@@ -6,6 +6,8 @@ from typing import Callable, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+
+from src.db import DB
 from IPython.core.debugger import set_trace
 
 PatternFn = Callable[[str, pd.Timestamp], bool]
@@ -21,10 +23,13 @@ DEFAULT_HORIZONS: List[Tuple[str, int]] = [
 ]
 
 
-def _load_prices(prices_pkl: str | Path) -> pd.DataFrame:
-    series = pd.read_pickle(prices_pkl)
+def _load_prices(prices_pkl: str | Path | None) -> pd.DataFrame:
+    if prices_pkl is None:
+        series = DB().load()
+    else:
+        series = pd.read_pickle(prices_pkl)
     if not isinstance(series, pd.Series):
-        raise TypeError("Expected a pandas Series in kospi_adjclose.pkl.")
+        raise TypeError("Expected a pandas Series for adjclose data.")
     if series.index.nlevels != 2:
         raise ValueError("Series index must be a (date, code) MultiIndex.")
 
@@ -71,9 +76,7 @@ def backtest(
     start_date: str | pd.Timestamp | None = None,
     end_date: str | pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    if prices_pkl is None:
-        prices_pkl = Path(__file__).resolve().parents[1] / "static" / "kospi_adjclose.pkl"
-    else:
+    if prices_pkl is not None:
         prices_pkl = Path(prices_pkl)
 
     horizons_list = _normalize_horizons(horizons)
@@ -124,12 +127,14 @@ def backtest(
         values = returns_by_horizon[label]
         arith_mean = float(np.mean(values)) if values else float("nan")
         geom_mean = _geom_mean(values)
+        rise_prob = float(np.mean([v > 0 for v in values])) if values else float("nan")
         rows.append(
             {
                 "period": label,
                 "count": len(values),
                 "arith_mean": arith_mean,
                 "geom_mean": geom_mean,
+                "rise_prob": rise_prob,
             }
         )
 
