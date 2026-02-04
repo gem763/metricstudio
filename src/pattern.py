@@ -1,13 +1,16 @@
-﻿"""Pattern helpers that operate directly on numpy price arrays."""
+﻿"""넘파이 가격 배열에 대한 패턴 보조 함수."""
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
+
+from src import util as u
 
 
 def market(values: np.ndarray, name: str | None = None) -> np.ndarray:
-    """Return True for every date with a finite, positive price."""
+    """유효하고 양수인 가격이면 True를 반환한다."""
 
     prices = np.asarray(values, dtype=np.float64)
     return np.isfinite(prices) & (prices > 0)
@@ -17,20 +20,31 @@ def bollinger(
     values: np.ndarray,
     window: int = 20,
     sigma: float = 2.0,
-    max_band_pct: float = 100.0,
-    min_narrow_days: int = 1,
-    band_pct_type: str = "absolute",
-    band_pct_percentile_window: int = 252,
+    narrow_width: float = 1.0,
+    narrow_stay_days: int = 1,
+    narrow_width_type: Literal["absolute", "percentile"] = "absolute",
+    narrow_percentile_window: int = 252,
     uptrend_window: int | None = None,
     high_window: int | None = None,
     high_threshold: float = 0.9,
-    style: str = "breakout",
+    trigger: Literal["breakout", "topclose"] = "breakout",
+    trigger_cooldown_days: int = 3,
+    trigger_topclose_tolerance: float = 0.03,
+    trigger_topclose_stay_days: int = 3,
     name: str | None = None,
 ) -> np.ndarray:
     """
-    Return True when prices break above the upper Bollinger band and the band width
-    is within `max_band_pct` of the moving average.
+    볼린저밴드 상단 돌파 시점과 밴드폭 조건을 만족하는 구간을 True로 반환한다.
+    narrow_width는 비율(예: 5%면 0.05) 기준이다.
     """
+
+    narrow_width_type = (narrow_width_type or "absolute").lower()
+    if narrow_width_type not in {"absolute", "percentile"}:
+        raise ValueError("narrow_width_type must be 'absolute' or 'percentile'")
+
+    trigger = (trigger or "breakout").lower()
+    if trigger not in {"breakout", "topclose"}:
+        raise ValueError("trigger must be 'breakout' or 'topclose'")
 
     prices = np.asarray(values, dtype=np.float64)
     n = prices.shape[0]
@@ -39,130 +53,43 @@ def bollinger(
     if window <= 0 or n < window:
         return mask
 
-    windows = sliding_window_view(prices, window)
-    valid_win = np.isfinite(windows) & (windows > 0)
-    all_valid = valid_win.all(axis=1)
-    if not np.any(all_valid):
+    mean, std, valid_end = u.rolling_mean_std(prices, window)
+    if not np.any(valid_end):
         return mask
 
-    safe_windows = np.where(valid_win, windows, 0.0)
-    sum_win = safe_windows.sum(axis=1)
-    sum_sq = (safe_windows * safe_windows).sum(axis=1)
-
-    mean = sum_win / window
-
-    variance = np.maximum(sum_sq / window - mean * mean, 0.0)
-    band_width = sigma * np.sqrt(variance)
+    # 1) 기본 밴드 계산
+    band_width = sigma * std
     upper = mean + band_width
+    mask = valid_end.copy()
 
-    band_type = (band_pct_type or "absolute").lower()
-    if band_type not in {"absolute", "percentile"}:
-        raise ValueError("band_pct_type must be 'absolute' or 'percentile'")
+    # 2) 밴드폭(좁은 구간) 조건
+    mode = 0 if narrow_width_type == "absolute" else 1
+    mask &= u.narrow_mask(
+        mean,
+        band_width,
+        valid_end,
+        narrow_width,
+        mode,
+        int(max(1, narrow_percentile_window)),
+        int(max(1, narrow_stay_days)),
+    )
 
-    if band_type == "absolute" or max_band_pct <= 0:
-        if max_band_pct <= 0:
-            narrow_condition = np.ones_like(mean, dtype=bool)
-        else:
-            ratio = band_width / np.clip(mean, 1e-12, None)
-            narrow_condition = ratio <= (max_band_pct / 100.0)
-    else:
-        ratio = band_width / np.clip(mean, 1e-12, None)
-        ratio = np.where(np.isfinite(ratio), ratio, np.nan)
-        lookback = int(max(1, band_pct_percentile_window))
-        ratio_len = ratio.shape[0]
-        if ratio_len >= lookback:
-            ratio_windows = sliding_window_view(ratio, lookback)
-            percentile_vals = np.nanpercentile(ratio_windows, max_band_pct, axis=1)
-            thresholds = np.full(ratio_len, np.nan)
-            thresholds[lookback - 1 :] = percentile_vals
-            narrow_condition = np.isfinite(thresholds) & (ratio <= thresholds)
-        else:
-            narrow_condition = np.zeros_like(ratio, dtype=bool)
+    # 3) 52주 고가 근처 조건
+    hw = int(high_window) if high_window is not None else 0
+    mask &= u.high_mask(prices, hw, high_threshold)
 
-    if min_narrow_days <= 1:
-        narrow_mask = narrow_condition
-    else:
-        narrow_mask = np.zeros_like(narrow_condition, dtype=bool)
-        run = 0
-        for i, cond in enumerate(narrow_condition):
-            if cond:
-                run += 1
-            else:
-                run = 0
-            if run >= min_narrow_days:
-                narrow_mask[i] = True
+    # 4) 업트렌드 조건(별도 이평선)
+    uw = int(uptrend_window) if uptrend_window is not None else 0
+    mask &= u.uptrend_mask(prices, uw)
 
-    if high_window is not None and high_window > 0 and n >= high_window:
-        hw = int(high_window)
-        high_windows = sliding_window_view(prices, hw)
-        high_valid = np.isfinite(high_windows) & (high_windows > 0)
-        safe_high = np.where(high_valid, high_windows, -np.inf)
-        rolling_high = safe_high.max(axis=1)
-        rolling_high[~high_valid.any(axis=1)] = np.nan
-        high_series = np.full(n, np.nan)
-        high_series[hw - 1 :] = rolling_high
-        high_mask = np.isfinite(high_series) & (prices >= high_threshold * high_series)
-    else:
-        high_mask = np.ones(n, dtype=bool)
-
-    # optional uptrend filter using independent moving average window
-    if uptrend_window is not None and uptrend_window > 1 and n >= uptrend_window:
-        uw = int(uptrend_window)
-        trend_end = np.zeros(n, dtype=bool)
-        up_windows = sliding_window_view(prices, uw)
-        up_valid = np.isfinite(up_windows) & (up_windows > 0)
-        up_all = up_valid.all(axis=1)
-        if np.any(up_all):
-            safe_up = np.where(up_valid, up_windows, 0.0)
-            sum_up = safe_up.sum(axis=1)
-            mean_up = np.full_like(sum_up, np.nan)
-            valid_idx = np.where(up_all)[0]
-            mean_up[valid_idx] = sum_up[valid_idx] / uw
-            prev_up = np.empty_like(mean_up)
-            prev_up[:] = np.nan
-            prev_up[1:] = mean_up[:-1]
-            trend_windows = up_all & np.isfinite(prev_up) & (mean_up > prev_up)
-            trend_indices = np.where(trend_windows)[0] + uw - 1
-            trend_end[trend_indices] = True
-    else:
-        trend_end = np.ones(n, dtype=bool)
-
-    style_key = (style or "breakout").lower()
-    if style_key not in {"breakout", "topclose"}:
-        raise ValueError("style must be 'breakout' or 'topclose'")
-
-    idx = np.where(all_valid & narrow_mask)[0]
-    if idx.size == 0:
-        return mask
-
-    end_pos = idx + window - 1
-    base_valid = trend_end[end_pos] & high_mask[end_pos]
-
-    if style_key == "topclose":
-        tolerance = 0.03
-        closeness = prices[end_pos] >= upper[idx] * (1.0 - tolerance)
-        candidate = np.zeros(n, dtype=bool)
-        candidate[end_pos] = base_valid & closeness
-        run = 0
-        for i in range(n):
-            if candidate[i]:
-                run += 1
-            else:
-                run = 0
-            mask[i] = run >= 3
-        return mask
-
-    breakout = prices[end_pos] > upper[idx]
-    breakout &= base_valid
-    mask[end_pos] = breakout
-
-    cooldown = 3  # require no breakout during the previous 3 days
-    if cooldown > 0:
-        last_break = -cooldown - 1
-        for pos in np.where(mask)[0]:
-            if pos - last_break <= cooldown:
-                mask[pos] = False
-            else:
-                last_break = pos
-
-    return mask
+    # 5) 트리거 분기
+    trigger_mode = 0 if trigger == "breakout" else 1
+    return u.trigger_mask(
+        prices,
+        upper,
+        mask,
+        trigger_mode,
+        int(max(0, trigger_cooldown_days)),
+        float(trigger_topclose_tolerance),
+        int(max(1, trigger_topclose_stay_days)),
+    )

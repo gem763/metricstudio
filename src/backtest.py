@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from src.db import DB
 from src.stats import Stats, StatsCollection
+from src.pattern import market
 
 PatternArrayFn = Callable[[np.ndarray], np.ndarray]
 
@@ -21,7 +22,8 @@ HORIZONS: List[Tuple[str, int]] = [
     ("1W", 5),
     ("2W", 10),
     ("3W", 15),
-    ("6W", 30),
+    ("1M", 20),
+    ("2M", 40),
     ("3M", 60),
     ("6M", 120),
 ]
@@ -37,19 +39,33 @@ class PriceTable:
 _PRICE_TABLE: Optional[PriceTable] = None
 
 
+def _filter_bad_codes(
+    df: pd.DataFrame,
+    max_daily_ret: float = 2.0,
+    min_price: float = 1.0,
+) -> pd.DataFrame:
+    # 비정상 급등락 또는 비정상 가격(예: 1원)을 포함한 종목 제거
+    daily_ret = df.pct_change()
+    bad_ret = daily_ret.abs() > max_daily_ret
+    bad_price = df <= min_price
+    bad_codes = bad_ret.any() | bad_price.any()
+    if bad_codes.any():
+        df = df.loc[:, ~bad_codes]
+    return df
+
+
 def _load_price_table() -> PriceTable:
     global _PRICE_TABLE
     if _PRICE_TABLE is None:
         series = DB().load()
         df = series.unstack("code").sort_index()
         df.index = pd.to_datetime(df.index)
+        df = _filter_bad_codes(df)
         dates = df.index.to_numpy(dtype="datetime64[ns]")
         prices = df.to_numpy(dtype=np.float64, copy=True)
         codes = [str(c) for c in df.columns]
         _PRICE_TABLE = PriceTable(dates=dates, prices=prices, codes=codes)
     return _PRICE_TABLE
-
-
 
 
 @njit(cache=True)
@@ -95,47 +111,6 @@ def _numba_accumulate_returns(
                 sum_log[h_idx, i] += np.log1p(ret)
 
 
-def _backtest_single(pattern_fn: PatternArrayFn, start, end) -> Stats:
-    table = _load_price_table()
-    dates = table.dates
-    prices = table.prices
-    codes = table.codes
-
-    horizon_offsets = np.asarray([int(days) for _, days in HORIZONS], dtype=np.int64)
-
-    start_ts = pd.Timestamp(start).to_datetime64()
-    end_ts = pd.Timestamp(end).to_datetime64()
-
-    start_idx = int(np.searchsorted(dates, start_ts, side="left"))
-    end_idx = int(np.searchsorted(dates, end_ts, side="right"))
-    end_idx = min(end_idx, len(dates))
-
-    stats = Stats.create(dates, HORIZONS)
-
-    for col_idx, code in enumerate(tqdm(codes)):
-        values = prices[:, col_idx]
-        mask = pattern_fn(values)
-        if mask is None:
-            continue
-        if mask.shape != values.shape:
-            raise ValueError(f"pattern mask shape mismatch for code {code}")
-
-        _numba_accumulate_returns(
-            values,
-            mask,
-            start_idx,
-            end_idx,
-            horizon_offsets,
-            stats.counts,
-            stats.sum_ret,
-            stats.sum_log,
-            stats.pos_counts,
-            stats.geom_invalid,
-        )
-
-    return stats
-
-
 def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
     import inspect
 
@@ -163,20 +138,67 @@ def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
     return f"pattern_{idx}"
 
 
-def backtest(*pattern_fns: PatternArrayFn, start, end) -> StatsCollection:
-    if not pattern_fns:
-        raise ValueError("At least one pattern function must be provided.")
+class Backtest:
+    def __init__(self, start, end, base_pattern: PatternArrayFn = market):
+        self.start = pd.Timestamp(start)
+        self.end = pd.Timestamp(end)
+        table = _load_price_table()
+        self.dates = table.dates
+        self.prices = table.prices
+        self.codes = table.codes
+        self.horizon_offsets = np.asarray([int(days) for _, days in HORIZONS], dtype=np.int64)
+        self.start_idx = int(np.searchsorted(self.dates, self.start.to_datetime64(), side="left"))
+        self.end_idx = int(np.searchsorted(self.dates, self.end.to_datetime64(), side="right"))
+        self.end_idx = min(self.end_idx, len(self.dates))
+        self.base_pattern = base_pattern
+        self._base_stats = {}
+        base_name = _infer_pattern_label(base_pattern, 0)
+        self._base_stats[base_name] = self._run_pattern(base_pattern)
 
-    stats_map: Dict[str, Stats] = {}
-    for idx, pattern_fn in enumerate(pattern_fns, start=1):
-        stats = _backtest_single(pattern_fn, start, end)
-        base = _infer_pattern_label(pattern_fn, idx)
-        name = base
-        base = name
-        suffix = 2
-        while name in stats_map:
-            name = f"{base}_{suffix}"
-            suffix += 1
-        stats_map[name] = stats
+    def _run_pattern(self, pattern_fn: PatternArrayFn) -> Stats:
+        stats = Stats.create(self.dates, HORIZONS)
+        for col_idx, code in enumerate(tqdm(self.codes, desc="codes")):
+            values = self.prices[:, col_idx]
+            mask = pattern_fn(values)
+            if mask is None:
+                continue
+            if mask.shape != values.shape:
+                raise ValueError(f"pattern mask shape mismatch for code {code}")
+            _numba_accumulate_returns(
+                values,
+                mask,
+                self.start_idx,
+                self.end_idx,
+                self.horizon_offsets,
+                stats.counts,
+                stats.sum_ret,
+                stats.sum_log,
+                stats.pos_counts,
+                stats.geom_invalid,
+            )
+        return stats
 
-    return StatsCollection(stats_map)
+    def run(self, *patterns: PatternArrayFn, include_base: bool = True, **shared_kwargs) -> StatsCollection:
+        stats_map: Dict[str, Stats] = {}
+        if include_base:
+            stats_map.update(self._base_stats)
+
+        for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
+            wrapped = pattern_fn
+            if shared_kwargs:
+                def _wrapped(values, _fn=pattern_fn, _kwargs=shared_kwargs):
+                    return _fn(values, **_kwargs)
+
+                wrapped = _wrapped
+            stats = self._run_pattern(wrapped)
+            base_name = _infer_pattern_label(pattern_fn, idx)
+            name = base_name
+            suffix = 2
+            while name in stats_map:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+            stats_map[name] = stats
+
+        if not stats_map:
+            raise ValueError("No patterns were executed.")
+        return StatsCollection(stats_map)
