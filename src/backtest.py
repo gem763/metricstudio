@@ -18,7 +18,7 @@ from src.pattern import market
 PatternArrayFn = Callable[[np.ndarray], np.ndarray]
 
 HORIZONS: List[Tuple[str, int]] = [
-    ("1D", 1),
+    # ("1D", 1),
     ("1W", 5),
     ("2W", 10),
     ("3W", 15),
