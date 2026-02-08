@@ -12,8 +12,8 @@ from numba import njit
 from tqdm.auto import tqdm
 
 from src.db import DB
+from src.pattern import Default
 from src.stats import Stats, StatsCollection
-from src.pattern import market
 
 PatternArrayFn = Callable[[np.ndarray], np.ndarray]
 
@@ -139,7 +139,15 @@ def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
 
 
 class Backtest:
-    def __init__(self, start, end, base_pattern: PatternArrayFn = market):
+    def __init__(
+        self,
+        start,
+        end,
+        benchmark: PatternArrayFn | None = None,
+    ):
+        if benchmark is None:
+            benchmark = Default(name='benchmark')
+
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
         table = _load_price_table()
@@ -150,10 +158,10 @@ class Backtest:
         self.start_idx = int(np.searchsorted(self.dates, self.start.to_datetime64(), side="left"))
         self.end_idx = int(np.searchsorted(self.dates, self.end.to_datetime64(), side="right"))
         self.end_idx = min(self.end_idx, len(self.dates))
-        self.base_pattern = base_pattern
+        self.benchmark = benchmark
         self._base_stats = {}
-        base_name = _infer_pattern_label(base_pattern, 0)
-        self._base_stats[base_name] = self._run_pattern(base_pattern)
+        base_name = _infer_pattern_label(benchmark, 0)
+        self._base_stats[base_name] = self._run_pattern(benchmark)
 
     def _run_pattern(self, pattern_fn: PatternArrayFn) -> Stats:
         stats = Stats.create(self.dates, HORIZONS)

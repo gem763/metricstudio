@@ -8,9 +8,119 @@ from typing import Dict, Iterable, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
 
 Horizon = Tuple[str, int]
+
+
+def _as_percent(values: np.ndarray) -> np.ndarray:
+    return values * 100.0
+
+
+def _normalize_ylim_percent(ylim):
+    if ylim is None:
+        return None
+    lo = float(ylim[0])
+    hi = float(ylim[1])
+    # 소수 수익률(예: 0.3) 입력도 허용하고, 퍼센트(예: 30) 입력도 허용한다.
+    if max(abs(lo), abs(hi)) <= 2.0:
+        return lo * 100.0, hi * 100.0
+    return lo, hi
+
+
+def _apply_integer_y_ticks(axes):
+    for ax in axes:
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+
+
+def _share_return_y_axis(axes):
+    axes[1].sharey(axes[0])
+    axes[1].set_ylabel("")
+    axes[1].tick_params(axis="y", left=False, labelleft=False)
+
+
+def _apply_date_ticks(axes, dates):
+    n_points = len(dates)
+    if n_points <= 0:
+        return
+    dt = pd.to_datetime(dates)
+    span_days = max(1, int((dt[-1] - dt[0]).days))
+
+    if span_days <= 120:
+        date_fmt = "%Y-%m-%d"
+    elif span_days <= 10 * 365:
+        date_fmt = "%Y-%m"
+    else:
+        date_fmt = "%Y"
+
+    # 축 너비(픽셀)와 라벨 길이를 같이 고려해서 라벨 개수를 동적으로 제한한다.
+    fig = axes[0].figure
+    fig_width_px = float(fig.get_size_inches()[0] * fig.dpi)
+    axis_width_px = fig_width_px / max(1, len(axes))
+    sample_len = max(4, len(dt[0].strftime(date_fmt)))
+    label_px = sample_len * 8.0 + 14.0
+    max_ticks_by_width = int(axis_width_px // label_px)
+    target_ticks = max(2, min(8, max_ticks_by_width))
+
+    idx = np.linspace(0, n_points - 1, num=min(target_ticks, n_points), dtype=int)
+    idx = np.unique(idx)
+    tick_dates = dt[idx]
+    tick_labels = tick_dates.strftime(date_fmt).tolist()
+
+    # 포맷 때문에 같은 라벨이 반복될 수 있어 중복 라벨을 제거한다.
+    uniq_dates = []
+    uniq_labels = []
+    for tick_date, tick_label in zip(tick_dates, tick_labels):
+        if uniq_labels and uniq_labels[-1] == tick_label:
+            continue
+        uniq_dates.append(tick_date)
+        uniq_labels.append(tick_label)
+    if len(uniq_dates) >= 2:
+        tick_dates = uniq_dates
+        tick_labels = uniq_labels
+
+    for ax in axes:
+        ax.set_xticks(tick_dates)
+        ax.set_xticklabels(tick_labels)
+        ax.tick_params(axis="x", labelrotation=0)
+
+
+def _rolling_sum_1d(values: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1:
+        return values.astype(np.float64, copy=True)
+    cumsum = np.cumsum(values, dtype=np.float64)
+    out = cumsum.copy()
+    if values.shape[0] >= window:
+        out[window:] = cumsum[window:] - cumsum[:-window]
+    return out
+
+
+def _parse_lookback(spec: str):
+    text = str(spec).strip().upper()
+    if len(text) < 2:
+        raise ValueError(f"Invalid lookback format: {spec}")
+    unit = text[-1]
+    value_text = text[:-1]
+    if not value_text.isdigit():
+        raise ValueError(f"Invalid lookback format: {spec}")
+    value = int(value_text)
+    if value <= 0:
+        raise ValueError(f"Lookback must be positive: {spec}")
+    if unit == "D":
+        return pd.Timedelta(days=value)
+    if unit == "W":
+        return pd.Timedelta(weeks=value)
+    if unit == "M":
+        return pd.DateOffset(months=value)
+    if unit == "Y":
+        return pd.DateOffset(years=value)
+    raise ValueError(f"Unsupported lookback unit in '{spec}'. Use D/W/M/Y.")
+
+
+def _lookback_start(asof: pd.Timestamp, lookback: str) -> pd.Timestamp:
+    return asof - _parse_lookback(lookback)
 
 
 @dataclass
@@ -110,211 +220,15 @@ class Stats:
             ).set_index(["period", "scope"])
         return pd.DataFrame(rows).set_index(["period", "scope"])
 
-    def plot(self, start=None, end=None, figsize=(12, 4), rise_ylim=None, return_ylim=None):
-        df = self.to_frame(start, end).reset_index()
-        if df.empty:
-            raise ValueError("No data available for the specified range.")
-
-        periods = df["period"].tolist()
-        arith = df["arith_mean"].to_numpy(dtype=float)
-        geom = df["geom_mean"].to_numpy(dtype=float)
-        rise = df["rise_prob"].to_numpy(dtype=float)
-        x = np.arange(len(periods))
-
-        fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
-
-        axes[0].plot(x, arith, marker="o", color="tab:blue")
-        axes[0].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[0].set_xticks(x)
-        axes[0].set_xticklabels(periods, rotation=45)
-        axes[0].set_ylabel("Return")
-        axes[0].set_title("Arithmetic Mean")
-
-        axes[1].plot(x, geom, marker="o", linestyle="-", color="tab:orange")
-        axes[1].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(periods, rotation=45)
-        axes[1].set_title("Geometric Mean")
-
-        axes[1].sharey(axes[0])
-
-        combined = np.concatenate(
-            [
-                arith[np.isfinite(arith)],
-                geom[np.isfinite(geom)],
-            ]
-        )
-        if return_ylim is not None:
-            axes[0].set_ylim(*return_ylim)
-            axes[1].set_ylim(*return_ylim)
-        elif combined.size:
-            ymin = float(combined.min())
-            ymax = float(combined.max())
-            span = ymax - ymin
-            margin = max(1e-4, 0.05 * span)
-            axes[0].set_ylim(ymin - margin, ymax + margin)
-            axes[1].set_ylim(ymin - margin, ymax + margin)
-
-        axes[2].plot(x, rise * 100.0, marker="o", color="tab:green")
-        axes[2].set_xticks(x)
-        axes[2].set_xticklabels(periods, rotation=45)
-        axes[2].set_ylabel("Rise Probability (%)")
-        axes[2].set_title("Rise Probability")
-        axes[2].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
-        if rise_ylim is None:
-            pass
-        else:
-            axes[2].set_ylim(*rise_ylim)
-
-        return fig, axes
-
-    def plot_history(
+    def to_frame_history(
         self,
         horizon: str | int = "1M",
         start=None,
         end=None,
-        figsize=(12, 4),
         history_window: int = 252,
-        rise_ylim=None,
-        return_ylim=None,
-    ):
-        dates, arith, geom, rise, label = self._history_series_for_plot(
-            horizon=horizon, start=start, end=end, history_window=history_window
-        )
-
-        fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True, sharex=True)
-
-        axes[0].plot(dates, arith, color="tab:blue")
-        axes[0].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[0].set_title(f"{label} Arithmetic Mean")
-        axes[0].set_ylabel("Return")
-
-        axes[1].plot(dates, geom, color="tab:orange", linestyle="--")
-        axes[1].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[1].set_title(f"{label} Geometric Mean")
-
-        axes[2].plot(dates, rise * 100.0, color="tab:green")
-        axes[2].set_title(f"{label} Rise Probability")
-        axes[2].set_ylabel("Rise Probability (%)")
-        axes[2].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
-
-        if return_ylim is not None:
-            axes[0].set_ylim(*return_ylim)
-            axes[1].set_ylim(*return_ylim)
-        if rise_ylim is not None:
-            axes[2].set_ylim(*rise_ylim)
-
-        return fig, axes
-
-    def _window_metrics(self, start_idx: int, end_idx: int):
-        counts = self.counts[:, start_idx:end_idx].sum(axis=1).astype(np.float64)
-        sum_ret = self.sum_ret[:, start_idx:end_idx].sum(axis=1)
-        sum_log = self.sum_log[:, start_idx:end_idx].sum(axis=1)
-        pos = self.pos_counts[:, start_idx:end_idx].sum(axis=1).astype(np.float64)
-        invalid = self.geom_invalid[:, start_idx:end_idx].any(axis=1)
-
-        arith = np.full(counts.shape[0], np.nan, dtype=np.float64)
-        geom = np.full(counts.shape[0], np.nan, dtype=np.float64)
-        rise = np.full(counts.shape[0], np.nan, dtype=np.float64)
-
-        valid = counts > 0
-        arith[valid] = sum_ret[valid] / counts[valid]
-        rise[valid] = pos[valid] / counts[valid]
-
-        valid_geom = valid & (~invalid)
-        geom[valid_geom] = np.exp(sum_log[valid_geom] / counts[valid_geom]) - 1.0
-
-        return arith, geom, rise
-    def plot_compare(self, asof, figsize=(12, 10), return_ylim=None, rise_ylim=None):
-        if asof is None:
-            raise ValueError("asof is required for plot_compare.")
-        asof_ts = np.datetime64(pd.Timestamp(asof).to_datetime64())
-        end_idx = int(np.searchsorted(self.dates, asof_ts, side="right"))
-        if end_idx < 252 * 3:
-            raise ValueError("Not enough data for 3-year comparison.")
-
-        windows = [
-            (end_idx - 252 * 3, end_idx - 252 * 2),
-            (end_idx - 252 * 2, end_idx - 252),
-            (end_idx - 252, end_idx),
-        ]
-        horizons = [label for label, _ in self.horizons]
-        x = np.arange(len(horizons))
-
-        fig, axes = plt.subplots(3, 3, figsize=figsize, constrained_layout=False, sharey="row")
-        fig.subplots_adjust(top=0.82, hspace=0.15, wspace=0.1)
-
-        def _add_col_header(ax, label, date_text):
-            bbox = ax.get_position()
-            x_center = (bbox.x0 + bbox.x1) / 2.0
-            y_top = fig.subplotpars.top
-            fig.text(
-                x_center,
-                y_top + 0.04,
-                label,
-                ha="center",
-                va="bottom",
-                fontsize=22,
-                fontweight="bold",
-            )
-            fig.text(
-                x_center,
-                y_top + 0.018,
-                date_text,
-                ha="center",
-                va="bottom",
-                fontsize=12,
-                color="dimgray",
-            )
-
-        for col, (start_idx, end_idx) in enumerate(windows):
-            start_date = pd.Timestamp(self.dates[start_idx]).strftime("%Y.%m.%d")
-            end_date = pd.Timestamp(self.dates[end_idx - 1]).strftime("%Y.%m.%d")
-
-            arith, geom, rise = self._window_metrics(start_idx, end_idx)
-
-            axes[0, col].plot(x, arith, marker="o", color="tab:blue")
-            axes[0, col].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-            _add_col_header(axes[0, col], f"{col + 1}Y", f"{start_date} - {end_date}")
-
-            axes[1, col].plot(x, geom, marker="o", linestyle="-", color="tab:orange")
-            axes[1, col].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-
-            axes[2, col].plot(x, rise * 100.0, marker="o", color="tab:green")
-            axes[2, col].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
-
-            for row in range(3):
-                axes[row, col].set_xticks(x)
-                if row == 2:
-                    axes[row, col].set_xticklabels(horizons, rotation=45)
-                else:
-                    axes[row, col].set_xticklabels([])
-
-        axes[0, 0].set_ylabel("Arithmetic Mean")
-        axes[1, 0].set_ylabel("Geometric Mean")
-        axes[2, 0].set_ylabel("Rise Probability (%)")
-
-        if return_ylim is not None:
-            for col in range(3):
-                axes[0, col].set_ylim(*return_ylim)
-                axes[1, col].set_ylim(*return_ylim)
-        if rise_ylim is not None:
-            for col in range(3):
-                axes[2, col].set_ylim(*rise_ylim)
-
-        return fig, axes
-
-    @staticmethod
-    def _rolling_sum_1d(values: np.ndarray, window: int) -> np.ndarray:
-        if window <= 1:
-            return values.astype(np.float64, copy=True)
-        cumsum = np.cumsum(values, dtype=np.float64)
-        out = cumsum.copy()
-        if values.shape[0] >= window:
-            out[window:] = cumsum[window:] - cumsum[:-window]
-        return out
-
-    def _history_series_for_plot(self, horizon="1M", start=None, end=None, history_window: int = 252):
+        min_count: int = 30,
+        require_full_window: bool = True,
+    ) -> pd.DataFrame:
         start_idx, end_idx = self._slice_indices(start, end)
         if start_idx >= end_idx:
             raise ValueError("No data available for the specified range.")
@@ -337,11 +251,11 @@ class Stats:
         pos = self.pos_counts[h_idx].astype(np.float64)
         invalid = self.geom_invalid[h_idx]
 
-        roll_counts = self._rolling_sum_1d(counts, window)
-        roll_sum_ret = self._rolling_sum_1d(sum_ret, window)
-        roll_sum_log = self._rolling_sum_1d(sum_log, window)
-        roll_pos = self._rolling_sum_1d(pos, window)
-        roll_invalid = self._rolling_sum_1d(invalid.astype(np.float64), window) > 0.0
+        roll_counts = _rolling_sum_1d(counts, window)
+        roll_sum_ret = _rolling_sum_1d(sum_ret, window)
+        roll_sum_log = _rolling_sum_1d(sum_log, window)
+        roll_pos = _rolling_sum_1d(pos, window)
+        roll_invalid = _rolling_sum_1d(invalid.astype(np.float64), window) > 0.0
 
         dates = self.dates[start_idx:end_idx]
         roll_counts = roll_counts[start_idx:end_idx]
@@ -361,7 +275,22 @@ class Stats:
         valid_geom = valid & (~roll_invalid)
         geom[valid_geom] = np.exp(roll_sum_log[valid_geom] / roll_counts[valid_geom]) - 1.0
 
-        return dates, arith, geom, rise, self.horizons[h_idx][0]
+        support = roll_counts >= max(1, int(min_count))
+        if require_full_window:
+            global_idx = np.arange(start_idx, end_idx)
+            support &= global_idx >= (window - 1)
+        out = pd.DataFrame(
+            {
+                "horizon": self.horizons[h_idx][0],
+                "count": roll_counts,
+                "arith_mean": np.where(support, arith, np.nan),
+                "geom_mean": np.where(support, geom, np.nan),
+                "rise_prob": np.where(support, rise, np.nan),
+            },
+            index=pd.to_datetime(dates),
+        )
+        out.index.name = "date"
+        return out
 
 
 @dataclass
@@ -370,27 +299,22 @@ class StatsCollection:
 
     @staticmethod
     def _pattern_colors(names: Iterable[str]) -> Dict[str, str]:
-        bright = [
-            "#e41a1c",
-            "#377eb8",
-            "#4daf4a",
-            "#984ea3",
-            "#ff7f00",
-            "#ffff33",
-            "#a65628",
-            "#f781bf",
-            "#66c2a5",
-            "#fc8d62",
+        palette = [
+            "#D56062",
+            "#067BC2",
+            "#F37748",
+            "#84BCDA",
+            "#ECC30B",
         ]
-        colors = iter(bright)
+        colors = iter(palette)
         mapping: Dict[str, str] = {}
         for name in names:
-            if name == "market":
+            if name in {"market", "benchmark", "default"}:
                 mapping[name] = "black"
                 continue
             color = next(colors, None)
             if color is None:
-                colors = iter(bright)
+                colors = iter(palette)
                 color = next(colors)
             mapping[name] = color
         return mapping
@@ -420,6 +344,47 @@ class StatsCollection:
         combined = pd.concat(frames, keys=keys, names=["pattern"])
         return combined
 
+    def to_frame_history(
+        self,
+        horizon: str | int = "1M",
+        start=None,
+        end=None,
+        history_window: int = 252,
+        min_count: int = 30,
+        require_full_window: bool = True,
+        pattern: str | None = None,
+    ) -> pd.DataFrame:
+        if not self.stats_map:
+            return pd.DataFrame(
+                columns=["horizon", "count", "arith_mean", "geom_mean", "rise_prob"]
+            )
+
+        if pattern is not None:
+            return self.get(pattern).to_frame_history(
+                horizon=horizon,
+                start=start,
+                end=end,
+                history_window=history_window,
+                min_count=min_count,
+                require_full_window=require_full_window,
+            )
+
+        frames = []
+        keys = []
+        for name, stats in self.stats_map.items():
+            frames.append(
+                stats.to_frame_history(
+                    horizon=horizon,
+                    start=start,
+                    end=end,
+                    history_window=history_window,
+                    min_count=min_count,
+                    require_full_window=require_full_window,
+                )
+            )
+            keys.append(name)
+        return pd.concat(frames, keys=keys, names=["pattern"])
+
     def plot(
         self,
         patterns: Iterable[str] | None = None,
@@ -439,13 +404,6 @@ class StatsCollection:
         if not names:
             raise ValueError("No patterns selected for plotting.")
 
-        # plot single pattern via Stats.plot for consistency
-        if len(names) == 1:
-            stats = self.get(names[0])
-            return stats.plot(
-                start=start, end=end, figsize=figsize, rise_ylim=rise_ylim, return_ylim=return_ylim
-            )
-
         color_map = self._pattern_colors(names)
         frames = []
         for name in names:
@@ -463,37 +421,37 @@ class StatsCollection:
         for name, group in combined.groupby("pattern"):
             color = color_map.get(name, None)
             xs = group["period"].map(period_index).to_numpy(dtype=float)
-            axes[0].plot(xs, group["arith_mean"], marker="o", color=color, label=name)
-            axes[1].plot(xs, group["geom_mean"], marker="o", linestyle="-", color=color, label=name)
+            axes[0].plot(xs, group["arith_mean"] * 100.0, marker="o", color=color, label=name)
+            axes[1].plot(
+                xs, group["geom_mean"] * 100.0, marker="o", linestyle="-", color=color, label=name
+            )
             axes[2].plot(xs, group["rise_prob"] * 100.0, marker="o", color=color, label=name)
 
         for ax, title, ylabel, draw_zero in [
-            (axes[0], "Arithmetic Mean", "Return", True),
-            (axes[1], "Geometric Mean", "Return", True),
+            (axes[0], "Arithmetic Mean", "Return (%)", True),
+            (axes[1], "Geometric Mean", "Return (%)", True),
             (axes[2], "Rise Probability (%)", "Rise Probability (%)", False),
         ]:
             if draw_zero:
                 ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
             ax.set_xticks(x)
-            ax.set_xticklabels(periods, rotation=45)
+            ax.set_xticklabels(periods, rotation=0)
             ax.set_title(title)
-            ax.legend()
 
-        axes[0].set_ylabel("Return")
-        axes[1].set_ylabel("Return")
+        axes[0].set_ylabel("Return (%)")
         axes[2].set_ylabel("Rise Probability (%)")
+        axes[0].legend()
         axes[2].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
-        if rise_ylim is not None:
-            axes[2].set_ylim(*rise_ylim)
 
-        arith_vals = combined["arith_mean"].to_numpy(dtype=float)
-        geom_vals = combined["geom_mean"].to_numpy(dtype=float)
+        arith_vals = combined["arith_mean"].to_numpy(dtype=float) * 100.0
+        geom_vals = combined["geom_mean"].to_numpy(dtype=float) * 100.0
         finite_vals = np.concatenate(
             [arith_vals[np.isfinite(arith_vals)], geom_vals[np.isfinite(geom_vals)]]
         )
-        if return_ylim is not None:
-            axes[0].set_ylim(*return_ylim)
-            axes[1].set_ylim(*return_ylim)
+        return_ylim_pct = _normalize_ylim_percent(return_ylim)
+        if return_ylim_pct is not None:
+            axes[0].set_ylim(*return_ylim_pct)
+            axes[1].set_ylim(*return_ylim_pct)
         elif finite_vals.size:
             ymin = float(finite_vals.min())
             ymax = float(finite_vals.max())
@@ -502,7 +460,54 @@ class StatsCollection:
             axes[0].set_ylim(ymin - margin, ymax + margin)
             axes[1].set_ylim(ymin - margin, ymax + margin)
 
+        rise_ylim_pct = _normalize_ylim_percent(rise_ylim)
+        if rise_ylim_pct is not None:
+            axes[2].set_ylim(*rise_ylim_pct)
+
+        _share_return_y_axis(axes)
+        _apply_integer_y_ticks(axes)
+
         return fig, axes
+
+    def plot_compare(
+        self,
+        asof,
+        short: str = "1Y",
+        long: str = "3Y",
+        patterns: Iterable[str] | None = None,
+        figsize=(12, 4),
+        rise_ylim=None,
+        return_ylim=None,
+    ):
+        asof_ts = pd.Timestamp(asof)
+        short_start = _lookback_start(asof_ts, short)
+        long_start = _lookback_start(asof_ts, long)
+        if long_start >= short_start:
+            raise ValueError("`long` must be longer than `short`.")
+
+        short_result = self.plot(
+            patterns=patterns,
+            start=short_start,
+            end=asof_ts,
+            figsize=figsize,
+            rise_ylim=rise_ylim,
+            return_ylim=return_ylim,
+        )
+        long_result = self.plot(
+            patterns=patterns,
+            start=long_start,
+            end=asof_ts,
+            figsize=figsize,
+            rise_ylim=rise_ylim,
+            return_ylim=return_ylim,
+        )
+
+        fig_short, _ = short_result
+        fig_long, _ = long_result
+        fig_short.suptitle(f"Short ({short}): {short_start.date()} ~ {asof_ts.date()}")
+        fig_long.suptitle(f"Long ({long}): {long_start.date()} ~ {asof_ts.date()}")
+
+        return short_result, long_result
 
     def plot_history(
         self,
@@ -512,6 +517,8 @@ class StatsCollection:
         end=None,
         figsize=(12, 4),
         history_window: int = 252,
+        min_count: int = 30,
+        require_full_window: bool = True,
         rise_ylim=None,
         return_ylim=None,
     ):
@@ -525,39 +532,43 @@ class StatsCollection:
         if not names:
             raise ValueError("No patterns selected for plotting.")
 
-        if len(names) == 1:
-            return self.get(names[0]).plot_history(
-                horizon=horizon,
-                start=start,
-                end=end,
-                figsize=figsize,
-                history_window=history_window,
-                rise_ylim=rise_ylim,
-                return_ylim=return_ylim,
-            )
-
+        color_map = self._pattern_colors(names)
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True, sharex=True)
 
         first_dates = None
         label = None
+        arith_series = []
+        geom_series = []
         for name in names:
-            stats = self.get(name)
-            dates, arith, geom, rise, current_label = stats._history_series_for_plot(
-                horizon=horizon, start=start, end=end, history_window=history_window
+            df = self.to_frame_history(
+                horizon=horizon,
+                start=start,
+                end=end,
+                history_window=history_window,
+                min_count=min_count,
+                require_full_window=require_full_window,
+                pattern=name,
             )
+            dates = df.index.to_numpy()
+            arith = _as_percent(df["arith_mean"].to_numpy(dtype=float))
+            geom = _as_percent(df["geom_mean"].to_numpy(dtype=float))
+            rise = _as_percent(df["rise_prob"].to_numpy(dtype=float))
+            current_label = str(df["horizon"].iloc[0]) if not df.empty else str(horizon)
             if first_dates is None:
                 first_dates = dates
                 label = current_label
             elif not np.array_equal(first_dates, dates):
                 raise ValueError("All patterns must share the same date index for plot_history.")
-            axes[0].plot(dates, arith, label=name)
-            axes[1].plot(dates, geom, linestyle="-", label=name)
-            axes[2].plot(dates, rise * 100.0, label=name)
+            color = color_map.get(name, None)
+            axes[0].plot(dates, arith, label=name, color=color)
+            axes[1].plot(dates, geom, linestyle="-", label=name, color=color)
+            axes[2].plot(dates, rise, label=name, color=color)
+            arith_series.append(arith)
+            geom_series.append(geom)
 
         axes[0].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
         axes[1].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[0].set_ylabel("Return")
-        axes[1].set_ylabel("Return")
+        axes[0].set_ylabel("Return (%)")
         axes[2].set_ylabel("Rise Probability (%)")
 
         title_prefix = label if label is not None else "Horizon"
@@ -567,124 +578,32 @@ class StatsCollection:
         axes[2].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
 
         axes[0].legend()
-        axes[1].legend()
-        axes[2].legend()
 
-        if return_ylim is not None:
-            axes[0].set_ylim(*return_ylim)
-            axes[1].set_ylim(*return_ylim)
-        if rise_ylim is not None:
-            axes[2].set_ylim(*rise_ylim)
-
-        return fig, axes
-
-    def plot_compare(
-        self,
-        asof,
-        patterns: Iterable[str] | None = None,
-        pattern: str | None = None,
-        figsize=(12, 10),
-        return_ylim=None,
-        rise_ylim=None,
-    ):
-        if not self.stats_map:
-            raise ValueError("StatsCollection is empty.")
-        if patterns is None:
-            names = list(self.stats_map.keys())
+        return_ylim_pct = _normalize_ylim_percent(return_ylim)
+        if return_ylim_pct is not None:
+            axes[0].set_ylim(*return_ylim_pct)
+            axes[1].set_ylim(*return_ylim_pct)
         else:
-            names = list(patterns)
-        if pattern is not None:
-            names = [pattern]
-        if not names:
-            raise ValueError("No patterns selected for plot_compare.")
+            finite_blocks = []
+            for series in arith_series + geom_series:
+                finite = series[np.isfinite(series)]
+                if finite.size:
+                    finite_blocks.append(finite)
+            if finite_blocks:
+                combined = np.concatenate(finite_blocks)
+                ymin = float(combined.min())
+                ymax = float(combined.max())
+                span = ymax - ymin
+                margin = max(1e-4, 0.05 * span)
+                axes[0].set_ylim(ymin - margin, ymax + margin)
+                axes[1].set_ylim(ymin - margin, ymax + margin)
+        rise_ylim_pct = _normalize_ylim_percent(rise_ylim)
+        if rise_ylim_pct is not None:
+            axes[2].set_ylim(*rise_ylim_pct)
 
-        if len(names) == 1:
-            return self.get(names[0]).plot_compare(
-                asof=asof, figsize=figsize, return_ylim=return_ylim, rise_ylim=rise_ylim
-            )
-
-        base = self.get(names[0])
-        asof_ts = np.datetime64(pd.Timestamp(asof).to_datetime64())
-        end_idx = int(np.searchsorted(base.dates, asof_ts, side="right"))
-        if end_idx < 252 * 3:
-            raise ValueError("Not enough data for 3-year comparison.")
-
-        windows = [
-            (end_idx - 252 * 3, end_idx - 252 * 2),
-            (end_idx - 252 * 2, end_idx - 252),
-            (end_idx - 252, end_idx),
-        ]
-        horizons = [label for label, _ in base.horizons]
-        x = np.arange(len(horizons))
-
-        fig, axes = plt.subplots(3, 3, figsize=figsize, constrained_layout=False, sharey="row")
-        fig.subplots_adjust(top=0.82, hspace=0.15, wspace=0.1)
-
-        def _add_col_header(ax, label, date_text):
-            bbox = ax.get_position()
-            x_center = (bbox.x0 + bbox.x1) / 2.0
-            y_top = fig.subplotpars.top
-            fig.text(
-                x_center,
-                y_top + 0.04,
-                label,
-                ha="center",
-                va="bottom",
-                fontsize=22,
-                fontweight="bold",
-            )
-            fig.text(
-                x_center,
-                y_top + 0.018,
-                date_text,
-                ha="center",
-                va="bottom",
-                fontsize=12,
-                color="dimgray",
-            )
-
-        color_map = self._pattern_colors(names)
-        for name in names:
-            stats = self.get(name)
-            if [label for label, _ in stats.horizons] != horizons:
-                raise ValueError("All patterns must share the same horizons for plot_compare.")
-            if not np.array_equal(stats.dates, base.dates):
-                raise ValueError("All patterns must share the same date index for plot_compare.")
-            color = color_map.get(name, None)
-            for col, (start_idx, end_idx) in enumerate(windows):
-                arith, geom, rise = stats._window_metrics(start_idx, end_idx)
-                axes[0, col].plot(x, arith, marker="o", color=color, label=name)
-                axes[1, col].plot(x, geom, marker="o", linestyle="-", color=color, label=name)
-                axes[2, col].plot(x, rise * 100.0, marker="o", color=color, label=name)
-
-        for col, (start_idx, end_idx) in enumerate(windows):
-            start_date = pd.Timestamp(base.dates[start_idx]).strftime("%Y.%m.%d")
-            end_date = pd.Timestamp(base.dates[end_idx - 1]).strftime("%Y.%m.%d")
-            axes[0, col].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-            axes[1, col].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-            axes[2, col].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
-            _add_col_header(axes[0, col], f"{col + 1}Y", f"{start_date} - {end_date}")
-            for row in range(3):
-                axes[row, col].set_xticks(x)
-                if row == 2:
-                    axes[row, col].set_xticklabels(horizons, rotation=45)
-                else:
-                    axes[row, col].set_xticklabels([])
-
-        axes[0, 0].set_ylabel("Arithmetic Mean")
-        axes[1, 0].set_ylabel("Geometric Mean")
-        axes[2, 0].set_ylabel("Rise Probability (%)")
-
-        axes[0, 0].legend()
-        axes[1, 0].legend()
-        axes[2, 0].legend()
-
-        if return_ylim is not None:
-            for col in range(3):
-                axes[0, col].set_ylim(*return_ylim)
-                axes[1, col].set_ylim(*return_ylim)
-        if rise_ylim is not None:
-            for col in range(3):
-                axes[2, col].set_ylim(*rise_ylim)
+        if first_dates is not None:
+            _apply_date_ticks(axes, first_dates)
+        _share_return_y_axis(axes)
+        _apply_integer_y_ticks(axes)
 
         return fig, axes
