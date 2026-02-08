@@ -11,7 +11,7 @@ import pandas as pd
 from numba import njit
 from tqdm.auto import tqdm
 
-from src.db import DB
+from src.db_manager import DB
 from src.pattern import Default
 from src.stats import Stats, StatsCollection
 
@@ -57,9 +57,7 @@ def _filter_bad_codes(
 def _load_price_table() -> PriceTable:
     global _PRICE_TABLE
     if _PRICE_TABLE is None:
-        series = DB().load()
-        df = series.unstack("code").sort_index()
-        df.index = pd.to_datetime(df.index)
+        df = DB().load(field="close")
         df = _filter_bad_codes(df)
         dates = df.index.to_numpy(dtype="datetime64[ns]")
         prices = df.to_numpy(dtype=np.float64, copy=True)
