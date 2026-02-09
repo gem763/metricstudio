@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-import os
 from pathlib import Path
 import re
-import tempfile
 from typing import Iterable
 
+import FinanceDataReader as fdr
 import pandas as pd
 from tqdm.auto import tqdm
 
@@ -19,18 +16,34 @@ class DB:
         data_dir: str | Path | None = None,
         db_dir: str | Path | None = None,
         marcap_dir: str | Path | None = None,
-        cache_dir: str | Path | None = None,
+        db_root_dir: str | Path | None = None,
+        stock_dir: str | Path | None = None,
+        stock_data_dir: str | Path | None = None,
+        market_dir: str | Path | None = None,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
+        self.project_root = root
         self.static_dir = Path(static_dir) if static_dir is not None else root / "static"
-        self.data_dir = Path(data_dir) if data_dir is not None else root / "data"
-        self.db_dir = Path(db_dir) if db_dir is not None else root / "db"
+        self.db_root_dir = Path(db_root_dir) if db_root_dir is not None else root / "db"
+        if stock_dir is None:
+            stock_dir = db_dir
+        self.stock_dir = Path(stock_dir) if stock_dir is not None else self.db_root_dir / "stock"
+        if stock_data_dir is None:
+            stock_data_dir = data_dir
+        self.stock_data_dir = (
+            Path(stock_data_dir) if stock_data_dir is not None else self.stock_dir / "data"
+        )
+        self.market_dir = Path(market_dir) if market_dir is not None else self.db_root_dir / "market"
         self.marcap_dir = Path(marcap_dir) if marcap_dir is not None else root / "marcap" / "data"
-        if cache_dir is None:
-            self.cache_dir = Path(tempfile.gettempdir()) / "metricstudio_cache"
-        else:
-            self.cache_dir = Path(cache_dir)
+        self.legacy_stock_data_dir = root / "data"
+        self.legacy_stock_field_dir = self.db_root_dir
+        # backward compatibility aliases
+        self.data_dir = self.stock_data_dir
+        self.db_dir = self.stock_dir
 
+    # =========================
+    # SHARED HELPERS
+    # =========================
     @staticmethod
     def _normalize_codes(codes: Iterable[object]) -> pd.Index:
         s = pd.Series(list(codes), dtype="object").astype(str).str.strip().str.upper()
@@ -46,50 +59,109 @@ class DB:
         return paths
 
     def _code_parquet_paths(self) -> list[Path]:
-        if not self.data_dir.exists():
-            raise FileNotFoundError(f"data 폴더가 없습니다: {self.data_dir}")
-        all_paths = sorted(self.data_dir.glob("*.parquet"))
-        paths = [
-            p
-            for p in all_paths
-            if re.fullmatch(r"[0-9A-Z]{6}\.parquet", p.name) is not None
-        ]
-        if not paths:
-            raise FileNotFoundError(f"data 폴더에 종목 parquet 파일이 없습니다: {self.data_dir}")
-        return paths
+        candidate_dirs = [self.stock_data_dir]
+        if self.legacy_stock_data_dir != self.stock_data_dir:
+            candidate_dirs.append(self.legacy_stock_data_dir)
+
+        # 신규 구조(db/stock/data) 우선, 없으면 레거시(data)를 fallback으로 본다.
+        for base_dir in candidate_dirs:
+            if not base_dir.exists():
+                continue
+            all_paths = sorted(base_dir.glob("*.parquet"))
+            paths = [
+                p
+                for p in all_paths
+                if re.fullmatch(r"[0-9A-Z]{6}\.parquet", p.name) is not None
+            ]
+            if paths:
+                return paths
+
+        raise FileNotFoundError(
+            "종목 parquet 파일이 없습니다. "
+            f"확인 경로: {', '.join(str(p) for p in candidate_dirs)}"
+        )
 
     def _field_path(self, field: str) -> Path:
-        return self.db_dir / f"{field}.parquet"
-
-    def _wide_cache_path(self, field: str, exclude_spac: bool) -> Path:
-        safe_field = re.sub(r"[^0-9a-zA-Z_]+", "_", field)
-        spac_tag = "nospec" if exclude_spac else "all"
-        return self.cache_dir / f"{spac_tag}_{safe_field}_wide.pkl"
+        return self.stock_dir / f"{field}.parquet"
 
     @staticmethod
-    def _cache_is_fresh(cache_path: Path, source_paths: list[Path]) -> bool:
-        if not cache_path.exists():
-            return False
-        cache_mtime = cache_path.stat().st_mtime
-        latest_source_mtime = max(p.stat().st_mtime for p in source_paths)
-        return cache_mtime >= latest_source_mtime
+    def _market_symbol(market: str) -> str:
+        key = str(market).strip().lower()
+        if not key:
+            raise ValueError("market은 비어 있을 수 없습니다.")
+        symbol_map = {
+            "kospi": "KS11",
+            "kosdaq": "KQ11",
+            "kospi200": "KS200",
+        }
+        return symbol_map.get(key, str(market).strip())
 
-    def _source_paths_for_load(self, field: str, exclude_spac: bool) -> list[Path]:
-        field_path = self._field_path(field)
-        if self.db_dir.exists() and field_path.exists():
-            paths: list[Path] = [field_path]
-        else:
-            paths = self._code_parquet_paths()
+    def _market_file_path(self, market: str) -> Path:
+        safe_name = re.sub(r"[^0-9a-zA-Z_-]+", "_", str(market).strip().lower())
+        if not safe_name:
+            raise ValueError("market 파일명을 생성할 수 없습니다.")
+        return self.market_dir / f"{safe_name}.parquet"
 
-        if exclude_spac:
-            mapping_path = self.static_dir / "code_name.pkl"
-            if mapping_path.exists():
-                paths.append(mapping_path)
-        return paths
+    @staticmethod
+    def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        lower_to_original = {str(col).lower(): str(col) for col in df.columns}
+        for name in candidates:
+            key = name.lower()
+            if key in lower_to_original:
+                return lower_to_original[key]
+        return None
 
+    @classmethod
+    def _normalize_market_frame(cls, raw_df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(raw_df, pd.DataFrame):
+            raise TypeError("시장 데이터는 pandas DataFrame이어야 합니다.")
+
+        target_cols = ["open", "high", "low", "close", "volume", "amount", "marketcap"]
+        if raw_df.empty:
+            return pd.DataFrame(columns=target_cols, index=pd.DatetimeIndex([], name="date"))
+
+        df = raw_df.copy()
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[df.index.notna()]
+        if df.empty:
+            return pd.DataFrame(columns=target_cols, index=pd.DatetimeIndex([], name="date"))
+
+        aliases: dict[str, list[str]] = {
+            "open": ["Open", "시가"],
+            "high": ["High", "고가"],
+            "low": ["Low", "저가"],
+            "close": ["Close", "종가", "Adj Close", "AdjClose"],
+            "volume": ["Volume", "거래량"],
+            "amount": ["Amount", "거래대금", "거래대금(원)"],
+            "marketcap": ["Marcap", "MarketCap", "시가총액"],
+        }
+
+        out = pd.DataFrame(index=df.index)
+        out.index.name = "date"
+        for target, candidates in aliases.items():
+            src_col = cls._find_column(df, candidates)
+            if src_col is None:
+                out[target] = pd.NA
+            else:
+                out[target] = pd.to_numeric(df[src_col], errors="coerce")
+
+        out = out[target_cols].sort_index()
+        out = out[~out.index.duplicated(keep="last")]
+        return out
+
+    # load()가 우선적으로 읽는 db/stock/{field}.parquet(wide) 경로
     def _read_field_store(self, field: str) -> pd.DataFrame | None:
-        field_path = self._field_path(field)
-        if not self.db_dir.exists() or not field_path.exists():
+        primary_path = self._field_path(field)
+        legacy_path = self.legacy_stock_field_dir / f"{field}.parquet"
+
+        # 신규 구조(db/stock) 우선, 없으면 레거시 구조(db 루트)를 fallback으로 본다.
+        field_path: Path | None = None
+        if primary_path.exists():
+            field_path = primary_path
+        elif legacy_path.exists() and legacy_path != primary_path:
+            field_path = legacy_path
+
+        if field_path is None:
             return None
 
         df = pd.read_parquet(field_path)
@@ -164,31 +236,20 @@ class DB:
             raise ValueError(f"{path}에 '{field}' 컬럼이 없습니다.")
         return self._series_from_frame(df, code=code, field=field)
 
+    # load() fallback 및 build_stock()에서 공통으로 쓰는 db/stock/data/{code}.parquet 병합 로더
     def _load_field_series_from_paths(
         self,
         paths: list[Path],
         field: str,
-        max_workers: int | None,
     ) -> pd.Series:
         if not paths:
             return self._empty_price_series(field)
 
-        workers = max_workers
-        if workers is None:
-            workers = min(8, max(1, (os.cpu_count() or 4)))
-
         series_list: list[pd.Series] = []
-        if workers <= 1:
-            for path in paths:
-                s = self._load_one_series(path, field=field)
-                if not s.empty:
-                    series_list.append(s)
-        else:
-            load_one = partial(self._load_one_series, field=field)
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                for s in ex.map(load_one, paths):
-                    if not s.empty:
-                        series_list.append(s)
+        for path in paths:
+            s = self._load_one_series(path, field=field)
+            if not s.empty:
+                series_list.append(s)
 
         if not series_list:
             return self._empty_price_series(field)
@@ -196,7 +257,7 @@ class DB:
         merged = pd.concat(series_list).sort_index()
         dup = merged.index[merged.index.duplicated()]
         if len(dup) > 0:
-            raise ValueError("data 로드 결과에 중복 (date, code) 인덱스가 있습니다.")
+            raise ValueError("stock raw 데이터 로드 결과에 중복 (date, code) 인덱스가 있습니다.")
         return merged
 
     @staticmethod
@@ -205,6 +266,24 @@ class DB:
             columns=["open", "high", "low", "close", "volume", "amount", "marketcap", "shares"]
         )
 
+    @staticmethod
+    def _filter_bad_codes(
+        df: pd.DataFrame,
+        max_daily_ret: float = 2.0,
+        min_price: float = 1.0,
+    ) -> pd.DataFrame:
+        if df.empty:
+            return df
+        # 비정상 급등락 또는 비정상 가격(예: 1원)을 포함한 종목 제거
+        daily_ret = df.pct_change()
+        bad_ret = daily_ret.abs() > max_daily_ret
+        bad_price = df <= min_price
+        bad_codes = bad_ret.any() | bad_price.any()
+        if bad_codes.any():
+            return df.loc[:, ~bad_codes]
+        return df
+
+    # collect_stock() 전체 수집에서만 사용하는 adjclose 통합 로더
     def _load_adjclose(self) -> pd.Series:
         series_list: list[pd.Series] = []
         for path in self._adjclose_paths():
@@ -228,18 +307,21 @@ class DB:
             raise ValueError("adjclose에 중복 (date, code) 인덱스가 있습니다.")
         return out
 
+    # =========================
+    # LOAD PATH (READ-ONLY)
+    # =========================
     def load(
         self,
         codes: Iterable[str] | str | None = None,
         field: str = "close",
         mapping_pkl: str = "code_name.pkl",
         exclude_spac: bool = True,
-        max_workers: int | None = None,
-        use_local_cache: bool = True,
     ) -> pd.DataFrame:
         """
-        db/{field}.parquet(wide) 또는 data/{code}.parquet를 병합해
+        db/stock/{field}.parquet(wide) 또는 db/stock/data/{code}.parquet를 병합해
         (date x code) wide DataFrame을 반환한다.
+        field가 가격계열(open/high/low/close)일 때는
+        비정상 급등락/비정상 저가 종목을 제외한다.
         """
         if isinstance(codes, str):
             requested_codes = set(self._normalize_codes([codes]).to_list())
@@ -261,20 +343,6 @@ class DB:
                 excluded = self._normalize_codes(code_name.index[mask])
                 codes_to_exclude = set(excluded.to_list())
 
-        cache_path = self._wide_cache_path(field, exclude_spac=exclude_spac)
-        source_paths = self._source_paths_for_load(field, exclude_spac=exclude_spac)
-        if requested_codes is None and use_local_cache and self._cache_is_fresh(cache_path, source_paths):
-            cached = pd.read_pickle(cache_path)
-            if not isinstance(cached, pd.DataFrame):
-                raise TypeError(f"{cache_path}는 pandas DataFrame이어야 합니다.")
-            cached.index = pd.to_datetime(cached.index, errors="coerce")
-            cached = cached[cached.index.notna()]
-            cached.columns = self._normalize_codes(cached.columns)
-            cached = cached.sort_index().sort_index(axis=1)
-            if codes_to_exclude:
-                cached = cached.loc[:, ~cached.columns.isin(codes_to_exclude)]
-            return cached
-
         wide = self._read_field_store(field)
         if wide is None:
             all_paths = self._code_parquet_paths()
@@ -293,7 +361,6 @@ class DB:
             merged = self._load_field_series_from_paths(
                 target_paths,
                 field=field,
-                max_workers=max_workers,
             )
             if merged.empty:
                 return pd.DataFrame()
@@ -309,12 +376,14 @@ class DB:
             wide = wide.loc[:, ~wide.columns.isin(codes_to_exclude)]
 
         wide = wide.sort_index().sort_index(axis=1)
-
-        if requested_codes is None and use_local_cache:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            wide.to_pickle(cache_path)
+        if str(field).lower() in {"open", "high", "low", "close"}:
+            wide = self._filter_bad_codes(wide)
         return wide
 
+    # =========================
+    # STOCK BUILD PATH (WRITE PIPELINE)
+    # =========================
+    # collect_stock(code=...) 단건 수집에서만 사용하는 adjclose 조회
     def _load_adjclose_code(self, code: str) -> pd.Series:
         code_norm = self._normalize_codes([code])[0]
         parts: list[pd.Series] = []
@@ -483,11 +552,12 @@ class DB:
         return out
 
     def _save(self, code: str, frame: pd.DataFrame) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        path = self.data_dir / f"{code}.parquet"
+        self.stock_data_dir.mkdir(parents=True, exist_ok=True)
+        path = self.stock_data_dir / f"{code}.parquet"
         frame.to_parquet(path, compression="zstd")
 
-    def collect(self, code: str | None = None) -> None:
+    # raw 소스(adjclose + marcap)에서 db/stock/data/{code}.parquet를 생성하는 단계
+    def collect_stock(self, code: str | None = None) -> None:
         if code is not None:
             code_norm = self._normalize_codes([code])[0]
             adj_s = self._load_adjclose_code(code_norm)
@@ -517,7 +587,7 @@ class DB:
         marcap_all = marcap_all[marcap_all["code"].isin(code_set)]
         marcap_by_code = marcap_all.groupby("code", sort=False)
 
-        for code_norm in tqdm(code_set.tolist(), total=len(code_set), desc="collect"):
+        for code_norm in tqdm(code_set.tolist(), total=len(code_set), desc="collect_stock"):
             adj_s = adjclose.xs(code_norm, level="code").sort_index()
             try:
                 m = marcap_by_code.get_group(code_norm)
@@ -530,10 +600,11 @@ class DB:
 
         return None
 
-    def build(self) -> None:
+    # db/stock/data/{code}.parquet를 field별 db/stock/{field}.parquet로 병합하는 단계
+    def build_stock(self) -> None:
         """
-        data/{code}.parquet 종목 파일들을 field별 단일 parquet로 병합한다.
-        결과 파일: db/{field}.parquet
+        db/stock/data/{code}.parquet 종목 파일들을 field별 단일 parquet로 병합한다.
+        결과 파일: db/stock/{field}.parquet
         """
         code_paths = self._code_parquet_paths()
         fields_list = ["open", "high", "low", "close", "volume", "amount", "marketcap", "shares"]
@@ -542,7 +613,6 @@ class DB:
             merged = self._load_field_series_from_paths(
                 code_paths,
                 field=field,
-                max_workers=None,
             )
             if merged.empty:
                 continue
@@ -553,7 +623,42 @@ class DB:
             out_df.columns = self._normalize_codes(out_df.columns)
             out_df = out_df.sort_index().sort_index(axis=1)
             out_path = self._field_path(field)
-            self.db_dir.mkdir(parents=True, exist_ok=True)
+            self.stock_dir.mkdir(parents=True, exist_ok=True)
             out_df.to_parquet(out_path, compression="zstd")
 
         return None
+
+    # =========================
+    # MARKET BUILD PATH (WRITE PIPELINE)
+    # =========================
+    def build_market(
+        self,
+        market: str,
+        start: str | pd.Timestamp = "2000-01-01",
+        end: str | pd.Timestamp | None = None,
+    ) -> Path:
+        market_key = str(market).strip().lower()
+        if not market_key:
+            raise ValueError("market은 비어 있을 수 없습니다.")
+
+        symbol = self._market_symbol(market_key)
+        start_ts = pd.Timestamp(start).normalize()
+        end_ts = pd.Timestamp.today().normalize() if end is None else pd.Timestamp(end).normalize()
+        if end_ts < start_ts:
+            raise ValueError("end는 start보다 같거나 이후여야 합니다.")
+
+        raw_df = fdr.DataReader(
+            symbol,
+            start_ts.strftime("%Y-%m-%d"),
+            end_ts.strftime("%Y-%m-%d"),
+        )
+        if raw_df is None or raw_df.empty:
+            raise ValueError(
+                f"시장 데이터를 가져오지 못했습니다. market={market_key}, symbol={symbol}"
+            )
+
+        out_df = self._normalize_market_frame(raw_df)
+        out_path = self._market_file_path(market_key)
+        self.market_dir.mkdir(parents=True, exist_ok=True)
+        out_df.to_parquet(out_path, compression="zstd")
+        return out_path

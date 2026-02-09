@@ -17,14 +17,28 @@ class Pattern:
         self,
         name: str | None = None,
         default_name: str = "pattern",
+        trim: float | None = None,
     ):
         self.name = name or default_name
         self.__name__ = self.name
+        self.trim = self._normalize_trim(trim)
         self._post_mask_fn: Callable[[np.ndarray], np.ndarray] = self._post_mask_base
+        self._post_mask_steps: list[tuple[str, tuple[object, ...]]] = []
+
+    @staticmethod
+    def _normalize_trim(trim: float | None) -> float | None:
+        if trim is None:
+            return None
+        value = float(trim)
+        if not np.isfinite(value) or value < 0.0 or value >= 0.5:
+            raise ValueError("trim must be in [0.0, 0.5).")
+        return value
 
     def _chain_post_mask(
         self,
         step_fn: Callable[[np.ndarray], np.ndarray],
+        step_name: str | None = None,
+        step_args: tuple[object, ...] = (),
     ):
         prev_fn = self._post_mask_fn
 
@@ -34,16 +48,51 @@ class Pattern:
             return prev_mask & step_mask
 
         self._post_mask_fn = _composed
+        if step_name is not None:
+            self._post_mask_steps.append((str(step_name), tuple(step_args)))
         return self
 
     def high(self, window: int, threshold: float = 0.9):
         w = int(window)
         t = float(threshold)
-        return self._chain_post_mask(lambda prices, _w=w, _t=t: u.high_mask(prices, _w, _t))
+        return self._chain_post_mask(
+            lambda prices, _w=w, _t=t: u.high_mask(prices, _w, _t),
+            step_name="high",
+            step_args=(w, t),
+        )
 
     def uptrend(self, window: int):
         w = int(window)
-        return self._chain_post_mask(lambda prices, _w=w: u.uptrend_mask(prices, _w))
+        return self._chain_post_mask(
+            lambda prices, _w=w: u.uptrend_mask(prices, _w),
+            step_name="uptrend",
+            step_args=(w,),
+        )
+
+    @staticmethod
+    def _freeze_for_key(value: object):
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (list, tuple)):
+            return tuple(Pattern._freeze_for_key(v) for v in value)
+        if isinstance(value, dict):
+            return tuple(sorted((str(k), Pattern._freeze_for_key(v)) for k, v in value.items()))
+        return repr(value)
+
+    def execution_key(self):
+        attrs = []
+        for key, value in vars(self).items():
+            if key in {"name", "__name__", "trim", "_post_mask_fn"}:
+                continue
+            attrs.append((str(key), self._freeze_for_key(value)))
+        attrs.sort(key=lambda item: item[0])
+        return (
+            self.__class__.__module__,
+            self.__class__.__qualname__,
+            tuple(attrs),
+        )
 
     def __call__(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -60,8 +109,8 @@ class Pattern:
 
 
 class Default(Pattern):
-    def __init__(self, name: str = "default"):
-        super().__init__(name=name, default_name="default")
+    def __init__(self, name: str = "default", trim: float | None = None):
+        super().__init__(name=name, default_name="default", trim=trim)
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -82,8 +131,9 @@ class Bollinger(Pattern):
         trigger_topclose_tolerance: float = 0.03,
         trigger_topclose_stay_days: int = 3,
         name: str | None = None,
+        trim: float | None = None,
     ):
-        super().__init__(name=name, default_name="bollinger")
+        super().__init__(name=name, default_name="bollinger", trim=trim)
         self.window = int(window)
         self.sigma = float(sigma)
         self.narrow_width = float(narrow_width)

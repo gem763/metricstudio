@@ -12,7 +12,6 @@ from numba import njit
 from tqdm.auto import tqdm
 
 from src.db_manager import DB
-from src.pattern import Default
 from src.stats import Stats, StatsCollection
 
 PatternArrayFn = Callable[[np.ndarray], np.ndarray]
@@ -39,26 +38,11 @@ class PriceTable:
 _PRICE_TABLE: Optional[PriceTable] = None
 
 
-def _filter_bad_codes(
-    df: pd.DataFrame,
-    max_daily_ret: float = 2.0,
-    min_price: float = 1.0,
-) -> pd.DataFrame:
-    # 비정상 급등락 또는 비정상 가격(예: 1원)을 포함한 종목 제거
-    daily_ret = df.pct_change()
-    bad_ret = daily_ret.abs() > max_daily_ret
-    bad_price = df <= min_price
-    bad_codes = bad_ret.any() | bad_price.any()
-    if bad_codes.any():
-        df = df.loc[:, ~bad_codes]
-    return df
-
-
 def _load_price_table() -> PriceTable:
     global _PRICE_TABLE
     if _PRICE_TABLE is None:
+        # DB 기본 경로: db/stock/close.parquet 또는 db/stock/data/*.parquet
         df = DB().load(field="close")
-        df = _filter_bad_codes(df)
         dates = df.index.to_numpy(dtype="datetime64[ns]")
         prices = df.to_numpy(dtype=np.float64, copy=True)
         codes = [str(c) for c in df.columns]
@@ -136,6 +120,73 @@ def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
     return f"pattern_{idx}"
 
 
+def _infer_pattern_trim(pattern_fn: PatternArrayFn) -> float | None:
+    candidate = getattr(pattern_fn, "trim", None)
+    if candidate is None:
+        keywords = getattr(pattern_fn, "keywords", None)
+        if isinstance(keywords, dict):
+            candidate = keywords.get("trim")
+    if candidate is None:
+        return None
+    value = float(candidate)
+    if not np.isfinite(value) or value < 0.0 or value >= 0.5:
+        raise ValueError("trim must be in [0.0, 0.5).")
+    return value
+
+
+def _collect_forward_returns(
+    values: np.ndarray,
+    mask: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    horizon_offsets: np.ndarray,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    prices = np.asarray(values, dtype=np.float64)
+    valid_mask = np.asarray(mask, dtype=np.bool_)
+    length = prices.shape[0]
+    num_h = len(horizon_offsets)
+
+    idx_by_h = [np.empty(0, dtype=np.int32) for _ in range(num_h)]
+    ret_by_h = [np.empty(0, dtype=np.float32) for _ in range(num_h)]
+    base_ok = valid_mask & np.isfinite(prices) & (prices > 0.0)
+
+    for h_idx, step_raw in enumerate(horizon_offsets):
+        step = int(step_raw)
+        if step <= 0 or step >= length:
+            continue
+
+        valid_len = length - step
+        base = prices[:valid_len]
+        fwd = prices[step:]
+        valid = base_ok[:valid_len] & np.isfinite(fwd) & (fwd > 0.0)
+
+        lo = max(0, int(start_idx))
+        hi = min(int(end_idx), valid_len)
+        if lo >= valid_len or hi <= 0 or lo >= hi:
+            continue
+        if lo > 0:
+            valid[:lo] = False
+        if hi < valid_len:
+            valid[hi:] = False
+
+        date_idx = np.flatnonzero(valid)
+        if date_idx.size == 0:
+            continue
+
+        ret = fwd[date_idx] / base[date_idx] - 1.0
+        finite = np.isfinite(ret)
+        if not np.all(finite):
+            date_idx = date_idx[finite]
+            ret = ret[finite]
+        if date_idx.size == 0:
+            continue
+
+        idx_by_h[h_idx] = date_idx.astype(np.int32, copy=False)
+        ret_by_h[h_idx] = ret.astype(np.float32, copy=False)
+
+    return idx_by_h, ret_by_h
+
+
 class Backtest:
     def __init__(
         self,
@@ -143,9 +194,6 @@ class Backtest:
         end,
         benchmark: PatternArrayFn | None = None,
     ):
-        if benchmark is None:
-            benchmark = Default(name='benchmark')
-
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
         table = _load_price_table()
@@ -158,12 +206,28 @@ class Backtest:
         self.end_idx = min(self.end_idx, len(self.dates))
         self.benchmark = benchmark
         self._base_stats = {}
-        base_name = _infer_pattern_label(benchmark, 0)
-        self._base_stats[base_name] = self._run_pattern(benchmark)
+        self._base_trims = {}
+        if benchmark is not None:
+            base_name = _infer_pattern_label(benchmark, 0)
+            trim_quantile = _infer_pattern_trim(benchmark)
+            self._base_stats[base_name] = self._run_pattern(
+                benchmark,
+                keep_event_returns=trim_quantile is not None and trim_quantile > 0.0,
+            )
+            self._base_trims[base_name] = trim_quantile
 
-    def _run_pattern(self, pattern_fn: PatternArrayFn) -> Stats:
-        stats = Stats.create(self.dates, HORIZONS)
-        for col_idx, code in enumerate(tqdm(self.codes, desc="codes")):
+    def _run_pattern(
+        self,
+        pattern_fn: PatternArrayFn,
+        keep_event_returns: bool = False,
+        progress_desc: str = "codes",
+    ) -> Stats:
+        stats = Stats.create(self.dates, HORIZONS, keep_event_returns=keep_event_returns)
+        num_h = len(self.horizon_offsets)
+        if keep_event_returns:
+            event_idx_chunks: list[list[np.ndarray]] = [[] for _ in range(num_h)]
+            event_ret_chunks: list[list[np.ndarray]] = [[] for _ in range(num_h)]
+        for col_idx, code in enumerate(tqdm(self.codes, desc=progress_desc)):
             values = self.prices[:, col_idx]
             mask = pattern_fn(values)
             if mask is None:
@@ -182,29 +246,68 @@ class Backtest:
                 stats.pos_counts,
                 stats.geom_invalid,
             )
+            if keep_event_returns:
+                idx_by_h, ret_by_h = _collect_forward_returns(
+                    values,
+                    mask,
+                    self.start_idx,
+                    self.end_idx,
+                    self.horizon_offsets,
+                )
+                for h_idx in range(num_h):
+                    if idx_by_h[h_idx].size == 0:
+                        continue
+                    event_idx_chunks[h_idx].append(idx_by_h[h_idx])
+                    event_ret_chunks[h_idx].append(ret_by_h[h_idx])
+
+        if keep_event_returns:
+            event_date_idx_by_horizon: list[np.ndarray] = []
+            event_returns_by_horizon: list[np.ndarray] = []
+            for h_idx in range(num_h):
+                if not event_idx_chunks[h_idx]:
+                    event_date_idx_by_horizon.append(np.empty(0, dtype=np.int32))
+                    event_returns_by_horizon.append(np.empty(0, dtype=np.float32))
+                    continue
+                date_idx = np.concatenate(event_idx_chunks[h_idx]).astype(np.int32, copy=False)
+                returns = np.concatenate(event_ret_chunks[h_idx]).astype(np.float32, copy=False)
+                order = np.argsort(date_idx, kind="mergesort")
+                event_date_idx_by_horizon.append(date_idx[order])
+                event_returns_by_horizon.append(returns[order])
+            stats.event_date_idx_by_horizon = event_date_idx_by_horizon
+            stats.event_returns_by_horizon = event_returns_by_horizon
         return stats
 
     def run(self, *patterns: PatternArrayFn, include_base: bool = True, **shared_kwargs) -> StatsCollection:
         stats_map: Dict[str, Stats] = {}
+        pattern_trims: Dict[str, float | None] = {}
         if include_base:
             stats_map.update(self._base_stats)
+            pattern_trims.update(self._base_trims)
 
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
-            wrapped = pattern_fn
-            if shared_kwargs:
-                def _wrapped(values, _fn=pattern_fn, _kwargs=shared_kwargs):
-                    return _fn(values, **_kwargs)
-
-                wrapped = _wrapped
-            stats = self._run_pattern(wrapped)
+            trim_quantile = _infer_pattern_trim(pattern_fn)
             base_name = _infer_pattern_label(pattern_fn, idx)
             name = base_name
             suffix = 2
             while name in stats_map:
                 name = f"{base_name}_{suffix}"
                 suffix += 1
+
+            wrapped = pattern_fn
+            if shared_kwargs:
+                def _wrapped(values, _fn=pattern_fn, _kwargs=shared_kwargs):
+                    return _fn(values, **_kwargs)
+
+                wrapped = _wrapped
+            stats = self._run_pattern(
+                wrapped,
+                keep_event_returns=trim_quantile is not None and trim_quantile > 0.0,
+                progress_desc=f"codes:{name}",
+            )
+
             stats_map[name] = stats
+            pattern_trims[name] = trim_quantile
 
         if not stats_map:
             raise ValueError("No patterns were executed.")
-        return StatsCollection(stats_map)
+        return StatsCollection(stats_map, pattern_trims=pattern_trims)

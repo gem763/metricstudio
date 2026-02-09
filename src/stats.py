@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -123,6 +123,15 @@ def _lookback_start(asof: pd.Timestamp, lookback: str) -> pd.Timestamp:
     return asof - _parse_lookback(lookback)
 
 
+def _normalize_trim_quantile(trim_quantile: float | None) -> float | None:
+    if trim_quantile is None:
+        return None
+    value = float(trim_quantile)
+    if not np.isfinite(value) or value < 0.0 or value >= 0.5:
+        raise ValueError("trim_quantile must be in [0.0, 0.5).")
+    return value
+
+
 @dataclass
 class Stats:
     dates: np.ndarray
@@ -132,12 +141,25 @@ class Stats:
     sum_log: np.ndarray
     pos_counts: np.ndarray
     geom_invalid: np.ndarray
+    event_returns_by_horizon: List[np.ndarray] | None = None
+    event_date_idx_by_horizon: List[np.ndarray] | None = None
 
     @classmethod
-    def create(cls, dates: np.ndarray, horizons: Iterable[Horizon]) -> "Stats":
+    def create(
+        cls,
+        dates: np.ndarray,
+        horizons: Iterable[Horizon],
+        keep_event_returns: bool = False,
+    ) -> "Stats":
         horizon_list = list(horizons)
         length = len(dates)
         num_h = len(horizon_list)
+        if keep_event_returns:
+            event_returns = [np.empty(0, dtype=np.float32) for _ in range(num_h)]
+            event_date_idx = [np.empty(0, dtype=np.int32) for _ in range(num_h)]
+        else:
+            event_returns = None
+            event_date_idx = None
         return cls(
             dates=dates.copy(),
             horizons=horizon_list,
@@ -146,6 +168,8 @@ class Stats:
             sum_log=np.zeros((num_h, length), dtype=np.float64),
             pos_counts=np.zeros((num_h, length), dtype=np.int64),
             geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
+            event_returns_by_horizon=event_returns,
+            event_date_idx_by_horizon=event_date_idx,
         )
 
     def _slice_indices(self, start=None, end=None) -> Tuple[int, int]:
@@ -165,7 +189,61 @@ class Stats:
         end_idx = max(start_idx, min(end_idx, total))
         return start_idx, end_idx
 
-    def to_frame(self, start=None, end=None) -> pd.DataFrame:
+    @staticmethod
+    def _metrics_from_returns(returns: np.ndarray) -> tuple[float, float, float, float]:
+        clean = np.asarray(returns, dtype=np.float64)
+        clean = clean[np.isfinite(clean)]
+        if clean.size == 0:
+            return 0.0, float("nan"), float("nan"), float("nan")
+
+        cnt = float(clean.size)
+        arith = float(clean.mean())
+        rise = float((clean > 0).mean())
+        if np.any(clean <= -1.0):
+            geom = float("nan")
+        else:
+            geom = float(np.exp(np.log1p(clean).mean()) - 1.0)
+        return cnt, arith, geom, rise
+
+    def _returns_in_range(self, h_idx: int, start_idx: int, end_idx: int) -> np.ndarray:
+        if self.event_returns_by_horizon is None or self.event_date_idx_by_horizon is None:
+            raise ValueError(
+                "trimmed 집계를 위해 event return 버퍼가 필요합니다. "
+                "Backtest에서 trim이 있는 패턴으로 실행하세요."
+            )
+
+        returns = np.asarray(self.event_returns_by_horizon[h_idx], dtype=np.float64)
+        date_idx = np.asarray(self.event_date_idx_by_horizon[h_idx], dtype=np.int64)
+        if returns.shape[0] != date_idx.shape[0]:
+            raise ValueError("event return 버퍼와 date_idx 길이가 일치하지 않습니다.")
+        if returns.size == 0:
+            return np.empty(0, dtype=np.float64)
+
+        in_range = (date_idx >= start_idx) & (date_idx < end_idx)
+        if not in_range.any():
+            return np.empty(0, dtype=np.float64)
+        return returns[in_range]
+
+    def _trimmed_metrics(
+        self,
+        h_idx: int,
+        start_idx: int,
+        end_idx: int,
+        trim_quantile: float,
+    ) -> tuple[float, float, float, float]:
+        returns = self._returns_in_range(h_idx, start_idx, end_idx)
+        returns = returns[np.isfinite(returns)]
+        if returns.size == 0:
+            return 0.0, float("nan"), float("nan"), float("nan")
+
+        if trim_quantile > 0.0:
+            lo = float(np.quantile(returns, trim_quantile))
+            hi = float(np.quantile(returns, 1.0 - trim_quantile))
+            returns = returns[(returns >= lo) & (returns <= hi)]
+        return self._metrics_from_returns(returns)
+
+    def to_frame(self, start=None, end=None, trim_quantile: float | None = None) -> pd.DataFrame:
+        trim_q = _normalize_trim_quantile(trim_quantile)
         start_idx, end_idx = self._slice_indices(start, end)
         rows = []
         if start_idx >= end_idx:
@@ -178,31 +256,31 @@ class Stats:
                 end_date = pd.Timestamp(self.dates[end_idx - 1]).date()
                 scope_label = f"{start_date}~{end_date}"
         for h_idx, (label, _) in enumerate(self.horizons):
-            cnt = float(self.counts[h_idx, start_idx:end_idx].sum())
-            sum_ret = float(self.sum_ret[h_idx, start_idx:end_idx].sum())
-            sum_log = float(self.sum_log[h_idx, start_idx:end_idx].sum())
-            pos = float(self.pos_counts[h_idx, start_idx:end_idx].sum())
-            invalid = bool(self.geom_invalid[h_idx, start_idx:end_idx].any())
-
-            if cnt == 0:
-                rows.append(
-                    {
-                        "period": label,
-                        "scope": scope_label,
-                        "count": 0.0,
-                        "arith_mean": float("nan"),
-                        "geom_mean": float("nan"),
-                        "rise_prob": float("nan"),
-                    }
+            if trim_q is not None and trim_q > 0.0:
+                cnt, arith, geom, rise = self._trimmed_metrics(
+                    h_idx,
+                    start_idx,
+                    end_idx,
+                    trim_q,
                 )
-                continue
-
-            arith = sum_ret / cnt
-            if invalid:
-                geom = float("nan")
             else:
-                geom = float(np.exp(sum_log / cnt) - 1.0)
-            rise = pos / cnt
+                cnt = float(self.counts[h_idx, start_idx:end_idx].sum())
+                sum_ret = float(self.sum_ret[h_idx, start_idx:end_idx].sum())
+                sum_log = float(self.sum_log[h_idx, start_idx:end_idx].sum())
+                pos = float(self.pos_counts[h_idx, start_idx:end_idx].sum())
+                invalid = bool(self.geom_invalid[h_idx, start_idx:end_idx].any())
+
+                if cnt == 0:
+                    arith = float("nan")
+                    geom = float("nan")
+                    rise = float("nan")
+                else:
+                    arith = sum_ret / cnt
+                    if invalid:
+                        geom = float("nan")
+                    else:
+                        geom = float(np.exp(sum_log / cnt) - 1.0)
+                    rise = pos / cnt
             rows.append(
                 {
                     "period": label,
@@ -296,6 +374,7 @@ class Stats:
 @dataclass
 class StatsCollection:
     stats_map: Dict[str, Stats]
+    pattern_trims: Dict[str, float | None] = field(default_factory=dict)
 
     @staticmethod
     def _pattern_colors(names: Iterable[str]) -> Dict[str, str]:
@@ -327,19 +406,48 @@ class StatsCollection:
             raise KeyError(f"Unknown pattern: {name}")
         return self.stats_map[name]
 
-    def to_frame(self, start=None, end=None, pattern: str | None = None) -> pd.DataFrame:
+    def _resolve_trim_for_pattern(
+        self,
+        pattern_name: str,
+        trim_quantile: float | None,
+    ) -> float | None:
+        if trim_quantile is not None:
+            return _normalize_trim_quantile(trim_quantile)
+        return _normalize_trim_quantile(self.pattern_trims.get(pattern_name))
+
+    def _ensure_history_trim_supported(
+        self,
+        pattern_name: str,
+        trim_quantile: float | None,
+    ) -> None:
+        effective_trim = self._resolve_trim_for_pattern(pattern_name, trim_quantile)
+        if effective_trim is not None and effective_trim > 0.0:
+            raise NotImplementedError(
+                "trim_quantile은 현재 to_frame()/plot()에서만 지원됩니다. "
+                "to_frame_history()/plot_history()는 아직 미지원입니다."
+            )
+
+    def to_frame(
+        self,
+        start=None,
+        end=None,
+        pattern: str | None = None,
+        trim_quantile: float | None = None,
+    ) -> pd.DataFrame:
         if not self.stats_map:
             return pd.DataFrame(
                 columns=["period", "scope", "count", "arith_mean", "geom_mean", "rise_prob"]
             ).set_index(["period", "scope"])
 
         if pattern is not None:
-            return self.get(pattern).to_frame(start, end)
+            effective_trim = self._resolve_trim_for_pattern(pattern, trim_quantile)
+            return self.get(pattern).to_frame(start, end, trim_quantile=effective_trim)
 
         frames = []
         keys = []
         for name, stats in self.stats_map.items():
-            frames.append(stats.to_frame(start, end))
+            effective_trim = self._resolve_trim_for_pattern(name, trim_quantile)
+            frames.append(stats.to_frame(start, end, trim_quantile=effective_trim))
             keys.append(name)
         combined = pd.concat(frames, keys=keys, names=["pattern"])
         return combined
@@ -353,6 +461,7 @@ class StatsCollection:
         min_count: int = 30,
         require_full_window: bool = True,
         pattern: str | None = None,
+        trim_quantile: float | None = None,
     ) -> pd.DataFrame:
         if not self.stats_map:
             return pd.DataFrame(
@@ -360,6 +469,7 @@ class StatsCollection:
             )
 
         if pattern is not None:
+            self._ensure_history_trim_supported(pattern, trim_quantile)
             return self.get(pattern).to_frame_history(
                 horizon=horizon,
                 start=start,
@@ -372,6 +482,7 @@ class StatsCollection:
         frames = []
         keys = []
         for name, stats in self.stats_map.items():
+            self._ensure_history_trim_supported(name, trim_quantile)
             frames.append(
                 stats.to_frame_history(
                     horizon=horizon,
@@ -390,6 +501,7 @@ class StatsCollection:
         patterns: Iterable[str] | None = None,
         start=None,
         end=None,
+        trim_quantile: float | None = None,
         figsize=(12, 4),
         rise_ylim=None,
         return_ylim=None,
@@ -407,7 +519,8 @@ class StatsCollection:
         color_map = self._pattern_colors(names)
         frames = []
         for name in names:
-            df = self.get(name).to_frame(start, end).reset_index()
+            effective_trim = self._resolve_trim_for_pattern(name, trim_quantile)
+            df = self.get(name).to_frame(start, end, trim_quantile=effective_trim).reset_index()
             df["pattern"] = name
             frames.append(df)
         combined = pd.concat(frames, ignore_index=True)
@@ -475,6 +588,7 @@ class StatsCollection:
         short: str = "1Y",
         long: str = "3Y",
         patterns: Iterable[str] | None = None,
+        trim_quantile: float | None = None,
         figsize=(12, 4),
         rise_ylim=None,
         return_ylim=None,
@@ -489,6 +603,7 @@ class StatsCollection:
             patterns=patterns,
             start=short_start,
             end=asof_ts,
+            trim_quantile=trim_quantile,
             figsize=figsize,
             rise_ylim=rise_ylim,
             return_ylim=return_ylim,
@@ -497,6 +612,7 @@ class StatsCollection:
             patterns=patterns,
             start=long_start,
             end=asof_ts,
+            trim_quantile=trim_quantile,
             figsize=figsize,
             rise_ylim=rise_ylim,
             return_ylim=return_ylim,
@@ -515,6 +631,7 @@ class StatsCollection:
         patterns: Iterable[str] | None = None,
         start=None,
         end=None,
+        trim_quantile: float | None = None,
         figsize=(12, 4),
         history_window: int = 252,
         min_count: int = 30,
@@ -548,6 +665,7 @@ class StatsCollection:
                 min_count=min_count,
                 require_full_window=require_full_window,
                 pattern=name,
+                trim_quantile=trim_quantile,
             )
             dates = df.index.to_numpy()
             arith = _as_percent(df["arith_mean"].to_numpy(dtype=float))
