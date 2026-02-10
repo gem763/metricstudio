@@ -151,6 +151,17 @@ def _apply_date_ticks(axes, dates):
         ax.tick_params(axis="x", labelrotation=0)
 
 
+def _draw_hline_if_in_view(ax, y: float, **kwargs) -> bool:
+    ymin, ymax = ax.get_ylim()
+    lo, hi = (ymin, ymax) if ymin <= ymax else (ymax, ymin)
+    if lo <= y <= hi:
+        ax.axhline(y, **kwargs)
+        # Keep the current view so the reference line does not expand autoscale.
+        ax.set_ylim(ymin, ymax)
+        return True
+    return False
+
+
 def _rolling_sum_1d(values: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return values.astype(np.float64, copy=True)
@@ -668,7 +679,6 @@ class StatsCollection:
         axes[0].set_ylabel("Return (%)")
         axes[2].set_ylabel("Rise Probability (%)")
         axes[0].legend()
-        axes[2].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
 
         arith_vals = combined["arith_mean"].to_numpy(dtype=float) * 100.0
         geom_vals = combined["geom_mean"].to_numpy(dtype=float) * 100.0
@@ -690,6 +700,7 @@ class StatsCollection:
         rise_ylim_pct = _normalize_ylim_percent(rise_ylim)
         if rise_ylim_pct is not None:
             axes[2].set_ylim(*rise_ylim_pct)
+        _draw_hline_if_in_view(axes[2], 50.0, color="gray", linewidth=0.8, linestyle="--")
 
         _share_return_y_axis(axes)
         _apply_integer_y_ticks(axes)
@@ -878,7 +889,6 @@ class StatsCollection:
         axes[0].set_title(f"{title_prefix} Arithmetic Mean")
         axes[1].set_title(f"{title_prefix} Geometric Mean")
         axes[2].set_title(f"{title_prefix} Rise Probability")
-        axes[2].axhline(50.0, color="gray", linewidth=0.8, linestyle="--")
 
         axes[0].legend()
 
@@ -903,6 +913,7 @@ class StatsCollection:
         rise_ylim_pct = _normalize_ylim_percent(rise_ylim)
         if rise_ylim_pct is not None:
             axes[2].set_ylim(*rise_ylim_pct)
+        _draw_hline_if_in_view(axes[2], 50.0, color="gray", linewidth=0.8, linestyle="--")
 
         if first_dates is not None:
             _apply_date_ticks(axes, first_dates)

@@ -285,11 +285,11 @@ def cooldown_mask(mask: np.ndarray, cooldown: int) -> np.ndarray:
 
 
 @njit(cache=True)
-def min_stay_mask(condition: np.ndarray, min_stay: int) -> np.ndarray:
+def stay_mask(condition: np.ndarray, stay_days: int) -> np.ndarray:
     """
-    condition이 min_stay일 이상 연속일 때만 True를 남긴다.
+    condition이 stay_days일 이상 연속일 때만 True를 남긴다.
     """
-    if min_stay <= 1:
+    if stay_days <= 1:
         return condition.copy()
     n = condition.shape[0]
     out = np.zeros(n, dtype=np.bool_)
@@ -299,8 +299,46 @@ def min_stay_mask(condition: np.ndarray, min_stay: int) -> np.ndarray:
             run += 1
         else:
             run = 0
-        if run >= min_stay:
+        if run >= stay_days:
             out[i] = True
+    return out
+
+
+@njit(cache=True)
+def cooldown_stay_mask(
+    condition: np.ndarray,
+    stay_days: int,
+    cooldown_days: int,
+) -> np.ndarray:
+    """
+    연속 유지(stay) 조건과 출현 간격(cooldown) 조건을 결합한 마스크.
+
+    - stay_days: condition이 연속으로 유지되어야 하는 최소 일수
+    - cooldown_days: 이전 출현과의 최소 간격
+    """
+    sustained = stay_mask(condition, stay_days)
+    if cooldown_days <= 0:
+        return sustained
+
+    n = sustained.shape[0]
+    entries = np.zeros(n, dtype=np.bool_)
+    for i in range(n):
+        if sustained[i] and (i == 0 or not sustained[i - 1]):
+            entries[i] = True
+    entries = cooldown_mask(entries, cooldown_days)
+
+    out = np.zeros(n, dtype=np.bool_)
+    i = 0
+    while i < n:
+        if not sustained[i]:
+            i += 1
+            continue
+        run_start = i
+        while i < n and sustained[i]:
+            i += 1
+        if entries[run_start]:
+            for j in range(run_start, i):
+                out[j] = True
     return out
 
 
@@ -308,23 +346,33 @@ def min_stay_mask(condition: np.ndarray, min_stay: int) -> np.ndarray:
 def uptrend_mask(
     prices: np.ndarray,
     window: int,
+    stay_days: int = 1,
+    cooldown_days: int = 0,
 ) -> np.ndarray:
     """
     이동평균 기울기(전일 대비 상승) 기반 추세 마스크.
+
+    - stay_days: 상승 추세가 연속으로 유지되어야 하는 최소 일수
+    - cooldown_days: 출현 직전 최소 비출현 일수(쿨다운)
     """
     n = prices.shape[0]
     if window <= 1 or n < window:
         return np.ones(n, dtype=np.bool_)
+
+    min_stay = max(1, int(stay_days))
+    cooldown = max(0, int(cooldown_days))
+
     mean_up, valid_up = rolling_mean(prices, window)
-    out = np.zeros(n, dtype=np.bool_)
+    up = np.zeros(n, dtype=np.bool_)
     for i in range(1, n):
         if valid_up[i] and valid_up[i - 1] and mean_up[i] > mean_up[i - 1]:
-            out[i] = True
-    return out
+            up[i] = True
+
+    return cooldown_stay_mask(up, min_stay, cooldown)
 
 
 @njit(cache=True)
-def breakout_mask(
+def break_mask(
     prices: np.ndarray,
     trigger_line: np.ndarray,
     base_mask: np.ndarray,
@@ -356,7 +404,7 @@ def breakout_mask(
 
 
 @njit(cache=True)
-def proximity_mask(
+def approach_mask(
     prices: np.ndarray,
     trigger_line: np.ndarray,
     base_mask: np.ndarray,
@@ -390,40 +438,7 @@ def proximity_mask(
         else:
             out[i] = p <= t * (1.0 + tol)
 
-    return min_stay_mask(out, stay_days)
-
-
-@njit(cache=True)
-def trigger_mask(
-    prices: np.ndarray,
-    upper: np.ndarray,
-    base_mask: np.ndarray,
-    trigger_mode: int,
-    cooldown: int,
-    topclose_tolerance: float,
-    topclose_stay_days: int,
-) -> np.ndarray:
-    """
-    레거시 호환용 트리거 래퍼.
-
-    새 코드는 breakout_mask/proximity_mask 사용을 권장한다.
-    """
-    if trigger_mode == 1:
-        return proximity_mask(
-            prices,
-            upper,
-            base_mask,
-            topclose_tolerance,
-            topclose_stay_days,
-            1,
-        )
-    return breakout_mask(
-        prices,
-        upper,
-        base_mask,
-        1,
-        cooldown,
-    )
+    return stay_mask(out, stay_days)
 
 
 @njit(cache=True)
@@ -455,13 +470,13 @@ def bandwidth_mask(
 
     if mode == 0 or narrow_width <= 0:
         if narrow_width <= 0:
-            return min_stay_mask(valid_end, narrow_stay_days)
+            return stay_mask(valid_end, narrow_stay_days)
         out = np.zeros(n, dtype=np.bool_)
         thresh = narrow_width
         for i in range(n):
             v = ratio[i]
             out[i] = np.isfinite(v) and v <= thresh
-        return min_stay_mask(out, narrow_stay_days)
+        return stay_mask(out, narrow_stay_days)
 
     thresholds = rolling_percentile_hist(ratio, lookback, narrow_width * 100.0, 128)
     out = np.zeros(n, dtype=np.bool_)
@@ -469,7 +484,7 @@ def bandwidth_mask(
         v = ratio[i]
         t = thresholds[i]
         out[i] = np.isfinite(v) and np.isfinite(t) and v <= t
-    return min_stay_mask(out, narrow_stay_days)
+    return stay_mask(out, narrow_stay_days)
 
 
 @njit(cache=True)
@@ -477,6 +492,8 @@ def high_mask(
     prices: np.ndarray,
     window: int,
     threshold: float,
+    stay_days: int = 1,
+    cooldown_days: int = 0,
 ) -> np.ndarray:
     """
     rolling high 대비 threshold 이상인 구간 마스크.
@@ -484,10 +501,12 @@ def high_mask(
     n = prices.shape[0]
     if window <= 0:
         return np.ones(n, dtype=np.bool_)
+    min_stay = max(1, int(stay_days))
+    cooldown = max(0, int(cooldown_days))
     high_series = rolling_high(prices, window)
     out = np.zeros(n, dtype=np.bool_)
     for i in range(n):
         h = high_series[i]
         if np.isfinite(h) and prices[i] >= threshold * h:
             out[i] = True
-    return out
+    return cooldown_stay_mask(out, min_stay, cooldown)
