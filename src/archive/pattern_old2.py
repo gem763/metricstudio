@@ -64,7 +64,7 @@ def bollinger(
 
     # 2) 밴드폭(좁은 구간) 조건
     mode = 0 if narrow_width_type == "absolute" else 1
-    mask &= u.narrow_mask(
+    mask &= u.bandwidth_mask(
         mean,
         band_width,
         valid_end,

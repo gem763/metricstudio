@@ -23,7 +23,6 @@ class Pattern:
         self.__name__ = self.name
         self.trim = self._normalize_trim(trim)
         self._post_mask_fn: Callable[[np.ndarray], np.ndarray] = self._post_mask_base
-        self._post_mask_steps: list[tuple[str, tuple[object, ...]]] = []
 
     @staticmethod
     def _normalize_trim(trim: float | None) -> float | None:
@@ -37,8 +36,6 @@ class Pattern:
     def _chain_post_mask(
         self,
         step_fn: Callable[[np.ndarray], np.ndarray],
-        step_name: str | None = None,
-        step_args: tuple[object, ...] = (),
     ):
         prev_fn = self._post_mask_fn
 
@@ -48,51 +45,16 @@ class Pattern:
             return prev_mask & step_mask
 
         self._post_mask_fn = _composed
-        if step_name is not None:
-            self._post_mask_steps.append((str(step_name), tuple(step_args)))
         return self
 
     def high(self, window: int, threshold: float = 0.9):
         w = int(window)
         t = float(threshold)
-        return self._chain_post_mask(
-            lambda prices, _w=w, _t=t: u.high_mask(prices, _w, _t),
-            step_name="high",
-            step_args=(w, t),
-        )
+        return self._chain_post_mask(lambda prices, _w=w, _t=t: u.high_mask(prices, _w, _t))
 
     def uptrend(self, window: int):
         w = int(window)
-        return self._chain_post_mask(
-            lambda prices, _w=w: u.uptrend_mask(prices, _w),
-            step_name="uptrend",
-            step_args=(w,),
-        )
-
-    @staticmethod
-    def _freeze_for_key(value: object):
-        if isinstance(value, (str, int, float, bool, type(None))):
-            return value
-        if isinstance(value, np.generic):
-            return value.item()
-        if isinstance(value, (list, tuple)):
-            return tuple(Pattern._freeze_for_key(v) for v in value)
-        if isinstance(value, dict):
-            return tuple(sorted((str(k), Pattern._freeze_for_key(v)) for k, v in value.items()))
-        return repr(value)
-
-    def execution_key(self):
-        attrs = []
-        for key, value in vars(self).items():
-            if key in {"name", "__name__", "trim", "_post_mask_fn"}:
-                continue
-            attrs.append((str(key), self._freeze_for_key(value)))
-        attrs.sort(key=lambda item: item[0])
-        return (
-            self.__class__.__module__,
-            self.__class__.__qualname__,
-            tuple(attrs),
-        )
+        return self._chain_post_mask(lambda prices, _w=w: u.uptrend_mask(prices, _w))
 
     def __call__(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -109,8 +71,16 @@ class Pattern:
 
 
 class Default(Pattern):
-    def __init__(self, name: str = "default", trim: float | None = None):
-        super().__init__(name=name, default_name="default", trim=trim)
+    def __init__(
+        self,
+        name: str = "default",
+        trim: float | None = None,
+    ):
+        super().__init__(
+            name=name,
+            default_name="default",
+            trim=trim,
+        )
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -122,33 +92,44 @@ class Bollinger(Pattern):
         self,
         window: int = 20,
         sigma: float = 2.0,
-        narrow_width: float = 1.0,
-        narrow_stay_days: int = 1,
-        narrow_width_type: Literal["absolute", "percentile"] = "absolute",
-        narrow_percentile_window: int = 252,
-        trigger: Literal["breakout", "topclose"] = "breakout",
-        trigger_cooldown_days: int = 3,
-        trigger_topclose_tolerance: float = 0.03,
-        trigger_topclose_stay_days: int = 3,
+        bandwidth: float = 1.0,
+        bandwidth_stay_days: int = 1,
+        bandwidth_type: Literal["absolute", "percentile"] = "absolute",
+        bandwidth_percentile_window: int = 252,
+        trigger: Literal[
+            "top_break",
+            "bottom_break",
+            "top_close",
+            "bottom_close",
+        ] = "top_break",
+        cooldown_days: int = 3,
+        proximity_tolerance: float = 0.03,
+        proximity_stay_days: int = 3,
         name: str | None = None,
         trim: float | None = None,
     ):
-        super().__init__(name=name, default_name="bollinger", trim=trim)
+        super().__init__(
+            name=name,
+            default_name="bollinger",
+            trim=trim,
+        )
         self.window = int(window)
         self.sigma = float(sigma)
-        self.narrow_width = float(narrow_width)
-        self.narrow_stay_days = int(max(1, narrow_stay_days))
-        self.narrow_width_type = (narrow_width_type or "absolute").lower()
-        self.narrow_percentile_window = int(max(1, narrow_percentile_window))
-        self.trigger = (trigger or "breakout").lower()
-        self.trigger_cooldown_days = int(max(0, trigger_cooldown_days))
-        self.trigger_topclose_tolerance = float(trigger_topclose_tolerance)
-        self.trigger_topclose_stay_days = int(max(1, trigger_topclose_stay_days))
+        self.bandwidth = float(bandwidth)
+        self.bandwidth_stay_days = int(max(1, bandwidth_stay_days))
+        self.bandwidth_type = (bandwidth_type or "absolute").lower()
+        self.bandwidth_percentile_window = int(max(1, bandwidth_percentile_window))
+        self.trigger = (trigger or "top_break").lower()
+        self.cooldown_days = int(max(0, cooldown_days))
+        self.proximity_tolerance = float(proximity_tolerance)
+        self.proximity_stay_days = int(max(1, proximity_stay_days))
 
-        if self.narrow_width_type not in {"absolute", "percentile"}:
-            raise ValueError("narrow_width_type must be 'absolute' or 'percentile'")
-        if self.trigger not in {"breakout", "topclose"}:
-            raise ValueError("trigger must be 'breakout' or 'topclose'")
+        if self.bandwidth_type not in {"absolute", "percentile"}:
+            raise ValueError("bandwidth_type must be 'absolute' or 'percentile'")
+        if self.trigger not in {"top_break", "bottom_break", "top_close", "bottom_close"}:
+            raise ValueError(
+                "trigger must be one of {'top_break', 'bottom_break', 'top_close', 'bottom_close'}."
+            )
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -164,28 +145,48 @@ class Bollinger(Pattern):
 
         band_width = self.sigma * std
         upper = mean + band_width
+        lower = mean - band_width
         mask = valid_end.copy()
 
-        mode = 0 if self.narrow_width_type == "absolute" else 1
-        mask &= u.narrow_mask(
+        mode = 0 if self.bandwidth_type == "absolute" else 1
+        mask &= u.bandwidth_mask(
             mean,
             band_width,
             valid_end,
-            self.narrow_width,
+            self.bandwidth,
             mode,
-            self.narrow_percentile_window,
-            self.narrow_stay_days,
+            self.bandwidth_percentile_window,
+            self.bandwidth_stay_days,
         )
 
-        trigger_mode = 0 if self.trigger == "breakout" else 1
-        return u.trigger_mask(
-            prices,
-            upper,
-            mask,
-            trigger_mode,
-            self.trigger_cooldown_days,
-            self.trigger_topclose_tolerance,
-            self.trigger_topclose_stay_days,
-        )
+        if self.trigger.startswith("top_"):
+            trigger_line = upper
+            direction = 1
+        elif self.trigger.startswith("bottom_"):
+            trigger_line = lower
+            direction = -1
+        else:
+            raise ValueError(f"unsupported trigger side: {self.trigger}")
+
+        if self.trigger.endswith("_close"):
+            return u.proximity_mask(
+                prices,
+                trigger_line,
+                mask,
+                self.proximity_tolerance,
+                self.proximity_stay_days,
+                direction,
+            )
+
+        if self.trigger.endswith("_break"):
+            return u.breakout_mask(
+                prices,
+                trigger_line,
+                mask,
+                direction,
+                self.cooldown_days,
+            )
+
+        raise ValueError(f"unsupported trigger kind: {self.trigger}")
 
 __all__ = ["Default", "Bollinger"]

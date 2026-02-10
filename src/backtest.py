@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple, Optional
-import inspect
 
 import numpy as np
 import pandas as pd
@@ -93,6 +92,121 @@ def _numba_accumulate_returns(
                 sum_log[h_idx, i] += np.log1p(ret)
 
 
+@njit(cache=True)
+def _numba_accumulate_occurrences(mask, start_idx, end_idx, occurrence_counts):
+    if end_idx < start_idx:
+        end_idx = start_idx
+    length = len(mask)
+    lo = max(0, start_idx)
+    hi = min(end_idx, length)
+    for i in range(lo, hi):
+        if mask[i]:
+            occurrence_counts[i] += 1
+
+
+@njit(cache=True)
+def _numba_quantile_linear_sorted(sorted_vals, n, q):
+    if n <= 0:
+        return np.nan
+    if q <= 0.0:
+        return sorted_vals[0]
+    if q >= 1.0:
+        return sorted_vals[n - 1]
+    pos = (n - 1) * q
+    lo = int(np.floor(pos))
+    hi = int(np.ceil(pos))
+    if lo == hi:
+        return sorted_vals[lo]
+    w = pos - lo
+    return sorted_vals[lo] * (1.0 - w) + sorted_vals[hi] * w
+
+
+@njit(cache=True)
+def _numba_accumulate_trim_for_date(
+    prices,
+    mask_row,
+    date_idx,
+    horizon_offsets,
+    trim_q,
+    counts,
+    sum_ret,
+    sum_log,
+    pos_counts,
+    geom_invalid,
+    daily_arith,
+    daily_geom,
+    daily_rise,
+):
+    num_dates = prices.shape[0]
+    num_codes = prices.shape[1]
+    num_h = len(horizon_offsets)
+    returns_buf = np.empty(num_codes, dtype=np.float64)
+
+    for h_idx in range(num_h):
+        step = int(horizon_offsets[h_idx])
+        fwd_idx = date_idx + step
+        if fwd_idx >= num_dates:
+            continue
+
+        n = 0
+        for code_idx in range(num_codes):
+            if not mask_row[code_idx]:
+                continue
+
+            base = prices[date_idx, code_idx]
+            if not np.isfinite(base) or base <= 0.0:
+                continue
+
+            fwd = prices[fwd_idx, code_idx]
+            if not np.isfinite(fwd) or fwd <= 0.0:
+                continue
+
+            returns_buf[n] = fwd / base - 1.0
+            n += 1
+
+        if n == 0:
+            continue
+
+        sorted_vals = np.sort(returns_buf[:n])
+        low = _numba_quantile_linear_sorted(sorted_vals, n, trim_q)
+        high = _numba_quantile_linear_sorted(sorted_vals, n, 1.0 - trim_q)
+
+        kept_count = 0
+        kept_pos = 0
+        kept_sum_ret = 0.0
+        kept_sum_log = 0.0
+        has_geom_invalid = False
+
+        for k in range(n):
+            ret = returns_buf[k]
+            if ret < low or ret > high:
+                continue
+            kept_count += 1
+            kept_sum_ret += ret
+            if ret > 0.0:
+                kept_pos += 1
+            if ret <= -1.0:
+                has_geom_invalid = True
+            else:
+                kept_sum_log += np.log1p(ret)
+
+        if kept_count == 0:
+            continue
+
+        counts[h_idx, date_idx] = kept_count
+        pos_counts[h_idx, date_idx] = kept_pos
+        sum_ret[h_idx, date_idx] = kept_sum_ret
+        daily_arith[h_idx, date_idx] = kept_sum_ret / kept_count
+        daily_rise[h_idx, date_idx] = kept_pos / kept_count
+
+        if has_geom_invalid:
+            geom_invalid[h_idx, date_idx] = True
+            continue
+
+        sum_log[h_idx, date_idx] = kept_sum_log
+        daily_geom[h_idx, date_idx] = np.exp(kept_sum_log / kept_count) - 1.0
+
+
 def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
     import inspect
 
@@ -120,71 +234,22 @@ def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
     return f"pattern_{idx}"
 
 
-def _infer_pattern_trim(pattern_fn: PatternArrayFn) -> float | None:
-    candidate = getattr(pattern_fn, "trim", None)
-    if candidate is None:
-        keywords = getattr(pattern_fn, "keywords", None)
-        if isinstance(keywords, dict):
-            candidate = keywords.get("trim")
-    if candidate is None:
+def _normalize_trim_quantile(trim: float | None) -> float | None:
+    if trim is None:
         return None
-    value = float(candidate)
+    value = float(trim)
     if not np.isfinite(value) or value < 0.0 or value >= 0.5:
         raise ValueError("trim must be in [0.0, 0.5).")
     return value
 
 
-def _collect_forward_returns(
-    values: np.ndarray,
-    mask: np.ndarray,
-    start_idx: int,
-    end_idx: int,
-    horizon_offsets: np.ndarray,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    prices = np.asarray(values, dtype=np.float64)
-    valid_mask = np.asarray(mask, dtype=np.bool_)
-    length = prices.shape[0]
-    num_h = len(horizon_offsets)
-
-    idx_by_h = [np.empty(0, dtype=np.int32) for _ in range(num_h)]
-    ret_by_h = [np.empty(0, dtype=np.float32) for _ in range(num_h)]
-    base_ok = valid_mask & np.isfinite(prices) & (prices > 0.0)
-
-    for h_idx, step_raw in enumerate(horizon_offsets):
-        step = int(step_raw)
-        if step <= 0 or step >= length:
-            continue
-
-        valid_len = length - step
-        base = prices[:valid_len]
-        fwd = prices[step:]
-        valid = base_ok[:valid_len] & np.isfinite(fwd) & (fwd > 0.0)
-
-        lo = max(0, int(start_idx))
-        hi = min(int(end_idx), valid_len)
-        if lo >= valid_len or hi <= 0 or lo >= hi:
-            continue
-        if lo > 0:
-            valid[:lo] = False
-        if hi < valid_len:
-            valid[hi:] = False
-
-        date_idx = np.flatnonzero(valid)
-        if date_idx.size == 0:
-            continue
-
-        ret = fwd[date_idx] / base[date_idx] - 1.0
-        finite = np.isfinite(ret)
-        if not np.all(finite):
-            date_idx = date_idx[finite]
-            ret = ret[finite]
-        if date_idx.size == 0:
-            continue
-
-        idx_by_h[h_idx] = date_idx.astype(np.int32, copy=False)
-        ret_by_h[h_idx] = ret.astype(np.float32, copy=False)
-
-    return idx_by_h, ret_by_h
+def _infer_pattern_trim(pattern_fn: PatternArrayFn) -> float | None:
+    trim = getattr(pattern_fn, "trim", None)
+    if trim is None:
+        keywords = getattr(pattern_fn, "keywords", None)
+        if isinstance(keywords, dict):
+            trim = keywords.get("trim")
+    return _normalize_trim_quantile(trim)
 
 
 class Backtest:
@@ -206,34 +271,38 @@ class Backtest:
         self.end_idx = min(self.end_idx, len(self.dates))
         self.benchmark = benchmark
         self._base_stats = {}
-        self._base_trims = {}
         if benchmark is not None:
             base_name = _infer_pattern_label(benchmark, 0)
-            trim_quantile = _infer_pattern_trim(benchmark)
+            base_trim = _infer_pattern_trim(benchmark)
             self._base_stats[base_name] = self._run_pattern(
                 benchmark,
-                keep_event_returns=trim_quantile is not None and trim_quantile > 0.0,
+                trim_quantile=base_trim,
+                progress_label=base_name,
             )
-            self._base_trims[base_name] = trim_quantile
 
-    def _run_pattern(
-        self,
-        pattern_fn: PatternArrayFn,
-        keep_event_returns: bool = False,
-        progress_desc: str = "codes",
-    ) -> Stats:
-        stats = Stats.create(self.dates, HORIZONS, keep_event_returns=keep_event_returns)
-        num_h = len(self.horizon_offsets)
-        if keep_event_returns:
-            event_idx_chunks: list[list[np.ndarray]] = [[] for _ in range(num_h)]
-            event_ret_chunks: list[list[np.ndarray]] = [[] for _ in range(num_h)]
-        for col_idx, code in enumerate(tqdm(self.codes, desc=progress_desc)):
+    @staticmethod
+    def _compute_mask(pattern_fn: PatternArrayFn, values: np.ndarray, code: str) -> np.ndarray | None:
+        mask = pattern_fn(values)
+        if mask is None:
+            return None
+        mask_arr = np.asarray(mask, dtype=np.bool_)
+        if mask_arr.shape != values.shape:
+            raise ValueError(f"pattern mask shape mismatch for code {code}")
+        return mask_arr
+
+    def _run_pattern_normal(self, pattern_fn: PatternArrayFn, progress_label: str) -> Stats:
+        stats = Stats.create(self.dates, HORIZONS)
+        for col_idx, code in enumerate(tqdm(self.codes, desc=f"{progress_label} | codes")):
             values = self.prices[:, col_idx]
-            mask = pattern_fn(values)
+            mask = self._compute_mask(pattern_fn, values, code)
             if mask is None:
                 continue
-            if mask.shape != values.shape:
-                raise ValueError(f"pattern mask shape mismatch for code {code}")
+            _numba_accumulate_occurrences(
+                mask,
+                self.start_idx,
+                self.end_idx,
+                stats.occurrence_counts,
+            )
             _numba_accumulate_returns(
                 values,
                 mask,
@@ -246,53 +315,93 @@ class Backtest:
                 stats.pos_counts,
                 stats.geom_invalid,
             )
-            if keep_event_returns:
-                idx_by_h, ret_by_h = _collect_forward_returns(
-                    values,
-                    mask,
-                    self.start_idx,
-                    self.end_idx,
-                    self.horizon_offsets,
-                )
-                for h_idx in range(num_h):
-                    if idx_by_h[h_idx].size == 0:
-                        continue
-                    event_idx_chunks[h_idx].append(idx_by_h[h_idx])
-                    event_ret_chunks[h_idx].append(ret_by_h[h_idx])
-
-        if keep_event_returns:
-            event_date_idx_by_horizon: list[np.ndarray] = []
-            event_returns_by_horizon: list[np.ndarray] = []
-            for h_idx in range(num_h):
-                if not event_idx_chunks[h_idx]:
-                    event_date_idx_by_horizon.append(np.empty(0, dtype=np.int32))
-                    event_returns_by_horizon.append(np.empty(0, dtype=np.float32))
-                    continue
-                date_idx = np.concatenate(event_idx_chunks[h_idx]).astype(np.int32, copy=False)
-                returns = np.concatenate(event_ret_chunks[h_idx]).astype(np.float32, copy=False)
-                order = np.argsort(date_idx, kind="mergesort")
-                event_date_idx_by_horizon.append(date_idx[order])
-                event_returns_by_horizon.append(returns[order])
-            stats.event_date_idx_by_horizon = event_date_idx_by_horizon
-            stats.event_returns_by_horizon = event_returns_by_horizon
         return stats
 
+    def _build_mask_matrix(self, pattern_fn: PatternArrayFn, eval_len: int) -> np.ndarray:
+        num_codes = len(self.codes)
+        mask_matrix = np.zeros((eval_len, num_codes), dtype=np.bool_)
+        if eval_len == 0:
+            return mask_matrix
+
+        for col_idx, code in enumerate(self.codes):
+            values = self.prices[:, col_idx]
+            mask = self._compute_mask(pattern_fn, values, code)
+            if mask is None:
+                continue
+            mask_matrix[:, col_idx] = mask[self.start_idx:self.end_idx]
+        return mask_matrix
+
+    def _accumulate_trim_dates(
+        self,
+        mask_matrix: np.ndarray,
+        trim_q: float,
+        stats: Stats,
+        progress_label: str,
+    ) -> None:
+        daily_arith = stats.daily_arith
+        daily_geom = stats.daily_geom
+        daily_rise = stats.daily_rise
+        if daily_arith is None or daily_geom is None or daily_rise is None:
+            raise ValueError("daily stats buffer is required for trim mode.")
+
+        for i_local in tqdm(range(mask_matrix.shape[0]), desc=f"{progress_label} | trim"):
+            i = self.start_idx + i_local
+            _numba_accumulate_trim_for_date(
+                self.prices,
+                mask_matrix[i_local],
+                i,
+                self.horizon_offsets,
+                trim_q,
+                stats.counts,
+                stats.sum_ret,
+                stats.sum_log,
+                stats.pos_counts,
+                stats.geom_invalid,
+                daily_arith,
+                daily_geom,
+                daily_rise,
+            )
+
+    def _run_pattern_trim(self, pattern_fn: PatternArrayFn, trim_q: float, progress_label: str) -> Stats:
+        stats = Stats.create_daily(self.dates, HORIZONS)
+        eval_len = max(0, self.end_idx - self.start_idx)
+        mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
+        if eval_len > 0:
+            stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
+                mask_matrix,
+                axis=1,
+                dtype=np.int64,
+            )
+        self._accumulate_trim_dates(mask_matrix, trim_q, stats, progress_label)
+        return stats
+
+    def _run_pattern(
+        self,
+        pattern_fn: PatternArrayFn,
+        trim_quantile: float | None = None,
+        progress_label: str = "pattern",
+    ) -> Stats:
+        trim_q = _normalize_trim_quantile(trim_quantile)
+        if trim_q is None or trim_q <= 0.0:
+            return self._run_pattern_normal(pattern_fn, progress_label)
+        return self._run_pattern_trim(pattern_fn, trim_q, progress_label)
+
     def run(self, *patterns: PatternArrayFn, include_base: bool = True, **shared_kwargs) -> StatsCollection:
+        if not patterns and include_base and self.benchmark is not None:
+            return StatsCollection(
+                dict(self._base_stats),
+                benchmark_names=set(self._base_stats.keys()),
+            )
+
         stats_map: Dict[str, Stats] = {}
-        pattern_trims: Dict[str, float | None] = {}
+        benchmark_names: set[str] = set()
         if include_base:
             stats_map.update(self._base_stats)
-            pattern_trims.update(self._base_trims)
+            benchmark_names = set(self._base_stats.keys())
 
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
-            trim_quantile = _infer_pattern_trim(pattern_fn)
             base_name = _infer_pattern_label(pattern_fn, idx)
-            name = base_name
-            suffix = 2
-            while name in stats_map:
-                name = f"{base_name}_{suffix}"
-                suffix += 1
-
+            trim_q = _infer_pattern_trim(pattern_fn)
             wrapped = pattern_fn
             if shared_kwargs:
                 def _wrapped(values, _fn=pattern_fn, _kwargs=shared_kwargs):
@@ -301,13 +410,16 @@ class Backtest:
                 wrapped = _wrapped
             stats = self._run_pattern(
                 wrapped,
-                keep_event_returns=trim_quantile is not None and trim_quantile > 0.0,
-                progress_desc=f"codes:{name}",
+                trim_quantile=trim_q,
+                progress_label=base_name,
             )
-
+            name = base_name
+            suffix = 2
+            while name in stats_map:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
             stats_map[name] = stats
-            pattern_trims[name] = trim_quantile
 
         if not stats_map:
             raise ValueError("No patterns were executed.")
-        return StatsCollection(stats_map, pattern_trims=pattern_trims)
+        return StatsCollection(stats_map, benchmark_names=benchmark_names)

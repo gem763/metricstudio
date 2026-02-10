@@ -1,4 +1,6 @@
-"""Numba 기반 패턴 유틸리티 함수 모음."""
+"""
+Numba 기반 패턴 유틸리티 함수 모음.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +8,15 @@ import numpy as np
 from numba import njit
 
 
+# ---- Rolling 통계 유틸 ----
+
 @njit(cache=True)
 def rolling_high(values: np.ndarray, window: int) -> np.ndarray:
+    """
+    슬라이딩 윈도우 최대값(rolling high)을 O(n)으로 계산한다.
+
+    유효값은 finite 이고 0보다 큰 값만 인정한다.
+    """
     n = values.shape[0]
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
@@ -39,6 +48,12 @@ def rolling_high(values: np.ndarray, window: int) -> np.ndarray:
 
 @njit(cache=True)
 def rolling_mean_std(values: np.ndarray, window: int):
+    """
+    롤링 평균/표준편차를 계산한다.
+
+    윈도우 내부 값이 모두 유효(finite, >0)할 때만 결과를 내고,
+    그렇지 않으면 해당 위치는 NaN/False로 남긴다.
+    """
     n = values.shape[0]
     mean = np.empty(n, dtype=np.float64)
     std = np.empty(n, dtype=np.float64)
@@ -79,6 +94,11 @@ def rolling_mean_std(values: np.ndarray, window: int):
 
 @njit(cache=True)
 def rolling_mean(values: np.ndarray, window: int):
+    """
+    롤링 평균을 계산한다.
+
+    윈도우 내부 값이 모두 유효(finite, >0)할 때만 평균을 기록한다.
+    """
     n = values.shape[0]
     mean = np.empty(n, dtype=np.float64)
     valid_end = np.zeros(n, dtype=np.bool_)
@@ -109,6 +129,12 @@ def rolling_mean(values: np.ndarray, window: int):
 
 @njit(cache=True)
 def rolling_percentile(values: np.ndarray, window: int, percentile: float) -> np.ndarray:
+    """
+    정확 rolling percentile 계산(윈도우 정렬 기반).
+
+    현재 메인 파이프라인에서는 미사용이며,
+    정밀 percentile이 필요할 때 사용할 수 있는 대안 구현이다.
+    """
     n = values.shape[0]
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
@@ -146,6 +172,12 @@ def rolling_percentile_hist(
     percentile: float,
     bins: int,
 ) -> np.ndarray:
+    """
+    히스토그램 기반 rolling percentile 근사 계산.
+
+    전역 min/max 범위를 bins로 나눠 분위수를 근사한다.
+    현재 메인 파이프라인에서는 bandwidth_mask(percentile 모드)에서 사용한다.
+    """
     n = values.shape[0]
     out = np.empty(n, dtype=np.float64)
     out[:] = np.nan
@@ -234,6 +266,11 @@ def rolling_percentile_hist(
 
 @njit(cache=True)
 def cooldown_mask(mask: np.ndarray, cooldown: int) -> np.ndarray:
+    """
+    신호 발생 후 cooldown 기간 동안 재발생을 차단한다.
+
+    입력 mask를 제자리(in-place)로 수정한다.
+    """
     if cooldown <= 0:
         return mask
     last_break = -cooldown - 1
@@ -248,8 +285,11 @@ def cooldown_mask(mask: np.ndarray, cooldown: int) -> np.ndarray:
 
 
 @njit(cache=True)
-def min_run_mask(condition: np.ndarray, min_run: int) -> np.ndarray:
-    if min_run <= 1:
+def min_stay_mask(condition: np.ndarray, min_stay: int) -> np.ndarray:
+    """
+    condition이 min_stay일 이상 연속일 때만 True를 남긴다.
+    """
+    if min_stay <= 1:
         return condition.copy()
     n = condition.shape[0]
     out = np.zeros(n, dtype=np.bool_)
@@ -259,7 +299,7 @@ def min_run_mask(condition: np.ndarray, min_run: int) -> np.ndarray:
             run += 1
         else:
             run = 0
-        if run >= min_run:
+        if run >= min_stay:
             out[i] = True
     return out
 
@@ -269,6 +309,9 @@ def uptrend_mask(
     prices: np.ndarray,
     window: int,
 ) -> np.ndarray:
+    """
+    이동평균 기울기(전일 대비 상승) 기반 추세 마스크.
+    """
     n = prices.shape[0]
     if window <= 1 or n < window:
         return np.ones(n, dtype=np.bool_)
@@ -281,6 +324,76 @@ def uptrend_mask(
 
 
 @njit(cache=True)
+def breakout_mask(
+    prices: np.ndarray,
+    trigger_line: np.ndarray,
+    base_mask: np.ndarray,
+    direction: int,
+    cooldown: int,
+) -> np.ndarray:
+    """
+    기준선(trigger_line) 돌파 마스크를 계산한다.
+
+    - direction >= 0: 상단(위쪽) 돌파, prices > trigger_line
+    - direction < 0: 하단(아래쪽) 돌파, prices < trigger_line
+    - cooldown: 돌파 신호 후 재발생 제한 일수
+    """
+    n = prices.shape[0]
+    out = np.zeros(n, dtype=np.bool_)
+    is_up = direction >= 0
+    for i in range(n):
+        if not base_mask[i]:
+            continue
+        p = prices[i]
+        t = trigger_line[i]
+        if not (np.isfinite(p) and np.isfinite(t)):
+            continue
+        if is_up:
+            out[i] = p > t
+        else:
+            out[i] = p < t
+    return cooldown_mask(out, cooldown)
+
+
+@njit(cache=True)
+def proximity_mask(
+    prices: np.ndarray,
+    trigger_line: np.ndarray,
+    base_mask: np.ndarray,
+    tolerance: float,
+    stay_days: int,
+    direction: int,
+) -> np.ndarray:
+    """
+    기준선(trigger_line) 근접 마스크를 계산한다.
+
+    - direction >= 0: 상단 근접, prices >= trigger_line * (1 - tolerance)
+    - direction < 0: 하단 근접, prices <= trigger_line * (1 + tolerance)
+    - stay_days: 연속 충족 일수
+    """
+    n = prices.shape[0]
+    out = np.zeros(n, dtype=np.bool_)
+    tol = tolerance
+    if tol < 0.0:
+        tol = 0.0
+    is_up = direction >= 0
+
+    for i in range(n):
+        if not base_mask[i]:
+            continue
+        p = prices[i]
+        t = trigger_line[i]
+        if not (np.isfinite(p) and np.isfinite(t)):
+            continue
+        if is_up:
+            out[i] = p >= t * (1.0 - tol)
+        else:
+            out[i] = p <= t * (1.0 + tol)
+
+    return min_stay_mask(out, stay_days)
+
+
+@njit(cache=True)
 def trigger_mask(
     prices: np.ndarray,
     upper: np.ndarray,
@@ -290,17 +403,31 @@ def trigger_mask(
     topclose_tolerance: float,
     topclose_stay_days: int,
 ) -> np.ndarray:
-    if trigger_mode == 1:
-        closeness = prices >= upper * (1.0 - topclose_tolerance)
-        candidate = base_mask & closeness
-        return min_run_mask(candidate, topclose_stay_days)
+    """
+    레거시 호환용 트리거 래퍼.
 
-    mask = base_mask & (prices > upper)
-    return cooldown_mask(mask, cooldown)
+    새 코드는 breakout_mask/proximity_mask 사용을 권장한다.
+    """
+    if trigger_mode == 1:
+        return proximity_mask(
+            prices,
+            upper,
+            base_mask,
+            topclose_tolerance,
+            topclose_stay_days,
+            1,
+        )
+    return breakout_mask(
+        prices,
+        upper,
+        base_mask,
+        1,
+        cooldown,
+    )
 
 
 @njit(cache=True)
-def narrow_mask(
+def bandwidth_mask(
     mean: np.ndarray,
     band_width: np.ndarray,
     valid_end: np.ndarray,
@@ -309,6 +436,12 @@ def narrow_mask(
     lookback: int,
     narrow_stay_days: int,
 ) -> np.ndarray:
+    """
+    밴드 폭 축소 구간 마스크를 계산한다.
+
+    - mode=0: 절대폭 기준
+    - mode=1: percentile 기준(rolling_percentile_hist 사용)
+    """
     if narrow_width >= 1.0:
         return valid_end.copy()
 
@@ -322,13 +455,13 @@ def narrow_mask(
 
     if mode == 0 or narrow_width <= 0:
         if narrow_width <= 0:
-            return min_run_mask(valid_end, narrow_stay_days)
+            return min_stay_mask(valid_end, narrow_stay_days)
         out = np.zeros(n, dtype=np.bool_)
         thresh = narrow_width
         for i in range(n):
             v = ratio[i]
             out[i] = np.isfinite(v) and v <= thresh
-        return min_run_mask(out, narrow_stay_days)
+        return min_stay_mask(out, narrow_stay_days)
 
     thresholds = rolling_percentile_hist(ratio, lookback, narrow_width * 100.0, 128)
     out = np.zeros(n, dtype=np.bool_)
@@ -336,7 +469,7 @@ def narrow_mask(
         v = ratio[i]
         t = thresholds[i]
         out[i] = np.isfinite(v) and np.isfinite(t) and v <= t
-    return min_run_mask(out, narrow_stay_days)
+    return min_stay_mask(out, narrow_stay_days)
 
 
 @njit(cache=True)
@@ -345,6 +478,9 @@ def high_mask(
     window: int,
     threshold: float,
 ) -> np.ndarray:
+    """
+    rolling high 대비 threshold 이상인 구간 마스크.
+    """
     n = prices.shape[0]
     if window <= 0:
         return np.ones(n, dtype=np.bool_)

@@ -3,15 +3,79 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib import font_manager
 from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
 
 Horizon = Tuple[str, int]
+_PLOT_FONT_CONFIGURED = False
+
+
+def _configure_plot_font() -> None:
+    global _PLOT_FONT_CONFIGURED
+    if _PLOT_FONT_CONFIGURED:
+        return
+
+    # WSL에서는 윈도우 폰트를 직접 등록해야 인식되는 경우가 많다.
+    font_files = [
+        Path("/mnt/c/Windows/Fonts/malgun.ttf"),
+        Path("/mnt/c/Windows/Fonts/malgunbd.ttf"),
+        Path("/mnt/c/Windows/Fonts/NotoSansKR-VF.ttf"),
+        Path("/mnt/c/Windows/Fonts/gulim.ttc"),
+        Path("/System/Library/Fonts/AppleGothic.ttf"),
+        Path("/Library/Fonts/AppleGothic.ttf"),
+    ]
+    for font_path in font_files:
+        if not font_path.exists():
+            continue
+        try:
+            font_manager.fontManager.addfont(str(font_path))
+        except Exception:
+            continue
+
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    # Windows/macOS/WSL에서 바로 동작하도록 한글 폰트 우선순위를 둔다.
+    preferred = [
+        "Malgun Gothic",   # Windows
+        "AppleGothic",     # macOS
+        "NanumGothic",
+        "Noto Sans CJK KR",
+        "Noto Sans KR",
+        "Gulim",
+        "Arial Unicode MS",
+    ]
+    preferred_available = [name for name in preferred if name in available]
+    existing = list(plt.rcParams.get("font.sans-serif", []))
+    merged: list[str] = []
+    for name in [*preferred_available, *existing]:
+        if name and name not in merged:
+            merged.append(name)
+
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = merged
+    # 한글 폰트 적용 시 음수 부호가 깨지는 이슈 방지
+    plt.rcParams["axes.unicode_minus"] = False
+
+    # 어떤 CJK 폰트도 없으면 경고 폭주를 막기 위해 glyph warning을 억제한다.
+    if not preferred_available:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Glyph .* missing from font\(s\).*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Glyph .* missing from current font\..*",
+            category=UserWarning,
+        )
+    _PLOT_FONT_CONFIGURED = True
 
 
 def _as_percent(values: np.ndarray) -> np.ndarray:
@@ -123,15 +187,6 @@ def _lookback_start(asof: pd.Timestamp, lookback: str) -> pd.Timestamp:
     return asof - _parse_lookback(lookback)
 
 
-def _normalize_trim_quantile(trim_quantile: float | None) -> float | None:
-    if trim_quantile is None:
-        return None
-    value = float(trim_quantile)
-    if not np.isfinite(value) or value < 0.0 or value >= 0.5:
-        raise ValueError("trim_quantile must be in [0.0, 0.5).")
-    return value
-
-
 @dataclass
 class Stats:
     dates: np.ndarray
@@ -141,25 +196,17 @@ class Stats:
     sum_log: np.ndarray
     pos_counts: np.ndarray
     geom_invalid: np.ndarray
-    event_returns_by_horizon: List[np.ndarray] | None = None
-    event_date_idx_by_horizon: List[np.ndarray] | None = None
+    occurrence_counts: np.ndarray
+    aggregation_mode: str = "event"
+    daily_arith: np.ndarray | None = None
+    daily_geom: np.ndarray | None = None
+    daily_rise: np.ndarray | None = None
 
     @classmethod
-    def create(
-        cls,
-        dates: np.ndarray,
-        horizons: Iterable[Horizon],
-        keep_event_returns: bool = False,
-    ) -> "Stats":
+    def create(cls, dates: np.ndarray, horizons: Iterable[Horizon]) -> "Stats":
         horizon_list = list(horizons)
         length = len(dates)
         num_h = len(horizon_list)
-        if keep_event_returns:
-            event_returns = [np.empty(0, dtype=np.float32) for _ in range(num_h)]
-            event_date_idx = [np.empty(0, dtype=np.int32) for _ in range(num_h)]
-        else:
-            event_returns = None
-            event_date_idx = None
         return cls(
             dates=dates.copy(),
             horizons=horizon_list,
@@ -168,8 +215,31 @@ class Stats:
             sum_log=np.zeros((num_h, length), dtype=np.float64),
             pos_counts=np.zeros((num_h, length), dtype=np.int64),
             geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
-            event_returns_by_horizon=event_returns,
-            event_date_idx_by_horizon=event_date_idx,
+            occurrence_counts=np.zeros(length, dtype=np.int64),
+            aggregation_mode="event",
+            daily_arith=None,
+            daily_geom=None,
+            daily_rise=None,
+        )
+
+    @classmethod
+    def create_daily(cls, dates: np.ndarray, horizons: Iterable[Horizon]) -> "Stats":
+        horizon_list = list(horizons)
+        length = len(dates)
+        num_h = len(horizon_list)
+        return cls(
+            dates=dates.copy(),
+            horizons=horizon_list,
+            counts=np.zeros((num_h, length), dtype=np.int64),
+            sum_ret=np.zeros((num_h, length), dtype=np.float64),
+            sum_log=np.zeros((num_h, length), dtype=np.float64),
+            pos_counts=np.zeros((num_h, length), dtype=np.int64),
+            geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
+            occurrence_counts=np.zeros(length, dtype=np.int64),
+            aggregation_mode="daily_mean",
+            daily_arith=np.full((num_h, length), np.nan, dtype=np.float64),
+            daily_geom=np.full((num_h, length), np.nan, dtype=np.float64),
+            daily_rise=np.full((num_h, length), np.nan, dtype=np.float64),
         )
 
     def _slice_indices(self, start=None, end=None) -> Tuple[int, int]:
@@ -189,61 +259,31 @@ class Stats:
         end_idx = max(start_idx, min(end_idx, total))
         return start_idx, end_idx
 
-    @staticmethod
-    def _metrics_from_returns(returns: np.ndarray) -> tuple[float, float, float, float]:
-        clean = np.asarray(returns, dtype=np.float64)
-        clean = clean[np.isfinite(clean)]
-        if clean.size == 0:
-            return 0.0, float("nan"), float("nan"), float("nan")
-
-        cnt = float(clean.size)
-        arith = float(clean.mean())
-        rise = float((clean > 0).mean())
-        if np.any(clean <= -1.0):
-            geom = float("nan")
-        else:
-            geom = float(np.exp(np.log1p(clean).mean()) - 1.0)
-        return cnt, arith, geom, rise
-
-    def _returns_in_range(self, h_idx: int, start_idx: int, end_idx: int) -> np.ndarray:
-        if self.event_returns_by_horizon is None or self.event_date_idx_by_horizon is None:
-            raise ValueError(
-                "trimmed 집계를 위해 event return 버퍼가 필요합니다. "
-                "Backtest에서 trim이 있는 패턴으로 실행하세요."
-            )
-
-        returns = np.asarray(self.event_returns_by_horizon[h_idx], dtype=np.float64)
-        date_idx = np.asarray(self.event_date_idx_by_horizon[h_idx], dtype=np.int64)
-        if returns.shape[0] != date_idx.shape[0]:
-            raise ValueError("event return 버퍼와 date_idx 길이가 일치하지 않습니다.")
-        if returns.size == 0:
-            return np.empty(0, dtype=np.float64)
-
-        in_range = (date_idx >= start_idx) & (date_idx < end_idx)
-        if not in_range.any():
-            return np.empty(0, dtype=np.float64)
-        return returns[in_range]
-
-    def _trimmed_metrics(
+    def occurrence(
         self,
-        h_idx: int,
-        start_idx: int,
-        end_idx: int,
-        trim_quantile: float,
-    ) -> tuple[float, float, float, float]:
-        returns = self._returns_in_range(h_idx, start_idx, end_idx)
-        returns = returns[np.isfinite(returns)]
-        if returns.size == 0:
-            return 0.0, float("nan"), float("nan"), float("nan")
+        start=None,
+        end=None,
+        ma_window: int | None = None,
+    ) -> pd.DataFrame:
+        start_idx, end_idx = self._slice_indices(start, end)
+        dates = pd.to_datetime(self.dates[start_idx:end_idx])
+        occ_full = self.occurrence_counts.astype(np.float64, copy=False)
+        occ = occ_full[start_idx:end_idx]
 
-        if trim_quantile > 0.0:
-            lo = float(np.quantile(returns, trim_quantile))
-            hi = float(np.quantile(returns, 1.0 - trim_quantile))
-            returns = returns[(returns >= lo) & (returns <= hi)]
-        return self._metrics_from_returns(returns)
+        data = {
+            "occurrence": occ,
+        }
+        if ma_window is not None:
+            window = max(1, int(ma_window))
+            ma_full = pd.Series(occ_full).rolling(window=window, min_periods=window).mean().to_numpy()
+            ma = ma_full[start_idx:end_idx]
+            data["occurrence_ma"] = ma
 
-    def to_frame(self, start=None, end=None, trim_quantile: float | None = None) -> pd.DataFrame:
-        trim_q = _normalize_trim_quantile(trim_quantile)
+        out = pd.DataFrame(data, index=dates)
+        out.index.name = "date"
+        return out
+
+    def to_frame(self, start=None, end=None) -> pd.DataFrame:
         start_idx, end_idx = self._slice_indices(start, end)
         rows = []
         if start_idx >= end_idx:
@@ -255,32 +295,67 @@ class Stats:
                 start_date = pd.Timestamp(self.dates[start_idx]).date()
                 end_date = pd.Timestamp(self.dates[end_idx - 1]).date()
                 scope_label = f"{start_date}~{end_date}"
-        for h_idx, (label, _) in enumerate(self.horizons):
-            if trim_q is not None and trim_q > 0.0:
-                cnt, arith, geom, rise = self._trimmed_metrics(
-                    h_idx,
-                    start_idx,
-                    end_idx,
-                    trim_q,
-                )
-            else:
-                cnt = float(self.counts[h_idx, start_idx:end_idx].sum())
-                sum_ret = float(self.sum_ret[h_idx, start_idx:end_idx].sum())
-                sum_log = float(self.sum_log[h_idx, start_idx:end_idx].sum())
-                pos = float(self.pos_counts[h_idx, start_idx:end_idx].sum())
-                invalid = bool(self.geom_invalid[h_idx, start_idx:end_idx].any())
 
-                if cnt == 0:
-                    arith = float("nan")
-                    geom = float("nan")
-                    rise = float("nan")
-                else:
-                    arith = sum_ret / cnt
-                    if invalid:
-                        geom = float("nan")
-                    else:
-                        geom = float(np.exp(sum_log / cnt) - 1.0)
-                    rise = pos / cnt
+        if self.aggregation_mode == "daily_mean":
+            if self.daily_arith is None or self.daily_geom is None or self.daily_rise is None:
+                raise ValueError("daily_mean 모드에서는 daily metric 배열이 필요합니다.")
+            for h_idx, (label, _) in enumerate(self.horizons):
+                day_arith = self.daily_arith[h_idx, start_idx:end_idx]
+                day_geom = self.daily_geom[h_idx, start_idx:end_idx]
+                day_rise = self.daily_rise[h_idx, start_idx:end_idx]
+
+                valid_arith = np.isfinite(day_arith)
+                valid_geom = np.isfinite(day_geom)
+                valid_rise = np.isfinite(day_rise)
+
+                cnt = float(valid_arith.sum())
+                arith = float(np.nanmean(day_arith)) if valid_arith.any() else float("nan")
+                geom = float(np.nanmean(day_geom)) if valid_geom.any() else float("nan")
+                rise = float(np.nanmean(day_rise)) if valid_rise.any() else float("nan")
+
+                rows.append(
+                    {
+                        "period": label,
+                        "scope": scope_label,
+                        "count": cnt,
+                        "arith_mean": arith,
+                        "geom_mean": geom,
+                        "rise_prob": rise,
+                    }
+                )
+
+            if not rows:
+                return pd.DataFrame(
+                    columns=["period", "scope", "count", "arith_mean", "geom_mean", "rise_prob"]
+                ).set_index(["period", "scope"])
+            return pd.DataFrame(rows).set_index(["period", "scope"])
+
+        for h_idx, (label, _) in enumerate(self.horizons):
+            cnt = float(self.counts[h_idx, start_idx:end_idx].sum())
+            sum_ret = float(self.sum_ret[h_idx, start_idx:end_idx].sum())
+            sum_log = float(self.sum_log[h_idx, start_idx:end_idx].sum())
+            pos = float(self.pos_counts[h_idx, start_idx:end_idx].sum())
+            invalid = bool(self.geom_invalid[h_idx, start_idx:end_idx].any())
+
+            if cnt == 0:
+                rows.append(
+                    {
+                        "period": label,
+                        "scope": scope_label,
+                        "count": 0.0,
+                        "arith_mean": float("nan"),
+                        "geom_mean": float("nan"),
+                        "rise_prob": float("nan"),
+                    }
+                )
+                continue
+
+            arith = sum_ret / cnt
+            if invalid:
+                geom = float("nan")
+            else:
+                geom = float(np.exp(sum_log / cnt) - 1.0)
+            rise = pos / cnt
             rows.append(
                 {
                     "period": label,
@@ -322,6 +397,48 @@ class Stats:
             h_idx = labels.index(horizon)
 
         window = max(1, int(history_window))
+
+        if self.aggregation_mode == "daily_mean":
+            if self.daily_arith is None or self.daily_geom is None or self.daily_rise is None:
+                raise ValueError("daily_mean 모드에서는 daily metric 배열이 필요합니다.")
+
+            day_arith = self.daily_arith[h_idx]
+            day_geom = self.daily_geom[h_idx]
+            day_rise = self.daily_rise[h_idx]
+
+            arith_full = pd.Series(day_arith).rolling(window=window, min_periods=1).mean().to_numpy()
+            geom_full = pd.Series(day_geom).rolling(window=window, min_periods=1).mean().to_numpy()
+            rise_full = pd.Series(day_rise).rolling(window=window, min_periods=1).mean().to_numpy()
+            cnt_full = (
+                pd.Series(np.isfinite(day_arith).astype(np.float64))
+                .rolling(window=window, min_periods=1)
+                .sum()
+                .to_numpy()
+            )
+
+            dates = self.dates[start_idx:end_idx]
+            arith = arith_full[start_idx:end_idx]
+            geom = geom_full[start_idx:end_idx]
+            rise = rise_full[start_idx:end_idx]
+            roll_counts = cnt_full[start_idx:end_idx]
+
+            support = roll_counts >= max(1, int(min_count))
+            if require_full_window:
+                global_idx = np.arange(start_idx, end_idx)
+                support &= global_idx >= (window - 1)
+
+            out = pd.DataFrame(
+                {
+                    "horizon": self.horizons[h_idx][0],
+                    "count": roll_counts,
+                    "arith_mean": np.where(support, arith, np.nan),
+                    "geom_mean": np.where(support, geom, np.nan),
+                    "rise_prob": np.where(support, rise, np.nan),
+                },
+                index=pd.to_datetime(dates),
+            )
+            out.index.name = "date"
+            return out
 
         counts = self.counts[h_idx].astype(np.float64)
         sum_ret = self.sum_ret[h_idx]
@@ -374,10 +491,9 @@ class Stats:
 @dataclass
 class StatsCollection:
     stats_map: Dict[str, Stats]
-    pattern_trims: Dict[str, float | None] = field(default_factory=dict)
+    benchmark_names: set[str] = field(default_factory=set)
 
-    @staticmethod
-    def _pattern_colors(names: Iterable[str]) -> Dict[str, str]:
+    def _pattern_colors(self, names: Iterable[str]) -> Dict[str, str]:
         palette = [
             "#D56062",
             "#067BC2",
@@ -388,7 +504,7 @@ class StatsCollection:
         colors = iter(palette)
         mapping: Dict[str, str] = {}
         for name in names:
-            if name in {"market", "benchmark", "default"}:
+            if name in self.benchmark_names or name in {"market", "benchmark", "default"}:
                 mapping[name] = "black"
                 continue
             color = next(colors, None)
@@ -406,51 +522,53 @@ class StatsCollection:
             raise KeyError(f"Unknown pattern: {name}")
         return self.stats_map[name]
 
-    def _resolve_trim_for_pattern(
-        self,
-        pattern_name: str,
-        trim_quantile: float | None,
-    ) -> float | None:
-        if trim_quantile is not None:
-            return _normalize_trim_quantile(trim_quantile)
-        return _normalize_trim_quantile(self.pattern_trims.get(pattern_name))
-
-    def _ensure_history_trim_supported(
-        self,
-        pattern_name: str,
-        trim_quantile: float | None,
-    ) -> None:
-        effective_trim = self._resolve_trim_for_pattern(pattern_name, trim_quantile)
-        if effective_trim is not None and effective_trim > 0.0:
-            raise NotImplementedError(
-                "trim_quantile은 현재 to_frame()/plot()에서만 지원됩니다. "
-                "to_frame_history()/plot_history()는 아직 미지원입니다."
-            )
-
-    def to_frame(
-        self,
-        start=None,
-        end=None,
-        pattern: str | None = None,
-        trim_quantile: float | None = None,
-    ) -> pd.DataFrame:
+    def to_frame(self, start=None, end=None, pattern: str | None = None) -> pd.DataFrame:
         if not self.stats_map:
             return pd.DataFrame(
                 columns=["period", "scope", "count", "arith_mean", "geom_mean", "rise_prob"]
             ).set_index(["period", "scope"])
 
         if pattern is not None:
-            effective_trim = self._resolve_trim_for_pattern(pattern, trim_quantile)
-            return self.get(pattern).to_frame(start, end, trim_quantile=effective_trim)
+            return self.get(pattern).to_frame(start, end)
 
         frames = []
         keys = []
         for name, stats in self.stats_map.items():
-            effective_trim = self._resolve_trim_for_pattern(name, trim_quantile)
-            frames.append(stats.to_frame(start, end, trim_quantile=effective_trim))
+            frames.append(stats.to_frame(start, end))
             keys.append(name)
         combined = pd.concat(frames, keys=keys, names=["pattern"])
         return combined
+
+    def occurrence(
+        self,
+        start=None,
+        end=None,
+        ma_window: int | None = None,
+        pattern: str | None = None,
+    ) -> pd.DataFrame:
+        cols = ["occurrence"] if ma_window is None else ["occurrence", "occurrence_ma"]
+        if not self.stats_map:
+            return pd.DataFrame(columns=cols)
+
+        if pattern is not None:
+            return self.get(pattern).occurrence(
+                start=start,
+                end=end,
+                ma_window=ma_window,
+            )
+
+        frames = []
+        keys = []
+        for name, stats in self.stats_map.items():
+            frames.append(
+                stats.occurrence(
+                    start=start,
+                    end=end,
+                    ma_window=ma_window,
+                )
+            )
+            keys.append(name)
+        return pd.concat(frames, keys=keys, names=["pattern"])
 
     def to_frame_history(
         self,
@@ -461,7 +579,6 @@ class StatsCollection:
         min_count: int = 30,
         require_full_window: bool = True,
         pattern: str | None = None,
-        trim_quantile: float | None = None,
     ) -> pd.DataFrame:
         if not self.stats_map:
             return pd.DataFrame(
@@ -469,7 +586,6 @@ class StatsCollection:
             )
 
         if pattern is not None:
-            self._ensure_history_trim_supported(pattern, trim_quantile)
             return self.get(pattern).to_frame_history(
                 horizon=horizon,
                 start=start,
@@ -482,7 +598,6 @@ class StatsCollection:
         frames = []
         keys = []
         for name, stats in self.stats_map.items():
-            self._ensure_history_trim_supported(name, trim_quantile)
             frames.append(
                 stats.to_frame_history(
                     horizon=horizon,
@@ -501,11 +616,11 @@ class StatsCollection:
         patterns: Iterable[str] | None = None,
         start=None,
         end=None,
-        trim_quantile: float | None = None,
         figsize=(12, 4),
         rise_ylim=None,
         return_ylim=None,
     ):
+        _configure_plot_font()
         if not self.stats_map:
             raise ValueError("StatsCollection is empty.")
 
@@ -519,8 +634,7 @@ class StatsCollection:
         color_map = self._pattern_colors(names)
         frames = []
         for name in names:
-            effective_trim = self._resolve_trim_for_pattern(name, trim_quantile)
-            df = self.get(name).to_frame(start, end, trim_quantile=effective_trim).reset_index()
+            df = self.get(name).to_frame(start, end).reset_index()
             df["pattern"] = name
             frames.append(df)
         combined = pd.concat(frames, ignore_index=True)
@@ -588,7 +702,6 @@ class StatsCollection:
         short: str = "1Y",
         long: str = "3Y",
         patterns: Iterable[str] | None = None,
-        trim_quantile: float | None = None,
         figsize=(12, 4),
         rise_ylim=None,
         return_ylim=None,
@@ -603,7 +716,6 @@ class StatsCollection:
             patterns=patterns,
             start=short_start,
             end=asof_ts,
-            trim_quantile=trim_quantile,
             figsize=figsize,
             rise_ylim=rise_ylim,
             return_ylim=return_ylim,
@@ -612,7 +724,6 @@ class StatsCollection:
             patterns=patterns,
             start=long_start,
             end=asof_ts,
-            trim_quantile=trim_quantile,
             figsize=figsize,
             rise_ylim=rise_ylim,
             return_ylim=return_ylim,
@@ -625,13 +736,87 @@ class StatsCollection:
 
         return short_result, long_result
 
+    def plot_occurrence(
+        self,
+        patterns: Iterable[str] | None = None,
+        start=None,
+        end=None,
+        figsize=(3, 3),
+        ma_window: int | None = 252,
+        ylim=None,
+        show_daily: bool = False,
+    ):
+        _configure_plot_font()
+        if not self.stats_map:
+            raise ValueError("StatsCollection is empty.")
+
+        if patterns is None:
+            names = list(self.stats_map.keys())
+        else:
+            names = list(patterns)
+        if not names:
+            raise ValueError("No patterns selected for plotting.")
+
+        color_map = self._pattern_colors(names)
+        fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
+
+        first_dates = None
+        for name in names:
+            df = self.occurrence(
+                start=start,
+                end=end,
+                ma_window=ma_window,
+                pattern=name,
+            )
+            dates = df.index.to_numpy()
+            if first_dates is None:
+                first_dates = dates
+            elif not np.array_equal(first_dates, dates):
+                raise ValueError("All patterns must share the same date index for plot_occurrence.")
+
+            color = color_map.get(name, None)
+            if show_daily:
+                ax.plot(
+                    dates,
+                    df["occurrence"].to_numpy(dtype=float),
+                    color=color,
+                    alpha=0.2,
+                    linewidth=1.0,
+                )
+            line_vals = (
+                df["occurrence_ma"].to_numpy(dtype=float)
+                if ma_window is not None
+                else df["occurrence"].to_numpy(dtype=float)
+            )
+            ax.plot(
+                dates,
+                line_vals,
+                color=color,
+                linewidth=2.0,
+                label=name,
+            )
+
+        if ma_window is None:
+            ax.set_title("Pattern Occurrence")
+        else:
+            ax.set_title(f"Pattern Occurrence (Rolling {int(ma_window)}D Mean)")
+        ax.set_ylabel("Daily Occurrence Count")
+        ax.legend()
+        if ylim is not None:
+            ax.set_ylim(float(ylim[0]), float(ylim[1]))
+
+        if first_dates is not None:
+            _apply_date_ticks([ax], first_dates)
+        ax.tick_params(axis="x", labelrotation=0)
+
+        return fig, ax
+
     def plot_history(
         self,
         horizon: str | int = "1M",
         patterns: Iterable[str] | None = None,
         start=None,
         end=None,
-        trim_quantile: float | None = None,
         figsize=(12, 4),
         history_window: int = 252,
         min_count: int = 30,
@@ -639,6 +824,7 @@ class StatsCollection:
         rise_ylim=None,
         return_ylim=None,
     ):
+        _configure_plot_font()
         if not self.stats_map:
             raise ValueError("StatsCollection is empty.")
 
@@ -665,7 +851,6 @@ class StatsCollection:
                 min_count=min_count,
                 require_full_window=require_full_window,
                 pattern=name,
-                trim_quantile=trim_quantile,
             )
             dates = df.index.to_numpy()
             arith = _as_percent(df["arith_mean"].to_numpy(dtype=float))
