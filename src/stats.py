@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib import font_manager
-from matplotlib.ticker import MaxNLocator, StrMethodFormatter
+from matplotlib.ticker import MaxNLocator, MultipleLocator, StrMethodFormatter
 
 
 Horizon = Tuple[str, int]
@@ -93,10 +93,31 @@ def _normalize_ylim_percent(ylim):
     return lo, hi
 
 
-def _apply_integer_y_ticks(axes):
-    for ax in axes:
+def _apply_y_ticks(axes):
+    # Return 축은 정수 눈금을 유지한다.
+    for ax in axes[:2]:
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+
+    # Rise Probability 축은 자연수(정수) 눈금만 보이도록 고정한다.
+    if len(axes) >= 3:
+        rise_ax = axes[2]
+        ymin, ymax = rise_ax.get_ylim()
+        if np.isfinite(ymin) and np.isfinite(ymax):
+            lo, hi = (ymin, ymax) if ymin <= ymax else (ymax, ymin)
+            visible_integer_ticks = int(np.floor(hi) - np.ceil(lo) + 1)
+            if visible_integer_ticks < 2:
+                new_lo = float(np.floor(lo))
+                new_hi = float(np.ceil(hi))
+                if new_hi - new_lo < 1.0:
+                    new_hi = new_lo + 1.0
+                if ymin <= ymax:
+                    rise_ax.set_ylim(new_lo, new_hi)
+                else:
+                    rise_ax.set_ylim(new_hi, new_lo)
+
+        rise_ax.yaxis.set_major_locator(MultipleLocator(1.0))
+        rise_ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
 
 
 def _share_return_y_axis(axes):
@@ -175,14 +196,14 @@ def _rolling_sum_1d(values: np.ndarray, window: int) -> np.ndarray:
 def _parse_lookback(spec: str):
     text = str(spec).strip().upper()
     if len(text) < 2:
-        raise ValueError(f"Invalid lookback format: {spec}")
+        raise ValueError(f"lookback 형식이 올바르지 않습니다: {spec}")
     unit = text[-1]
     value_text = text[:-1]
     if not value_text.isdigit():
-        raise ValueError(f"Invalid lookback format: {spec}")
+        raise ValueError(f"lookback 형식이 올바르지 않습니다: {spec}")
     value = int(value_text)
     if value <= 0:
-        raise ValueError(f"Lookback must be positive: {spec}")
+        raise ValueError(f"lookback 값은 1 이상이어야 합니다: {spec}")
     if unit == "D":
         return pd.Timedelta(days=value)
     if unit == "W":
@@ -191,7 +212,7 @@ def _parse_lookback(spec: str):
         return pd.DateOffset(months=value)
     if unit == "Y":
         return pd.DateOffset(years=value)
-    raise ValueError(f"Unsupported lookback unit in '{spec}'. Use D/W/M/Y.")
+    raise ValueError(f"지원하지 않는 lookback 단위입니다: '{spec}'. D/W/M/Y만 사용 가능합니다.")
 
 
 def _lookback_start(asof: pd.Timestamp, lookback: str) -> pd.Timestamp:
@@ -395,16 +416,16 @@ class Stats:
     ) -> pd.DataFrame:
         start_idx, end_idx = self._slice_indices(start, end)
         if start_idx >= end_idx:
-            raise ValueError("No data available for the specified range.")
+            raise ValueError("지정한 구간에 데이터가 없습니다.")
 
         if isinstance(horizon, int):
             h_idx = horizon
             if h_idx < 0 or h_idx >= len(self.horizons):
-                raise ValueError(f"Invalid horizon index: {horizon}")
+                raise ValueError(f"horizon 인덱스가 올바르지 않습니다: {horizon}")
         else:
             labels = [label for label, _ in self.horizons]
             if horizon not in labels:
-                raise ValueError(f"Unknown horizon: {horizon}")
+                raise ValueError(f"알 수 없는 horizon 입니다: {horizon}")
             h_idx = labels.index(horizon)
 
         window = max(1, int(history_window))
@@ -504,6 +525,35 @@ class StatsCollection:
     stats_map: Dict[str, Stats]
     benchmark_names: set[str] = field(default_factory=set)
 
+    def _ordered_pattern_names(self, patterns: Iterable[str] | None = None) -> List[str]:
+        if patterns is None:
+            names = list(self.stats_map.keys())
+        else:
+            names = list(patterns)
+
+        # Drop duplicates while preserving first appearance.
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in seen:
+                continue
+            deduped.append(name)
+            seen.add(name)
+
+        benchmarks = [name for name in deduped if name in self.benchmark_names]
+        non_benchmarks = [name for name in deduped if name not in self.benchmark_names]
+        return [*benchmarks, *non_benchmarks]
+
+    @staticmethod
+    def _apply_legend_order(ax, names: Iterable[str]) -> None:
+        handles, labels = ax.get_legend_handles_labels()
+        handle_by_label = {label: handle for handle, label in zip(handles, labels)}
+        ordered_labels = [name for name in names if name in handle_by_label]
+        if not ordered_labels:
+            return
+        ordered_handles = [handle_by_label[label] for label in ordered_labels]
+        ax.legend(ordered_handles, ordered_labels)
+
     def _pattern_colors(self, names: Iterable[str]) -> Dict[str, str]:
         palette = [
             "#D56062",
@@ -530,7 +580,7 @@ class StatsCollection:
 
     def get(self, name: str) -> Stats:
         if name not in self.stats_map:
-            raise KeyError(f"Unknown pattern: {name}")
+            raise KeyError(f"알 수 없는 패턴입니다: {name}")
         return self.stats_map[name]
 
     def to_frame(self, start=None, end=None, pattern: str | None = None) -> pd.DataFrame:
@@ -633,14 +683,11 @@ class StatsCollection:
     ):
         _configure_plot_font()
         if not self.stats_map:
-            raise ValueError("StatsCollection is empty.")
+            raise ValueError("StatsCollection이 비어 있습니다.")
 
-        if patterns is None:
-            names = list(self.stats_map.keys())
-        else:
-            names = list(patterns)
+        names = self._ordered_pattern_names(patterns)
         if not names:
-            raise ValueError("No patterns selected for plotting.")
+            raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
 
         color_map = self._pattern_colors(names)
         frames = []
@@ -656,7 +703,10 @@ class StatsCollection:
 
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
 
-        for name, group in combined.groupby("pattern"):
+        for name in names:
+            group = combined.loc[combined["pattern"] == name]
+            if group.empty:
+                continue
             color = color_map.get(name, None)
             xs = group["period"].map(period_index).to_numpy(dtype=float)
             axes[0].plot(xs, group["arith_mean"] * 100.0, marker="o", color=color, label=name)
@@ -677,8 +727,8 @@ class StatsCollection:
             ax.set_title(title)
 
         axes[0].set_ylabel("Return (%)")
-        axes[2].set_ylabel("Rise Probability (%)")
-        axes[0].legend()
+        axes[2].set_ylabel("")
+        self._apply_legend_order(axes[0], names)
 
         arith_vals = combined["arith_mean"].to_numpy(dtype=float) * 100.0
         geom_vals = combined["geom_mean"].to_numpy(dtype=float) * 100.0
@@ -703,7 +753,7 @@ class StatsCollection:
         _draw_hline_if_in_view(axes[2], 50.0, color="gray", linewidth=0.8, linestyle="--")
 
         _share_return_y_axis(axes)
-        _apply_integer_y_ticks(axes)
+        _apply_y_ticks(axes)
 
         return fig, axes
 
@@ -721,7 +771,7 @@ class StatsCollection:
         short_start = _lookback_start(asof_ts, short)
         long_start = _lookback_start(asof_ts, long)
         if long_start >= short_start:
-            raise ValueError("`long` must be longer than `short`.")
+            raise ValueError("`long` 기간은 `short` 기간보다 길어야 합니다.")
 
         short_result = self.plot(
             patterns=patterns,
@@ -759,14 +809,11 @@ class StatsCollection:
     ):
         _configure_plot_font()
         if not self.stats_map:
-            raise ValueError("StatsCollection is empty.")
+            raise ValueError("StatsCollection이 비어 있습니다.")
 
-        if patterns is None:
-            names = list(self.stats_map.keys())
-        else:
-            names = list(patterns)
+        names = self._ordered_pattern_names(patterns)
         if not names:
-            raise ValueError("No patterns selected for plotting.")
+            raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
 
         color_map = self._pattern_colors(names)
         fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
@@ -783,7 +830,7 @@ class StatsCollection:
             if first_dates is None:
                 first_dates = dates
             elif not np.array_equal(first_dates, dates):
-                raise ValueError("All patterns must share the same date index for plot_occurrence.")
+                raise ValueError("plot_occurrence에서는 모든 패턴이 동일한 날짜 인덱스를 가져야 합니다.")
 
             color = color_map.get(name, None)
             if show_daily:
@@ -812,7 +859,7 @@ class StatsCollection:
         else:
             ax.set_title(f"Pattern Occurrence (Rolling {int(ma_window)}D Mean)")
         ax.set_ylabel("Daily Occurrence Count")
-        ax.legend()
+        self._apply_legend_order(ax, names)
         if ylim is not None:
             ax.set_ylim(float(ylim[0]), float(ylim[1]))
 
@@ -837,14 +884,11 @@ class StatsCollection:
     ):
         _configure_plot_font()
         if not self.stats_map:
-            raise ValueError("StatsCollection is empty.")
+            raise ValueError("StatsCollection이 비어 있습니다.")
 
-        if patterns is None:
-            names = list(self.stats_map.keys())
-        else:
-            names = list(patterns)
+        names = self._ordered_pattern_names(patterns)
         if not names:
-            raise ValueError("No patterns selected for plotting.")
+            raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
 
         color_map = self._pattern_colors(names)
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True, sharex=True)
@@ -872,7 +916,7 @@ class StatsCollection:
                 first_dates = dates
                 label = current_label
             elif not np.array_equal(first_dates, dates):
-                raise ValueError("All patterns must share the same date index for plot_history.")
+                raise ValueError("plot_history에서는 모든 패턴이 동일한 날짜 인덱스를 가져야 합니다.")
             color = color_map.get(name, None)
             axes[0].plot(dates, arith, label=name, color=color)
             axes[1].plot(dates, geom, linestyle="-", label=name, color=color)
@@ -883,14 +927,14 @@ class StatsCollection:
         axes[0].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
         axes[1].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
         axes[0].set_ylabel("Return (%)")
-        axes[2].set_ylabel("Rise Probability (%)")
+        axes[2].set_ylabel("")
 
         title_prefix = label if label is not None else "Horizon"
         axes[0].set_title(f"{title_prefix} Arithmetic Mean")
         axes[1].set_title(f"{title_prefix} Geometric Mean")
         axes[2].set_title(f"{title_prefix} Rise Probability")
 
-        axes[0].legend()
+        self._apply_legend_order(axes[0], names)
 
         return_ylim_pct = _normalize_ylim_percent(return_ylim)
         if return_ylim_pct is not None:
@@ -918,6 +962,6 @@ class StatsCollection:
         if first_dates is not None:
             _apply_date_ticks(axes, first_dates)
         _share_return_y_axis(axes)
-        _apply_integer_y_ticks(axes)
+        _apply_y_ticks(axes)
 
         return fig, axes

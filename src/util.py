@@ -372,19 +372,17 @@ def uptrend_mask(
 
 
 @njit(cache=True)
-def break_mask(
+def breakout_mask(
     prices: np.ndarray,
     trigger_line: np.ndarray,
     base_mask: np.ndarray,
     direction: int,
-    cooldown: int,
 ) -> np.ndarray:
     """
     기준선(trigger_line) 돌파 마스크를 계산한다.
 
     - direction >= 0: 상단(위쪽) 돌파, prices > trigger_line
     - direction < 0: 하단(아래쪽) 돌파, prices < trigger_line
-    - cooldown: 돌파 신호 후 재발생 제한 일수
     """
     n = prices.shape[0]
     out = np.zeros(n, dtype=np.bool_)
@@ -400,16 +398,15 @@ def break_mask(
             out[i] = p > t
         else:
             out[i] = p < t
-    return cooldown_mask(out, cooldown)
+    return out
 
 
 @njit(cache=True)
-def approach_mask(
+def near_mask(
     prices: np.ndarray,
     trigger_line: np.ndarray,
     base_mask: np.ndarray,
     tolerance: float,
-    stay_days: int,
     direction: int,
 ) -> np.ndarray:
     """
@@ -417,7 +414,6 @@ def approach_mask(
 
     - direction >= 0: 상단 근접, prices >= trigger_line * (1 - tolerance)
     - direction < 0: 하단 근접, prices <= trigger_line * (1 + tolerance)
-    - stay_days: 연속 충족 일수
     """
     n = prices.shape[0]
     out = np.zeros(n, dtype=np.bool_)
@@ -438,7 +434,7 @@ def approach_mask(
         else:
             out[i] = p <= t * (1.0 + tol)
 
-    return stay_mask(out, stay_days)
+    return out
 
 
 @njit(cache=True)
@@ -446,10 +442,9 @@ def bandwidth_mask(
     mean: np.ndarray,
     band_width: np.ndarray,
     valid_end: np.ndarray,
-    narrow_width: float,
+    bandwidth: float,
     mode: int,
     lookback: int,
-    narrow_stay_days: int,
 ) -> np.ndarray:
     """
     밴드 폭 축소 구간 마스크를 계산한다.
@@ -457,7 +452,7 @@ def bandwidth_mask(
     - mode=0: 절대폭 기준
     - mode=1: percentile 기준(rolling_percentile_hist 사용)
     """
-    if narrow_width >= 1.0:
+    if bandwidth >= 1.0:
         return valid_end.copy()
 
     n = mean.shape[0]
@@ -468,23 +463,23 @@ def bandwidth_mask(
         else:
             ratio[i] = np.nan
 
-    if mode == 0 or narrow_width <= 0:
-        if narrow_width <= 0:
-            return stay_mask(valid_end, narrow_stay_days)
+    if mode == 0 or bandwidth <= 0:
+        if bandwidth <= 0:
+            return valid_end.copy()
         out = np.zeros(n, dtype=np.bool_)
-        thresh = narrow_width
+        thresh = bandwidth
         for i in range(n):
             v = ratio[i]
             out[i] = np.isfinite(v) and v <= thresh
-        return stay_mask(out, narrow_stay_days)
+        return out
 
-    thresholds = rolling_percentile_hist(ratio, lookback, narrow_width * 100.0, 128)
+    thresholds = rolling_percentile_hist(ratio, lookback, bandwidth * 100.0, 128)
     out = np.zeros(n, dtype=np.bool_)
     for i in range(n):
         v = ratio[i]
         t = thresholds[i]
         out[i] = np.isfinite(v) and np.isfinite(t) and v <= t
-    return stay_mask(out, narrow_stay_days)
+    return out
 
 
 @njit(cache=True)
@@ -492,8 +487,6 @@ def high_mask(
     prices: np.ndarray,
     window: int,
     threshold: float,
-    stay_days: int = 1,
-    cooldown_days: int = 0,
 ) -> np.ndarray:
     """
     rolling high 대비 threshold 이상인 구간 마스크.
@@ -501,12 +494,10 @@ def high_mask(
     n = prices.shape[0]
     if window <= 0:
         return np.ones(n, dtype=np.bool_)
-    min_stay = max(1, int(stay_days))
-    cooldown = max(0, int(cooldown_days))
     high_series = rolling_high(prices, window)
     out = np.zeros(n, dtype=np.bool_)
     for i in range(n):
         h = high_series[i]
         if np.isfinite(h) and prices[i] >= threshold * h:
             out[i] = True
-    return cooldown_stay_mask(out, min_stay, cooldown)
+    return out

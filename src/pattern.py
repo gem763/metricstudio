@@ -1,4 +1,4 @@
-﻿"""Pattern classes for numpy price arrays."""
+"""Pattern classes for numpy price arrays."""
 
 from __future__ import annotations
 from typing import Callable, Literal
@@ -47,89 +47,6 @@ class Pattern:
         self._post_mask_fn = _composed
         return self
 
-    def high(
-        self,
-        window: int,
-        threshold: float = 0.9,
-        stay_days: int = 1,
-        cooldown_days: int = 0,
-    ):
-        return self._chain_post_mask(
-            High(
-                window=window,
-                threshold=threshold,
-                stay_days=stay_days,
-                cooldown_days=cooldown_days,
-            )
-        )
-
-    def uptrend(self, window: int, stay_days: int = 1, cooldown_days: int = 0):
-        w = int(window)
-        s = int(max(1, stay_days))
-        c = int(max(0, cooldown_days))
-        return self._chain_post_mask(
-            lambda prices, _w=w, _s=s, _c=c: u.uptrend_mask(prices, _w, _s, _c)
-        )
-
-    def moving_average(
-        self,
-        window: int = 20,
-        trigger: Literal["break_up", "break_down"] = "break_up",
-        cooldown_days: int = 3,
-    ):
-        return self._chain_post_mask(
-            MovingAverage(
-                window=window,
-                trigger=trigger,
-                cooldown_days=cooldown_days,
-            )
-        )
-
-    def golden_cross(
-        self,
-        windows: list[int] | tuple[int, ...] = (5, 10, 20),
-        cooldown_days: int = 3,
-    ):
-        return self._chain_post_mask(
-            GoldenCross(
-                windows=windows,
-                cooldown_days=cooldown_days,
-            )
-        )
-
-    def bollinger(
-        self,
-        window: int = 20,
-        sigma: float = 2.0,
-        bandwidth: float = 1.0,
-        bandwidth_stay_days: int = 1,
-        bandwidth_type: Literal["absolute", "percentile"] = "absolute",
-        bandwidth_percentile_window: int = 252,
-        trigger: Literal[
-            "break_up",
-            "break_down",
-            "approach_up",
-            "approach_down",
-        ] = "break_up",
-        cooldown_days: int = 3,
-        approach_tolerance: float = 0.03,
-        approach_stay_days: int = 3,
-    ):
-        return self._chain_post_mask(
-            Bollinger(
-                window=window,
-                sigma=sigma,
-                bandwidth=bandwidth,
-                bandwidth_stay_days=bandwidth_stay_days,
-                bandwidth_type=bandwidth_type,
-                bandwidth_percentile_window=bandwidth_percentile_window,
-                trigger=trigger,
-                cooldown_days=cooldown_days,
-                approach_tolerance=approach_tolerance,
-                approach_stay_days=approach_stay_days,
-            )
-        )
-
     def __call__(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         base_mask = np.asarray(self._base_mask(prices), dtype=np.bool_)
@@ -140,9 +57,54 @@ class Pattern:
             raise ValueError(f"post mask shape mismatch in pattern '{self.__name__}'")
         return base_mask & post_mask
 
+    def __add__(self, other: "Pattern"):
+        if not isinstance(other, Pattern):
+            return NotImplemented
+        return CombinedPattern(self, other)
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         return np.isfinite(prices) & (prices > 0)
+
+
+class CombinedPattern(Pattern):
+    def __init__(
+        self,
+        left: Pattern,
+        right: Pattern,
+        name: str | None = None,
+    ):
+        self.left = left
+        self.right = right
+        trim = self._resolve_trim(left.trim, right.trim)
+        left_name = left.name if isinstance(left.name, str) and left.name else "left_pattern"
+        right_name = right.name if isinstance(right.name, str) and right.name else "right_pattern"
+        resolved_name = name or f"{left_name} + {right_name}"
+        super().__init__(
+            name=resolved_name,
+            default_name="combined_pattern",
+            trim=trim,
+        )
+
+    @staticmethod
+    def _resolve_trim(left_trim: float | None, right_trim: float | None) -> float | None:
+        if left_trim is None:
+            return right_trim
+        if right_trim is None:
+            return left_trim
+        if float(left_trim) == float(right_trim):
+            return left_trim
+        raise ValueError(
+            "trim 값이 서로 다른 패턴은 결합할 수 없습니다. "
+            "양쪽 trim을 동일하게 맞추거나 한쪽에만 trim을 설정하세요."
+        )
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        left_mask = np.asarray(self.left(values), dtype=np.bool_)
+        right_mask = np.asarray(self.right(values), dtype=np.bool_)
+        if left_mask.shape != right_mask.shape:
+            raise ValueError("combined pattern mask shape mismatch")
+        return left_mask & right_mask
 
 
 class High(Pattern):
@@ -167,13 +129,12 @@ class High(Pattern):
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
-        return u.high_mask(
+        cond = u.high_mask(
             prices,
             self.window,
             self.threshold,
-            self.stay_days,
-            self.cooldown_days,
         )
+        return u.cooldown_stay_mask(cond, self.stay_days, self.cooldown_days)
 
 
 class MovingAverage(Pattern):
@@ -212,13 +173,13 @@ class MovingAverage(Pattern):
             return mask
 
         direction = 1 if self.trigger == "break_up" else -1
-        return u.break_mask(
+        out = u.breakout_mask(
             prices,
             ma,
             valid_end,
             direction,
-            self.cooldown_days,
         )
+        return u.cooldown_stay_mask(out, 1, self.cooldown_days)
 
 
 class GoldenCross(Pattern):
@@ -271,19 +232,19 @@ class Bollinger(Pattern):
         self,
         window: int = 20,
         sigma: float = 2.0,
-        bandwidth: float = 1.0,
+        trigger: Literal[
+            "breakout_up",
+            "breakout_down",
+            "near_up",
+            "near_down",
+        ] = "breakout_up",
+        bandwidth_limit: float = 1.0,
         bandwidth_stay_days: int = 1,
         bandwidth_type: Literal["absolute", "percentile"] = "absolute",
         bandwidth_percentile_window: int = 252,
-        trigger: Literal[
-            "break_up",
-            "break_down",
-            "approach_up",
-            "approach_down",
-        ] = "break_up",
-        cooldown_days: int = 3,
-        approach_tolerance: float = 0.03,
-        approach_stay_days: int = 3,
+        breakout_cooldown_days: int = 3,
+        near_tolerance: float = 0.03,
+        near_stay_days: int = 3,
         name: str | None = None,
         trim: float | None = None,
     ):
@@ -294,26 +255,32 @@ class Bollinger(Pattern):
         )
         self.window = int(window)
         self.sigma = float(sigma)
-        self.bandwidth = float(bandwidth)
+        self.trigger = (trigger or "breakout_up").lower()
+        self.bandwidth_limit = float(bandwidth_limit)
         self.bandwidth_stay_days = int(max(1, bandwidth_stay_days))
         self.bandwidth_type = (bandwidth_type or "absolute").lower()
         self.bandwidth_percentile_window = int(max(1, bandwidth_percentile_window))
-        self.trigger = (trigger or "break_up").lower()
-        self.cooldown_days = int(max(0, cooldown_days))
-        self.approach_tolerance = float(approach_tolerance)
-        self.approach_stay_days = int(max(1, approach_stay_days))
+        self.breakout_cooldown_days = int(max(0, breakout_cooldown_days))
+        self.near_tolerance = float(near_tolerance)
+        self.near_stay_days = int(max(1, near_stay_days))
 
         if self.bandwidth_type not in {"absolute", "percentile"}:
             raise ValueError("bandwidth_type must be 'absolute' or 'percentile'")
-        if self.trigger not in {"break_up", "break_down", "approach_up", "approach_down"}:
+        if self.trigger not in {
+            "breakout_up",
+            "breakout_down",
+            "near_up",
+            "near_down",
+        }:
             raise ValueError(
-                "trigger must be one of {'break_up', 'break_down', 'approach_up', 'approach_down'}."
+                "trigger must be one of "
+                "{'breakout_up', 'breakout_down', 'near_up', 'near_down'}."
             )
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         n = prices.shape[0]
-        mask = np.zeros(n, dtype=bool)
+        mask = np.zeros(n, dtype=np.bool_)
 
         if self.window <= 0 or n < self.window:
             return mask
@@ -325,47 +292,43 @@ class Bollinger(Pattern):
         band_width = self.sigma * std
         upper = mean + band_width
         lower = mean - band_width
-        mask = valid_end.copy()
 
         mode = 0 if self.bandwidth_type == "absolute" else 1
-        mask &= u.bandwidth_mask(
+        band_cond = u.bandwidth_mask(
             mean,
             band_width,
             valid_end,
-            self.bandwidth,
+            self.bandwidth_limit,
             mode,
             self.bandwidth_percentile_window,
-            self.bandwidth_stay_days,
         )
+        band_cond = u.stay_mask(band_cond, self.bandwidth_stay_days)
+        band_mask = valid_end & band_cond
 
-        if self.trigger.endswith("_up"):
-            trigger_line = upper
-            direction = 1
-        elif self.trigger.endswith("_down"):
-            trigger_line = lower
-            direction = -1
-        else:
-            raise ValueError(f"unsupported trigger side: {self.trigger}")
-
-        if self.trigger.startswith("approach_"):
-            return u.approach_mask(
+        if self.trigger in {"breakout_up", "breakout_down"}:
+            trigger_line = upper if self.trigger == "breakout_up" else lower
+            direction = 1 if self.trigger == "breakout_up" else -1
+            out = u.breakout_mask(
                 prices,
                 trigger_line,
-                mask,
-                self.approach_tolerance,
-                self.approach_stay_days,
+                band_mask,
                 direction,
             )
-
-        if self.trigger.startswith("break_"):
-            return u.break_mask(
+            return u.cooldown_mask(out, self.breakout_cooldown_days)
+        
+        elif self.trigger in {"near_up", "near_down"}:
+            trigger_line = upper if self.trigger == "near_up" else lower
+            direction = 1 if self.trigger == "near_up" else -1
+            out = u.near_mask(
                 prices,
                 trigger_line,
-                mask,
+                band_mask,
+                self.near_tolerance,
                 direction,
-                self.cooldown_days,
             )
+            return u.stay_mask(out, self.near_stay_days)
 
         raise ValueError(f"unsupported trigger kind: {self.trigger}")
 
-__all__ = ["Pattern", "High", "MovingAverage", "GoldenCross", "Bollinger"]
+
+__all__ = ["Pattern", "CombinedPattern", "High", "MovingAverage", "GoldenCross", "Bollinger"]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,9 +11,8 @@ from numba import njit
 from tqdm.auto import tqdm
 
 from src.db_manager import DB
+from src.pattern import Pattern
 from src.stats import Stats, StatsCollection
-
-PatternArrayFn = Callable[[np.ndarray], np.ndarray]
 
 HORIZONS: List[Tuple[str, int]] = [
     # ("1D", 1),
@@ -207,30 +206,10 @@ def _numba_accumulate_trim_for_date(
         daily_geom[h_idx, date_idx] = np.exp(kept_sum_log / kept_count) - 1.0
 
 
-def _infer_pattern_label(pattern_fn: PatternArrayFn, idx: int) -> str:
-    import inspect
-
-    keywords = getattr(pattern_fn, "keywords", None)
-    if isinstance(keywords, dict):
-        provided = keywords.get("name")
-        if isinstance(provided, str) and provided:
-            return provided
-    attr_name = getattr(pattern_fn, "__name__", None)
-    if attr_name and attr_name != "<lambda>":
-        return attr_name
-    # attempt to find the variable name used at the call site
-    frame_records = inspect.stack()
-    try:
-        for frame_info in frame_records[2:6]:
-            frame = frame_info.frame
-            try:
-                for var_name, value in frame.f_locals.items():
-                    if value is pattern_fn and var_name not in {"pattern_fn", "pattern_fns"}:
-                        return var_name
-            finally:
-                del frame
-    finally:
-        del frame_records
+def _infer_pattern_label(pattern_fn: Pattern, idx: int) -> str:
+    name = getattr(pattern_fn, "name", None)
+    if isinstance(name, str) and name:
+        return name
     return f"pattern_{idx}"
 
 
@@ -239,17 +218,12 @@ def _normalize_trim_quantile(trim: float | None) -> float | None:
         return None
     value = float(trim)
     if not np.isfinite(value) or value < 0.0 or value >= 0.5:
-        raise ValueError("trim must be in [0.0, 0.5).")
+        raise ValueError("trim 값은 [0.0, 0.5) 범위여야 합니다.")
     return value
 
 
-def _infer_pattern_trim(pattern_fn: PatternArrayFn) -> float | None:
-    trim = getattr(pattern_fn, "trim", None)
-    if trim is None:
-        keywords = getattr(pattern_fn, "keywords", None)
-        if isinstance(keywords, dict):
-            trim = keywords.get("trim")
-    return _normalize_trim_quantile(trim)
+def _infer_pattern_trim(pattern_fn: Pattern) -> float | None:
+    return _normalize_trim_quantile(getattr(pattern_fn, "trim", None))
 
 
 class Backtest:
@@ -257,7 +231,7 @@ class Backtest:
         self,
         start,
         end,
-        benchmark: PatternArrayFn | None = None,
+        benchmark: Pattern | None = None,
     ):
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
@@ -269,6 +243,8 @@ class Backtest:
         self.start_idx = int(np.searchsorted(self.dates, self.start.to_datetime64(), side="left"))
         self.end_idx = int(np.searchsorted(self.dates, self.end.to_datetime64(), side="right"))
         self.end_idx = min(self.end_idx, len(self.dates))
+        if benchmark is not None and not isinstance(benchmark, Pattern):
+            raise TypeError("benchmark는 Pattern 객체여야 합니다.")
         self.benchmark = benchmark
         self._base_stats = {}
         if benchmark is not None:
@@ -281,16 +257,16 @@ class Backtest:
             )
 
     @staticmethod
-    def _compute_mask(pattern_fn: PatternArrayFn, values: np.ndarray, code: str) -> np.ndarray | None:
+    def _compute_mask(pattern_fn: Pattern, values: np.ndarray, code: str) -> np.ndarray | None:
         mask = pattern_fn(values)
         if mask is None:
             return None
         mask_arr = np.asarray(mask, dtype=np.bool_)
         if mask_arr.shape != values.shape:
-            raise ValueError(f"pattern mask shape mismatch for code {code}")
+            raise ValueError(f"패턴 mask shape이 종목 코드 {code}의 가격 배열 shape과 일치하지 않습니다.")
         return mask_arr
 
-    def _run_pattern_normal(self, pattern_fn: PatternArrayFn, progress_label: str) -> Stats:
+    def _run_pattern_normal(self, pattern_fn: Pattern, progress_label: str) -> Stats:
         stats = Stats.create(self.dates, HORIZONS)
         for col_idx, code in enumerate(tqdm(self.codes, desc=f"{progress_label} | codes")):
             values = self.prices[:, col_idx]
@@ -317,7 +293,7 @@ class Backtest:
             )
         return stats
 
-    def _build_mask_matrix(self, pattern_fn: PatternArrayFn, eval_len: int) -> np.ndarray:
+    def _build_mask_matrix(self, pattern_fn: Pattern, eval_len: int) -> np.ndarray:
         num_codes = len(self.codes)
         mask_matrix = np.zeros((eval_len, num_codes), dtype=np.bool_)
         if eval_len == 0:
@@ -342,7 +318,7 @@ class Backtest:
         daily_geom = stats.daily_geom
         daily_rise = stats.daily_rise
         if daily_arith is None or daily_geom is None or daily_rise is None:
-            raise ValueError("daily stats buffer is required for trim mode.")
+            raise ValueError("trim 모드에서는 daily 통계 버퍼가 필요합니다.")
 
         for i_local in tqdm(range(mask_matrix.shape[0]), desc=f"{progress_label} | trim"):
             i = self.start_idx + i_local
@@ -362,7 +338,7 @@ class Backtest:
                 daily_rise,
             )
 
-    def _run_pattern_trim(self, pattern_fn: PatternArrayFn, trim_q: float, progress_label: str) -> Stats:
+    def _run_pattern_trim(self, pattern_fn: Pattern, trim_q: float, progress_label: str) -> Stats:
         stats = Stats.create_daily(self.dates, HORIZONS)
         eval_len = max(0, self.end_idx - self.start_idx)
         mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
@@ -377,7 +353,7 @@ class Backtest:
 
     def _run_pattern(
         self,
-        pattern_fn: PatternArrayFn,
+        pattern_fn: Pattern,
         trim_quantile: float | None = None,
         progress_label: str = "pattern",
     ) -> Stats:
@@ -386,7 +362,7 @@ class Backtest:
             return self._run_pattern_normal(pattern_fn, progress_label)
         return self._run_pattern_trim(pattern_fn, trim_q, progress_label)
 
-    def run(self, *patterns: PatternArrayFn, include_base: bool = True, **shared_kwargs) -> StatsCollection:
+    def run(self, *patterns: Pattern, include_base: bool = True) -> StatsCollection:
         if not patterns and include_base and self.benchmark is not None:
             return StatsCollection(
                 dict(self._base_stats),
@@ -400,16 +376,12 @@ class Backtest:
             benchmark_names = set(self._base_stats.keys())
 
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
+            if not isinstance(pattern_fn, Pattern):
+                raise TypeError("run()에 전달한 모든 패턴은 Pattern 객체여야 합니다.")
             base_name = _infer_pattern_label(pattern_fn, idx)
             trim_q = _infer_pattern_trim(pattern_fn)
-            wrapped = pattern_fn
-            if shared_kwargs:
-                def _wrapped(values, _fn=pattern_fn, _kwargs=shared_kwargs):
-                    return _fn(values, **_kwargs)
-
-                wrapped = _wrapped
             stats = self._run_pattern(
-                wrapped,
+                pattern_fn,
                 trim_quantile=trim_q,
                 progress_label=base_name,
             )
@@ -421,5 +393,5 @@ class Backtest:
             stats_map[name] = stats
 
         if not stats_map:
-            raise ValueError("No patterns were executed.")
+            raise ValueError("실행된 패턴이 없습니다.")
         return StatsCollection(stats_map, benchmark_names=benchmark_names)

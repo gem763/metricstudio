@@ -40,11 +40,11 @@ def bollinger(
 
     narrow_width_type = (narrow_width_type or "absolute").lower()
     if narrow_width_type not in {"absolute", "percentile"}:
-        raise ValueError("narrow_width_type must be 'absolute' or 'percentile'")
+        raise ValueError("narrow_width_type은 'absolute' 또는 'percentile'이어야 합니다.")
 
     trigger = (trigger or "breakout").lower()
     if trigger not in {"breakout", "topclose"}:
-        raise ValueError("trigger must be 'breakout' or 'topclose'")
+        raise ValueError("trigger는 'breakout' 또는 'topclose'여야 합니다.")
 
     prices = np.asarray(values, dtype=np.float64)
     n = prices.shape[0]
@@ -71,7 +71,6 @@ def bollinger(
         narrow_width,
         mode,
         int(max(1, narrow_percentile_window)),
-        int(max(1, narrow_stay_days)),
     )
 
     # 3) 52주 고가 근처 조건
