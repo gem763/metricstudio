@@ -680,6 +680,7 @@ class StatsCollection:
         figsize=(12, 4),
         rise_ylim=None,
         return_ylim=None,
+        return_handles: bool = False,
     ):
         _configure_plot_font()
         if not self.stats_map:
@@ -755,7 +756,9 @@ class StatsCollection:
         _share_return_y_axis(axes)
         _apply_y_ticks(axes)
 
-        return fig, axes
+        if return_handles:
+            return fig, axes
+        return None
 
     def plot_compare(
         self,
@@ -766,6 +769,7 @@ class StatsCollection:
         figsize=(12, 4),
         rise_ylim=None,
         return_ylim=None,
+        return_handles: bool = False,
     ):
         asof_ts = pd.Timestamp(asof)
         short_start = _lookback_start(asof_ts, short)
@@ -780,6 +784,7 @@ class StatsCollection:
             figsize=figsize,
             rise_ylim=rise_ylim,
             return_ylim=return_ylim,
+            return_handles=True,
         )
         long_result = self.plot(
             patterns=patterns,
@@ -788,6 +793,7 @@ class StatsCollection:
             figsize=figsize,
             rise_ylim=rise_ylim,
             return_ylim=return_ylim,
+            return_handles=True,
         )
 
         fig_short, _ = short_result
@@ -795,7 +801,9 @@ class StatsCollection:
         fig_short.suptitle(f"Short ({short}): {short_start.date()} ~ {asof_ts.date()}")
         fig_long.suptitle(f"Long ({long}): {long_start.date()} ~ {asof_ts.date()}")
 
-        return short_result, long_result
+        if return_handles:
+            return short_result, long_result
+        return None
 
     def plot_occurrence(
         self,
@@ -806,6 +814,7 @@ class StatsCollection:
         ma_window: int | None = 252,
         ylim=None,
         show_daily: bool = False,
+        return_handles: bool = False,
     ):
         _configure_plot_font()
         if not self.stats_map:
@@ -867,7 +876,9 @@ class StatsCollection:
             _apply_date_ticks([ax], first_dates)
         ax.tick_params(axis="x", labelrotation=0)
 
-        return fig, ax
+        if return_handles:
+            return fig, ax
+        return None
 
     def plot_history(
         self,
@@ -881,6 +892,7 @@ class StatsCollection:
         require_full_window: bool = True,
         rise_ylim=None,
         return_ylim=None,
+        return_handles: bool = False,
     ):
         _configure_plot_font()
         if not self.stats_map:
@@ -964,4 +976,6 @@ class StatsCollection:
         _share_return_y_axis(axes)
         _apply_y_ticks(axes)
 
-        return fig, axes
+        if return_handles:
+            return fig, axes
+        return None

@@ -305,41 +305,22 @@ def stay_mask(condition: np.ndarray, stay_days: int) -> np.ndarray:
 
 
 @njit(cache=True)
-def cooldown_stay_mask(
+def stay_cooldown_mask(
     condition: np.ndarray,
     stay_days: int,
     cooldown_days: int,
 ) -> np.ndarray:
     """
-    연속 유지(stay) 조건과 출현 간격(cooldown) 조건을 결합한 마스크.
+    연속 유지(stay) 후 출현 간격(cooldown)을 적용한 결합 마스크.
 
-    - stay_days: condition이 연속으로 유지되어야 하는 최소 일수
-    - cooldown_days: 이전 출현과의 최소 간격
+    합성 정의:
+    stay_cooldown_mask(x, s, c) = cooldown_mask(stay_mask(x, s), c)
+
+    - stay_days: condition이 연속으로 유지되어야 하는 최소 일수(s)
+    - cooldown_days: 이전 출현과의 최소 간격(c)
     """
     sustained = stay_mask(condition, stay_days)
-    if cooldown_days <= 0:
-        return sustained
-
-    n = sustained.shape[0]
-    entries = np.zeros(n, dtype=np.bool_)
-    for i in range(n):
-        if sustained[i] and (i == 0 or not sustained[i - 1]):
-            entries[i] = True
-    entries = cooldown_mask(entries, cooldown_days)
-
-    out = np.zeros(n, dtype=np.bool_)
-    i = 0
-    while i < n:
-        if not sustained[i]:
-            i += 1
-            continue
-        run_start = i
-        while i < n and sustained[i]:
-            i += 1
-        if entries[run_start]:
-            for j in range(run_start, i):
-                out[j] = True
-    return out
+    return cooldown_mask(sustained, cooldown_days)
 
 
 @njit(cache=True)
@@ -368,7 +349,7 @@ def uptrend_mask(
         if valid_up[i] and valid_up[i - 1] and mean_up[i] > mean_up[i - 1]:
             up[i] = True
 
-    return cooldown_stay_mask(up, min_stay, cooldown)
+    return stay_cooldown_mask(up, min_stay, cooldown)
 
 
 @njit(cache=True)
@@ -442,7 +423,8 @@ def bandwidth_mask(
     mean: np.ndarray,
     band_width: np.ndarray,
     valid_end: np.ndarray,
-    bandwidth: float,
+    bandwidth_min: float,
+    bandwidth_max: float,
     mode: int,
     lookback: int,
 ) -> np.ndarray:
@@ -452,33 +434,50 @@ def bandwidth_mask(
     - mode=0: 절대폭 기준
     - mode=1: percentile 기준(rolling_percentile_hist 사용)
     """
-    if bandwidth >= 1.0:
-        return valid_end.copy()
-
     n = mean.shape[0]
     ratio = np.empty(n, dtype=np.float64)
+    lower = bandwidth_min
+    upper = bandwidth_max
+    if lower < 0.0:
+        lower = 0.0
+    if upper < lower:
+        out = np.zeros(n, dtype=np.bool_)
+        return out
+
     for i in range(n):
         if valid_end[i] and mean[i] > 0.0:
             ratio[i] = band_width[i] / mean[i]
         else:
             ratio[i] = np.nan
 
-    if mode == 0 or bandwidth <= 0:
-        if bandwidth <= 0:
-            return valid_end.copy()
+    if mode == 0:
         out = np.zeros(n, dtype=np.bool_)
-        thresh = bandwidth
         for i in range(n):
             v = ratio[i]
-            out[i] = np.isfinite(v) and v <= thresh
+            out[i] = np.isfinite(v) and v >= lower and v <= upper
         return out
 
-    thresholds = rolling_percentile_hist(ratio, lookback, bandwidth * 100.0, 128)
+    low_q = lower * 100.0
+    if low_q < 0.0:
+        low_q = 0.0
+    elif low_q > 100.0:
+        low_q = 100.0
+
+    high_q = upper * 100.0
+    if high_q < 0.0:
+        high_q = 0.0
+    elif high_q > 100.0:
+        high_q = 100.0
+
+    low_thresholds = rolling_percentile_hist(ratio, lookback, low_q, 128)
+    high_thresholds = rolling_percentile_hist(ratio, lookback, high_q, 128)
+
     out = np.zeros(n, dtype=np.bool_)
     for i in range(n):
         v = ratio[i]
-        t = thresholds[i]
-        out[i] = np.isfinite(v) and np.isfinite(t) and v <= t
+        lo = low_thresholds[i]
+        hi = high_thresholds[i]
+        out[i] = np.isfinite(v) and np.isfinite(lo) and np.isfinite(hi) and v >= lo and v <= hi
     return out
 
 

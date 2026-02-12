@@ -310,7 +310,7 @@ class DB:
     # =========================
     # LOAD PATH (READ-ONLY)
     # =========================
-    def load(
+    def load_stock(
         self,
         codes: Iterable[str] | str | None = None,
         field: str = "close",
@@ -379,6 +379,44 @@ class DB:
         if str(field).lower() in {"open", "high", "low", "close"}:
             wide = self._filter_bad_codes(wide)
         return wide
+
+    def load_market(
+        self,
+        market: str,
+        field: str | None = None,
+    ) -> pd.DataFrame | pd.Series:
+        market_key = str(market).strip().lower()
+        if not market_key:
+            raise ValueError("market은 비어 있을 수 없습니다.")
+
+        path = self._market_file_path(market_key)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"시장 데이터 파일이 없습니다: {path} (먼저 build_market('{market_key}')를 실행하세요.)"
+            )
+
+        df = pd.read_parquet(path)
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(f"{path}는 pandas DataFrame이어야 합니다.")
+
+        if "date" in df.columns:
+            df = df.set_index("date")
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[df.index.notna()]
+        df = df.sort_index()
+        df.index.name = "date"
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        if field is None:
+            return df
+
+        field_key = str(field).strip().lower()
+        if field_key not in df.columns:
+            raise ValueError(f"market 데이터에 '{field_key}' 컬럼이 없습니다: {path}")
+
+        out = pd.to_numeric(df[field_key], errors="coerce")
+        out.name = field_key
+        return out
 
     # =========================
     # STOCK BUILD PATH (WRITE PIPELINE)

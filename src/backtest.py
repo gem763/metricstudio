@@ -25,27 +25,45 @@ HORIZONS: List[Tuple[str, int]] = [
     ("6M", 120),
 ]
 
+TRIM_MODE_REMOVE = 0
+TRIM_MODE_WINSORIZE = 1
+
 
 @dataclass
-class PriceTable:
+class StockTable:
     dates: np.ndarray  # shape (T,)
     prices: np.ndarray  # shape (T, N)
     codes: List[str]
 
 
-_PRICE_TABLE: Optional[PriceTable] = None
+_STOCK_TABLE: Optional[StockTable] = None
+_MARKET_TABLE: Dict[str, pd.DataFrame] = {}
 
 
-def _load_price_table() -> PriceTable:
-    global _PRICE_TABLE
-    if _PRICE_TABLE is None:
+def _load_stock_table() -> StockTable:
+    global _STOCK_TABLE
+    if _STOCK_TABLE is None:
         # DB 기본 경로: db/stock/close.parquet 또는 db/stock/data/*.parquet
-        df = DB().load(field="close")
+        df = DB().load_stock(field="close")
         dates = df.index.to_numpy(dtype="datetime64[ns]")
         prices = df.to_numpy(dtype=np.float64, copy=True)
         codes = [str(c) for c in df.columns]
-        _PRICE_TABLE = PriceTable(dates=dates, prices=prices, codes=codes)
-    return _PRICE_TABLE
+        _STOCK_TABLE = StockTable(dates=dates, prices=prices, codes=codes)
+    return _STOCK_TABLE
+
+
+def _load_market_table(market: str) -> pd.DataFrame:
+    key = str(market).strip().lower()
+    if not key:
+        raise ValueError("market은 비어 있을 수 없습니다.")
+
+    if key not in _MARKET_TABLE:
+        df = DB().load_market(market=key)
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("load_market()은 DataFrame을 반환해야 합니다.")
+        _MARKET_TABLE[key] = df
+
+    return _MARKET_TABLE[key]
 
 
 @njit(cache=True)
@@ -127,6 +145,7 @@ def _numba_accumulate_trim_for_date(
     date_idx,
     horizon_offsets,
     trim_q,
+    trim_mode,
     counts,
     sum_ret,
     sum_log,
@@ -178,16 +197,27 @@ def _numba_accumulate_trim_for_date(
 
         for k in range(n):
             ret = returns_buf[k]
-            if ret < low or ret > high:
-                continue
+
+            if trim_mode == TRIM_MODE_REMOVE:
+                if ret < low or ret > high:
+                    continue
+                adjusted = ret
+            else:
+                if ret < low:
+                    adjusted = low
+                elif ret > high:
+                    adjusted = high
+                else:
+                    adjusted = ret
+
             kept_count += 1
-            kept_sum_ret += ret
-            if ret > 0.0:
+            kept_sum_ret += adjusted
+            if adjusted > 0.0:
                 kept_pos += 1
-            if ret <= -1.0:
+            if adjusted <= -1.0:
                 has_geom_invalid = True
             else:
-                kept_sum_log += np.log1p(ret)
+                kept_sum_log += np.log1p(adjusted)
 
         if kept_count == 0:
             continue
@@ -222,8 +252,25 @@ def _normalize_trim_quantile(trim: float | None) -> float | None:
     return value
 
 
-def _infer_pattern_trim(pattern_fn: Pattern) -> float | None:
-    return _normalize_trim_quantile(getattr(pattern_fn, "trim", None))
+def _normalize_trim_method(method: str | None) -> str:
+    method_text = str(method or "remove").lower()
+    if method_text not in {"remove", "winsorize"}:
+        raise ValueError("trim method는 'remove' 또는 'winsorize'여야 합니다.")
+    return method_text
+
+
+def _trim_mode_from_method(method: str) -> int:
+    if method == "remove":
+        return TRIM_MODE_REMOVE
+    if method == "winsorize":
+        return TRIM_MODE_WINSORIZE
+    raise ValueError("trim method는 'remove' 또는 'winsorize'여야 합니다.")
+
+
+def _infer_pattern_trim_config(pattern_fn: Pattern) -> tuple[float | None, str]:
+    trim_q = _normalize_trim_quantile(getattr(pattern_fn, "trim_quantile", None))
+    trim_method = _normalize_trim_method(getattr(pattern_fn, "trim_method", "remove"))
+    return trim_q, trim_method
 
 
 class Backtest:
@@ -235,10 +282,11 @@ class Backtest:
     ):
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
-        table = _load_price_table()
+        table = _load_stock_table()
         self.dates = table.dates
         self.prices = table.prices
         self.codes = table.codes
+        self._market_values_cache: Dict[tuple[str, str], np.ndarray] = {}
         self.horizon_offsets = np.asarray([int(days) for _, days in HORIZONS], dtype=np.int64)
         self.start_idx = int(np.searchsorted(self.dates, self.start.to_datetime64(), side="left"))
         self.end_idx = int(np.searchsorted(self.dates, self.end.to_datetime64(), side="right"))
@@ -249,10 +297,11 @@ class Backtest:
         self._base_stats = {}
         if benchmark is not None:
             base_name = _infer_pattern_label(benchmark, 0)
-            base_trim = _infer_pattern_trim(benchmark)
+            base_trim_q, base_trim_method = _infer_pattern_trim_config(benchmark)
             self._base_stats[base_name] = self._run_pattern(
                 benchmark,
-                trim_quantile=base_trim,
+                trim_quantile=base_trim_q,
+                trim_method=base_trim_method,
                 progress_label=base_name,
             )
 
@@ -265,6 +314,55 @@ class Backtest:
         if mask_arr.shape != values.shape:
             raise ValueError(f"패턴 mask shape이 종목 코드 {code}의 가격 배열 shape과 일치하지 않습니다.")
         return mask_arr
+
+    def _get_market_values(self, market: str, field: str) -> np.ndarray:
+        key = (str(market).strip().lower(), str(field).strip().lower())
+        if not key[0]:
+            raise ValueError("market은 비어 있을 수 없습니다.")
+        if not key[1]:
+            raise ValueError("field는 비어 있을 수 없습니다.")
+
+        if key not in self._market_values_cache:
+            df = _load_market_table(key[0])
+            if key[1] not in df.columns:
+                raise ValueError(
+                    f"market='{key[0]}' 데이터에 field='{key[1]}' 컬럼이 없습니다."
+                )
+            series = pd.to_numeric(df[key[1]], errors="coerce")
+            aligned = series.reindex(pd.DatetimeIndex(self.dates)).to_numpy(
+                dtype=np.float64,
+                copy=True,
+            )
+            self._market_values_cache[key] = aligned
+        return self._market_values_cache[key]
+
+    def _iter_pattern_nodes(self, pattern_fn: Pattern):
+        seen: set[int] = set()
+        stack: list[Pattern] = [pattern_fn]
+        while stack:
+            node = stack.pop()
+            node_id = id(node)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            yield node
+
+            left = getattr(node, "left", None)
+            right = getattr(node, "right", None)
+            if isinstance(left, Pattern):
+                stack.append(left)
+            if isinstance(right, Pattern):
+                stack.append(right)
+
+    def _prepare_market_sources(self, pattern_fn: Pattern) -> None:
+        for node in self._iter_pattern_nodes(pattern_fn):
+            market_name = getattr(node, "market_name", None)
+            if market_name is None:
+                node._set_market_values(None)
+                continue
+            market_field = getattr(node, "market_field", "close")
+            market_values = self._get_market_values(market_name, market_field)
+            node._set_market_values(market_values)
 
     def _run_pattern_normal(self, pattern_fn: Pattern, progress_label: str) -> Stats:
         stats = Stats.create(self.dates, HORIZONS)
@@ -311,6 +409,7 @@ class Backtest:
         self,
         mask_matrix: np.ndarray,
         trim_q: float,
+        trim_mode: int,
         stats: Stats,
         progress_label: str,
     ) -> None:
@@ -328,6 +427,7 @@ class Backtest:
                 i,
                 self.horizon_offsets,
                 trim_q,
+                trim_mode,
                 stats.counts,
                 stats.sum_ret,
                 stats.sum_log,
@@ -338,7 +438,13 @@ class Backtest:
                 daily_rise,
             )
 
-    def _run_pattern_trim(self, pattern_fn: Pattern, trim_q: float, progress_label: str) -> Stats:
+    def _run_pattern_trim(
+        self,
+        pattern_fn: Pattern,
+        trim_q: float,
+        trim_method: str,
+        progress_label: str,
+    ) -> Stats:
         stats = Stats.create_daily(self.dates, HORIZONS)
         eval_len = max(0, self.end_idx - self.start_idx)
         mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
@@ -348,21 +454,25 @@ class Backtest:
                 axis=1,
                 dtype=np.int64,
             )
-        self._accumulate_trim_dates(mask_matrix, trim_q, stats, progress_label)
+        trim_mode = _trim_mode_from_method(trim_method)
+        self._accumulate_trim_dates(mask_matrix, trim_q, trim_mode, stats, progress_label)
         return stats
 
     def _run_pattern(
         self,
         pattern_fn: Pattern,
         trim_quantile: float | None = None,
+        trim_method: str = "remove",
         progress_label: str = "pattern",
     ) -> Stats:
+        self._prepare_market_sources(pattern_fn)
         trim_q = _normalize_trim_quantile(trim_quantile)
+        trim_method_text = _normalize_trim_method(trim_method)
         if trim_q is None or trim_q <= 0.0:
             return self._run_pattern_normal(pattern_fn, progress_label)
-        return self._run_pattern_trim(pattern_fn, trim_q, progress_label)
+        return self._run_pattern_trim(pattern_fn, trim_q, trim_method_text, progress_label)
 
-    def run(self, *patterns: Pattern, include_base: bool = True) -> StatsCollection:
+    def analyze(self, *patterns: Pattern, include_base: bool = True) -> StatsCollection:
         if not patterns and include_base and self.benchmark is not None:
             return StatsCollection(
                 dict(self._base_stats),
@@ -377,12 +487,13 @@ class Backtest:
 
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
             if not isinstance(pattern_fn, Pattern):
-                raise TypeError("run()에 전달한 모든 패턴은 Pattern 객체여야 합니다.")
+                raise TypeError("analyze()에 전달한 모든 패턴은 Pattern 객체여야 합니다.")
             base_name = _infer_pattern_label(pattern_fn, idx)
-            trim_q = _infer_pattern_trim(pattern_fn)
+            trim_q, trim_method = _infer_pattern_trim_config(pattern_fn)
             stats = self._run_pattern(
                 pattern_fn,
                 trim_quantile=trim_q,
+                trim_method=trim_method,
                 progress_label=base_name,
             )
             name = base_name
