@@ -644,6 +644,19 @@ class Backtest:
             pattern_hist["geom_mean"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
         )
         all_stock_geom_series = self._all_stock_geom_history(horizon_days, lookback_window)
+
+        # Look-ahead 방지:
+        # horizon 기반 성과지표(기준일 i -> i+h)는 i+h 시점에야 확정된다.
+        # 의사결정 시점 t에서는 t-h까지의 값만 사용할 수 있으므로 h일 lag를 적용한다.
+        if horizon_days > 0:
+            lagged_pattern_geom = np.full_like(pattern_geom_series, np.nan, dtype=np.float64)
+            lagged_all_stock_geom = np.full_like(all_stock_geom_series, np.nan, dtype=np.float64)
+            lagged_pattern_geom[horizon_days:] = pattern_geom_series[:-horizon_days]
+            lagged_all_stock_geom[horizon_days:] = all_stock_geom_series[:-horizon_days]
+        else:
+            lagged_pattern_geom = pattern_geom_series
+            lagged_all_stock_geom = all_stock_geom_series
+
         simulator = Simulator(
             dates=self.dates,
             prices=self.prices,
@@ -656,8 +669,8 @@ class Backtest:
             target_horizon_days=horizon_days,
             aggregate_lookback=aggregate_lookback,
             pattern_mask=pattern_mask,
-            pattern_geom_series=pattern_geom_series,
-            all_stock_geom_series=all_stock_geom_series,
+            pattern_geom_series=lagged_pattern_geom,
+            all_stock_geom_series=lagged_all_stock_geom,
             fallback_exposure=fallback_exposure,
             max_weight_per_stock=max_weight_per_stock,
         )
