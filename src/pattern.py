@@ -205,52 +205,6 @@ class High(Pattern):
         return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
 
 
-class MovingAverage(Pattern):
-    def on(
-        self,
-        window: int = 20,
-        trigger: Literal["break_up", "break_down"] = "break_up",
-        cooldown_days: int = 3,
-    ):
-        window_value = int(window)
-        trigger_text = str(trigger or "break_up").lower()
-        if window_value <= 0:
-            raise ValueError("window는 1 이상이어야 합니다.")
-        if trigger_text not in {"break_up", "break_down"}:
-            raise ValueError("trigger는 {'break_up', 'break_down'} 중 하나여야 합니다.")
-
-        self.params = SimpleNamespace(
-            window=window_value,
-            trigger=trigger_text,
-            cooldown_days=int(max(0, cooldown_days)),
-        )
-        return self
-
-    def _base_mask(self, values: np.ndarray) -> np.ndarray:
-        if self.params is None:
-            raise ValueError("MovingAverage는 사용 전에 on(...)으로 설정해야 합니다.")
-
-        prices = np.asarray(values, dtype=np.float64)
-        n = prices.shape[0]
-        mask = np.zeros(n, dtype=np.bool_)
-
-        if n < self.params.window:
-            return mask
-
-        ma, valid_end = u.rolling_mean(prices, self.params.window)
-        if not np.any(valid_end):
-            return mask
-
-        direction = 1 if self.params.trigger == "break_up" else -1
-        out = u.breakout_mask(
-            prices,
-            ma,
-            valid_end,
-            direction,
-        )
-        return u.stay_cooldown_mask(out, 1, self.params.cooldown_days)
-
-
 class Disparity(Pattern):
     def __init__(
         self,
@@ -544,9 +498,7 @@ class Bollinger(Pattern):
 
 __all__ = [
     "Pattern",
-    "CombinedPattern",
     "High",
-    "MovingAverage",
     "Disparity",
     "Trending",
     "GoldenCross",

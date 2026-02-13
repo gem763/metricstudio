@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib import font_manager
-from matplotlib.ticker import MaxNLocator, MultipleLocator, StrMethodFormatter
+from matplotlib.ticker import MaxNLocator, StrMethodFormatter
 
 
 Horizon = Tuple[str, int]
@@ -99,7 +99,7 @@ def _apply_y_ticks(axes):
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
 
-    # Rise Probability 축은 자연수(정수) 눈금만 보이도록 고정한다.
+    # Rise Probability 축은 정수 눈금을 유지하되, 범위에 따라 간격을 자동 조정한다.
     if len(axes) >= 3:
         rise_ax = axes[2]
         ymin, ymax = rise_ax.get_ylim()
@@ -116,7 +116,7 @@ def _apply_y_ticks(axes):
                 else:
                     rise_ax.set_ylim(new_hi, new_lo)
 
-        rise_ax.yaxis.set_major_locator(MultipleLocator(1.0))
+        rise_ax.yaxis.set_major_locator(MaxNLocator(nbins=8, integer=True, min_n_ticks=3))
         rise_ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
 
 
