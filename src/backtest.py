@@ -40,6 +40,7 @@ class StockTable:
 
 _STOCK_TABLE: Optional[StockTable] = None
 _MARKET_TABLE: Dict[str, pd.DataFrame] = {}
+_CODE_NAME_SERIES: Optional[pd.Series] = None
 
 
 def _load_stock_table() -> StockTable:
@@ -66,6 +67,30 @@ def _load_market_table(market: str) -> pd.DataFrame:
         _MARKET_TABLE[key] = df
 
     return _MARKET_TABLE[key]
+
+
+def _load_code_name_series() -> pd.Series:
+    global _CODE_NAME_SERIES
+    if _CODE_NAME_SERIES is None:
+        mapping_path = DB().static_dir / "code_name.pkl"
+        if not mapping_path.exists():
+            _CODE_NAME_SERIES = pd.Series(dtype="object")
+            return _CODE_NAME_SERIES
+
+        code_name = pd.read_pickle(mapping_path)
+        if not isinstance(code_name, pd.Series):
+            raise TypeError(f"{mapping_path}는 pandas Series여야 합니다.")
+
+        normalized_codes = DB._normalize_codes(code_name.index)
+        normalized = pd.Series(
+            code_name.to_numpy(dtype=object, copy=False),
+            index=normalized_codes,
+            dtype="object",
+        )
+        if normalized.index.has_duplicates:
+            normalized = normalized[~normalized.index.duplicated(keep="last")]
+        _CODE_NAME_SERIES = normalized
+    return _CODE_NAME_SERIES
 
 
 @njit(cache=True)
@@ -528,6 +553,58 @@ class Backtest:
             f"h={h}는 지원되지 않습니다. horizon 라벨({labels}) 또는 offset({offsets})을 사용하세요."
         )
 
+    def _resolve_screen_date_index(self, date) -> int:
+        date_ts = pd.Timestamp(date)
+        target = date_ts.to_datetime64()
+        idx = int(np.searchsorted(self.dates, target, side="left"))
+        if idx < len(self.dates) and self.dates[idx] == target:
+            return idx
+
+        prev_text = None
+        next_text = None
+        if idx > 0:
+            prev_text = str(pd.Timestamp(self.dates[idx - 1]).date())
+        if idx < len(self.dates):
+            next_text = str(pd.Timestamp(self.dates[idx]).date())
+        raise ValueError(
+            f"요청한 날짜({date_ts.date()})는 거래일 데이터에 없습니다. "
+            f"이전 거래일={prev_text}, 다음 거래일={next_text}"
+        )
+
+    def _resolve_screen_pattern(
+        self,
+        pattern: Pattern,
+    ) -> tuple[str, Pattern, bool]:
+        if not isinstance(pattern, Pattern):
+            raise TypeError("screen()의 pattern은 Pattern 객체여야 합니다.")
+
+        for name, registered in self._analyzed_patterns.items():
+            if registered is pattern:
+                return name, pattern, True
+
+        inferred_name = _infer_pattern_label(pattern, len(self._analyzed_patterns) + 1)
+        return inferred_name, pattern, False
+
+    @staticmethod
+    def _code_names_for(codes: list[str]) -> list[str]:
+        if not codes:
+            return []
+        code_name = _load_code_name_series()
+        if code_name.empty:
+            return list(codes)
+
+        looked_up = code_name.reindex(pd.Index(codes, dtype="object"))
+        names: list[str] = []
+        values = looked_up.to_numpy(dtype=object, copy=False)
+        for i, code in enumerate(codes):
+            name_val = values[i]
+            if pd.isna(name_val):
+                names.append(code)
+                continue
+            text = str(name_val).strip()
+            names.append(text if text else code)
+        return names
+
     def _build_pattern_mask_matrix(self, pattern_name: str, pattern_fn: Pattern) -> np.ndarray:
         if pattern_name in self._pattern_mask_cache:
             return self._pattern_mask_cache[pattern_name]
@@ -594,6 +671,41 @@ class Backtest:
 
         self._all_stock_geom_cache[cache_key] = geom
         return geom
+
+    def screen(
+        self,
+        date,
+        pattern: Pattern,
+        use_cache: bool = True,
+    ) -> pd.DataFrame:
+        date_idx = self._resolve_screen_date_index(date)
+        pattern_name, pattern_fn, cache_allowed = self._resolve_screen_pattern(pattern)
+
+        row_mask = np.zeros(len(self.codes), dtype=np.bool_)
+        use_cache_now = bool(use_cache and cache_allowed)
+        if use_cache_now:
+            mask_matrix = self._build_pattern_mask_matrix(pattern_name, pattern_fn)
+            row_mask = np.asarray(mask_matrix[date_idx], dtype=np.bool_)
+        else:
+            self._prepare_market_sources(pattern_fn)
+            for col_idx, code in enumerate(self.codes):
+                values = self.prices[:, col_idx]
+                mask = self._compute_mask(pattern_fn, values, code)
+                if mask is None:
+                    continue
+                row_mask[col_idx] = bool(mask[date_idx])
+
+        selected_idx = np.flatnonzero(row_mask)
+        selected_codes = [self.codes[i] for i in selected_idx]
+        selected_names = self._code_names_for(selected_codes)
+        selected_prices = self.prices[date_idx, selected_idx]
+        return pd.DataFrame(
+            {
+                "name": selected_names,
+                "close": selected_prices.astype(np.float64, copy=False),
+            },
+            index=pd.Index(selected_codes, name="code"),
+        )
 
     def run(
         self,
