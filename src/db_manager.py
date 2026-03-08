@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 from typing import Iterable
+import warnings
 
 import FinanceDataReader as fdr
 import pandas as pd
@@ -51,6 +52,68 @@ class DB:
         numeric_mask = s.str.fullmatch(r"\d+")
         s.loc[numeric_mask] = s.loc[numeric_mask].str.zfill(6)
         return pd.Index(s.to_numpy())
+
+    @classmethod
+    def _normalize_code_name_series(cls, code_name: pd.Series) -> pd.Series:
+        if not isinstance(code_name, pd.Series):
+            raise TypeError("code_name은 pandas Series여야 합니다.")
+        normalized_codes = cls._normalize_codes(code_name.index)
+        normalized = pd.Series(
+            code_name.to_numpy(dtype=object, copy=False),
+            index=normalized_codes,
+            dtype="object",
+        )
+        if normalized.index.has_duplicates:
+            normalized = normalized[~normalized.index.duplicated(keep="last")]
+        return normalized
+
+    def _rebuild_code_name_from_excel_headers(self) -> pd.Series:
+        excel_paths = sorted(self.static_dir.glob("수정주가*.xlsx"))
+        if not excel_paths:
+            raise FileNotFoundError(
+                f"매핑 재생성용 엑셀 파일이 없습니다: {self.static_dir / '수정주가*.xlsx'}"
+            )
+
+        parts: list[pd.Series] = []
+        for path in excel_paths:
+            header_df = pd.read_excel(path, header=[0, 1], nrows=0)
+            if not isinstance(header_df.columns, pd.MultiIndex) or header_df.columns.nlevels < 2:
+                continue
+            cols = header_df.columns[1:]
+            if len(cols) == 0:
+                continue
+            codes = [c[0] for c in cols]
+            names = [c[1] for c in cols]
+            parts.append(pd.Series(names, index=codes, dtype="object"))
+
+        if not parts:
+            raise ValueError("엑셀 헤더에서 종목코드/종목명 매핑을 추출하지 못했습니다.")
+
+        merged = pd.concat(parts)
+        return self._normalize_code_name_series(merged)
+
+    def load_code_name(self, mapping_pkl: str = "code_name.pkl") -> pd.Series:
+        mapping_path = self.static_dir / mapping_pkl
+        if not mapping_path.exists():
+            raise FileNotFoundError(f"종목명 매핑 파일이 없습니다: {mapping_path}")
+
+        try:
+            code_name = pd.read_pickle(mapping_path)
+            if not isinstance(code_name, pd.Series):
+                raise TypeError(f"{mapping_path}는 pandas Series여야 합니다.")
+            return self._normalize_code_name_series(code_name)
+        except Exception as exc:
+            rebuilt = self._rebuild_code_name_from_excel_headers()
+            try:
+                rebuilt.to_pickle(mapping_path)
+            except Exception:
+                pass
+            warnings.warn(
+                "code_name.pkl 로딩이 실패해 엑셀 헤더에서 매핑을 재생성했습니다. "
+                f"원인: {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+            )
+            return rebuilt
 
     def _adjclose_paths(self) -> list[Path]:
         paths = sorted(self.static_dir.glob("adjclose*.pkl"))
@@ -275,7 +338,8 @@ class DB:
         if df.empty:
             return df
         # 비정상 급등락 또는 비정상 가격(예: 1원)을 포함한 종목 제거
-        daily_ret = df.pct_change()
+        # pandas 기본 fill_method 변경 경고 방지: 결측 자동 전파 없이 수익률 계산
+        daily_ret = df.pct_change(fill_method=None)
         bad_ret = daily_ret.abs() > max_daily_ret
         bad_price = df <= min_price
         bad_codes = bad_ret.any() | bad_price.any()
@@ -332,16 +396,18 @@ class DB:
 
         codes_to_exclude: set[str] = set()
         if exclude_spac:
-            mapping_path = self.static_dir / mapping_pkl
-            if not mapping_path.exists():
-                raise FileNotFoundError(f"종목명 매핑 파일이 없습니다: {mapping_path}")
-            code_name = pd.read_pickle(mapping_path)
-            if not isinstance(code_name, pd.Series):
-                raise TypeError(f"{mapping_path}는 pandas Series여야 합니다.")
-            mask = code_name.astype(str).str.contains(r"스팩", regex=True, na=False)
-            if mask.any():
-                excluded = self._normalize_codes(code_name.index[mask])
-                codes_to_exclude = set(excluded.to_list())
+            try:
+                code_name = self.load_code_name(mapping_pkl=mapping_pkl)
+                mask = code_name.astype(str).str.contains(r"스팩", regex=True, na=False)
+                if mask.any():
+                    excluded = self._normalize_codes(code_name.index[mask])
+                    codes_to_exclude = set(excluded.to_list())
+            except Exception as exc:
+                warnings.warn(
+                    "종목명 매핑 로딩 실패로 SPAC 제외를 건너뜁니다. "
+                    f"원인: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                )
 
         wide = self._read_field_store(field)
         if wide is None:

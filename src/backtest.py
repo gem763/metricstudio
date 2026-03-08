@@ -33,6 +33,10 @@ TRIM_MODE_WINSORIZE = 1
 
 @dataclass
 class StockTable:
+    """
+    백테스트에 쓰는 정렬된 가격 테이블(날짜 x 종목) 컨테이너.
+    """
+
     dates: np.ndarray  # shape (T,)
     prices: np.ndarray  # shape (T, N)
     codes: List[str]
@@ -44,6 +48,10 @@ _CODE_NAME_SERIES: Optional[pd.Series] = None
 
 
 def _load_stock_table() -> StockTable:
+    """
+    종가 테이블을 로드해 전역 캐시에 보관한다.
+    """
+
     global _STOCK_TABLE
     if _STOCK_TABLE is None:
         # DB 기본 경로: db/stock/close.parquet 또는 db/stock/data/*.parquet
@@ -56,40 +64,28 @@ def _load_stock_table() -> StockTable:
 
 
 def _load_market_table(market: str) -> pd.DataFrame:
+    """
+    시장 보조지표 테이블을 로드해 전역 캐시에 보관한다.
+    """
+
     key = str(market).strip().lower()
     if not key:
         raise ValueError("market은 비어 있을 수 없습니다.")
 
     if key not in _MARKET_TABLE:
-        df = DB().load_market(market=key)
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("load_market()은 DataFrame을 반환해야 합니다.")
-        _MARKET_TABLE[key] = df
+        _MARKET_TABLE[key] = DB().load_market(market=key)
 
     return _MARKET_TABLE[key]
 
 
 def _load_code_name_series() -> pd.Series:
+    """
+    종목코드-종목명 매핑 시리즈를 로드한다.
+    """
+
     global _CODE_NAME_SERIES
     if _CODE_NAME_SERIES is None:
-        mapping_path = DB().static_dir / "code_name.pkl"
-        if not mapping_path.exists():
-            _CODE_NAME_SERIES = pd.Series(dtype="object")
-            return _CODE_NAME_SERIES
-
-        code_name = pd.read_pickle(mapping_path)
-        if not isinstance(code_name, pd.Series):
-            raise TypeError(f"{mapping_path}는 pandas Series여야 합니다.")
-
-        normalized_codes = DB._normalize_codes(code_name.index)
-        normalized = pd.Series(
-            code_name.to_numpy(dtype=object, copy=False),
-            index=normalized_codes,
-            dtype="object",
-        )
-        if normalized.index.has_duplicates:
-            normalized = normalized[~normalized.index.duplicated(keep="last")]
-        _CODE_NAME_SERIES = normalized
+        _CODE_NAME_SERIES = DB().load_code_name(mapping_pkl="code_name.pkl")
     return _CODE_NAME_SERIES
 
 
@@ -106,6 +102,10 @@ def _numba_accumulate_returns(
     pos_counts,
     geom_invalid,
 ):
+    """
+    패턴 발생일별 horizon 수익률 통계를 누적한다.
+    """
+
     if end_idx < start_idx:
         end_idx = start_idx
     length = len(values)
@@ -138,6 +138,10 @@ def _numba_accumulate_returns(
 
 @njit(cache=True)
 def _numba_accumulate_occurrences(mask, start_idx, end_idx, occurrence_counts):
+    """
+    구간 내 패턴 발생 횟수를 일자별로 누적한다.
+    """
+
     if end_idx < start_idx:
         end_idx = start_idx
     length = len(mask)
@@ -150,6 +154,10 @@ def _numba_accumulate_occurrences(mask, start_idx, end_idx, occurrence_counts):
 
 @njit(cache=True)
 def _numba_quantile_linear_sorted(sorted_vals, n, q):
+    """
+    정렬된 배열에서 선형보간 분위수를 계산한다.
+    """
+
     if n <= 0:
         return np.nan
     if q <= 0.0:
@@ -182,6 +190,10 @@ def _numba_accumulate_trim_for_date(
     daily_geom,
     daily_rise,
 ):
+    """
+    단일 날짜 단면 수익률에 trim/winsorize를 적용해 통계를 누적한다.
+    """
+
     num_dates = prices.shape[0]
     num_codes = prices.shape[1]
     num_h = len(horizon_offsets)
@@ -264,6 +276,10 @@ def _numba_accumulate_trim_for_date(
 
 
 def _infer_pattern_label(pattern_fn: Pattern, idx: int) -> str:
+    """
+    패턴 표시 이름을 결정한다.
+    """
+
     name = getattr(pattern_fn, "name", None)
     if isinstance(name, str) and name:
         return name
@@ -271,6 +287,10 @@ def _infer_pattern_label(pattern_fn: Pattern, idx: int) -> str:
 
 
 def _normalize_trim_quantile(trim: float | None) -> float | None:
+    """
+    trim quantile 입력을 정규화하고 유효범위를 검증한다.
+    """
+
     if trim is None:
         return None
     value = float(trim)
@@ -280,6 +300,10 @@ def _normalize_trim_quantile(trim: float | None) -> float | None:
 
 
 def _normalize_trim_method(method: str | None) -> str:
+    """
+    trim 방법 문자열을 표준값으로 정규화한다.
+    """
+
     method_text = str(method or "remove").lower()
     if method_text not in {"remove", "winsorize"}:
         raise ValueError("trim method는 'remove' 또는 'winsorize'여야 합니다.")
@@ -287,6 +311,10 @@ def _normalize_trim_method(method: str | None) -> str:
 
 
 def _trim_mode_from_method(method: str) -> int:
+    """
+    trim 방법 문자열을 numba용 모드 상수로 변환한다.
+    """
+
     if method == "remove":
         return TRIM_MODE_REMOVE
     if method == "winsorize":
@@ -295,12 +323,20 @@ def _trim_mode_from_method(method: str) -> int:
 
 
 def _infer_pattern_trim_config(pattern_fn: Pattern) -> tuple[float | None, str]:
+    """
+    패턴 객체에서 trim 설정을 추출해 정규화한다.
+    """
+
     trim_q = _normalize_trim_quantile(getattr(pattern_fn, "trim_quantile", None))
     trim_method = _normalize_trim_method(getattr(pattern_fn, "trim_method", "remove"))
     return trim_q, trim_method
 
 
 def _parse_lookback_window(lookback: int | str) -> int:
+    """
+    lookback 입력(정수/문자열)을 거래일 수로 변환한다.
+    """
+
     if isinstance(lookback, (int, np.integer)):
         if lookback <= 0:
             raise ValueError("lookback은 1 이상이어야 합니다.")
@@ -326,12 +362,20 @@ def _parse_lookback_window(lookback: int | str) -> int:
 
 
 class Backtest:
+    """
+    패턴 분석, 스크리닝, 시뮬레이션 실행을 담당하는 메인 엔진.
+    """
+
     def __init__(
         self,
         start,
         end,
         benchmark: Pattern | None = None,
     ):
+        """
+        백테스트 기간과 기준 패턴(옵션)을 초기화한다.
+        """
+
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
         table = _load_stock_table()
@@ -352,6 +396,10 @@ class Backtest:
         self._last_stats_collection: StatsCollection | None = None
         self._pattern_mask_cache: Dict[str, np.ndarray] = {}
         self._all_stock_geom_cache: Dict[tuple[int, int], np.ndarray] = {}
+        self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._marketcap_matrix: np.ndarray | None = None
+        self._liquidity_matrix: np.ndarray | None = None
+        self._vwap_matrix: np.ndarray | None = None
         if benchmark is not None:
             base_name = _infer_pattern_label(benchmark, 0)
             base_trim_q, base_trim_method = _infer_pattern_trim_config(benchmark)
@@ -366,6 +414,10 @@ class Backtest:
 
     @staticmethod
     def _compute_mask(pattern_fn: Pattern, values: np.ndarray, code: str) -> np.ndarray | None:
+        """
+        패턴 함수 실행 결과를 bool 마스크로 정규화한다.
+        """
+
         mask = pattern_fn(values)
         if mask is None:
             return None
@@ -375,6 +427,10 @@ class Backtest:
         return mask_arr
 
     def _get_market_values(self, market: str, field: str) -> np.ndarray:
+        """
+        시장 데이터 컬럼을 날짜축에 맞춰 정렬한 뒤 캐시 반환한다.
+        """
+
         key = (str(market).strip().lower(), str(field).strip().lower())
         if not key[0]:
             raise ValueError("market은 비어 있을 수 없습니다.")
@@ -396,6 +452,10 @@ class Backtest:
         return self._market_values_cache[key]
 
     def _iter_pattern_nodes(self, pattern_fn: Pattern):
+        """
+        결합 패턴 트리를 순회하며 하위 Pattern 노드를 반환한다.
+        """
+
         seen: set[int] = set()
         stack: list[Pattern] = [pattern_fn]
         while stack:
@@ -414,6 +474,10 @@ class Backtest:
                 stack.append(right)
 
     def _prepare_market_sources(self, pattern_fn: Pattern) -> None:
+        """
+        market 기반 패턴 노드에 참조 시장 시계열을 주입한다.
+        """
+
         for node in self._iter_pattern_nodes(pattern_fn):
             market_name = getattr(node, "market_name", None)
             if market_name is None:
@@ -424,6 +488,10 @@ class Backtest:
             node._set_market_values(market_values)
 
     def _run_pattern_normal(self, pattern_fn: Pattern, progress_label: str) -> Stats:
+        """
+        trim 없이 이벤트 기반 통계를 계산한다.
+        """
+
         stats = Stats.create(self.dates, HORIZONS)
         for col_idx, code in enumerate(tqdm(self.codes, desc=f"{progress_label} | codes")):
             values = self.prices[:, col_idx]
@@ -451,6 +519,10 @@ class Backtest:
         return stats
 
     def _build_mask_matrix(self, pattern_fn: Pattern, eval_len: int) -> np.ndarray:
+        """
+        분석 구간의 [일자 x 종목] 패턴 마스크 행렬을 생성한다.
+        """
+
         num_codes = len(self.codes)
         mask_matrix = np.zeros((eval_len, num_codes), dtype=np.bool_)
         if eval_len == 0:
@@ -472,6 +544,10 @@ class Backtest:
         stats: Stats,
         progress_label: str,
     ) -> None:
+        """
+        날짜별 단면 데이터에 trim 집계를 누적한다.
+        """
+
         daily_arith = stats.daily_arith
         daily_geom = stats.daily_geom
         daily_rise = stats.daily_rise
@@ -504,6 +580,10 @@ class Backtest:
         trim_method: str,
         progress_label: str,
     ) -> Stats:
+        """
+        trim/winsorize를 적용한 daily-mean 통계를 계산한다.
+        """
+
         stats = Stats.create_daily(self.dates, HORIZONS)
         eval_len = max(0, self.end_idx - self.start_idx)
         mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
@@ -524,6 +604,10 @@ class Backtest:
         trim_method: str = "remove",
         progress_label: str = "pattern",
     ) -> Stats:
+        """
+        패턴 trim 설정에 따라 normal/trim 실행 경로를 선택한다.
+        """
+
         self._prepare_market_sources(pattern_fn)
         trim_q = _normalize_trim_quantile(trim_quantile)
         trim_method_text = _normalize_trim_method(trim_method)
@@ -533,6 +617,10 @@ class Backtest:
 
     @staticmethod
     def _resolve_horizon(h: str | int) -> tuple[str, int]:
+        """
+        horizon 입력을 (라벨, 거래일 수) 쌍으로 정규화한다.
+        """
+
         labels = [label for label, _ in HORIZONS]
         offsets = [int(days) for _, days in HORIZONS]
 
@@ -554,6 +642,10 @@ class Backtest:
         )
 
     def _resolve_screen_date_index(self, date) -> int:
+        """
+        스크리닝 대상 날짜를 내부 거래일 인덱스로 변환한다.
+        """
+
         date_ts = pd.Timestamp(date)
         target = date_ts.to_datetime64()
         idx = int(np.searchsorted(self.dates, target, side="left"))
@@ -575,6 +667,10 @@ class Backtest:
         self,
         pattern: Pattern,
     ) -> tuple[str, Pattern, bool]:
+        """
+        스크리닝용 패턴 이름과 캐시 사용 가능 여부를 결정한다.
+        """
+
         if not isinstance(pattern, Pattern):
             raise TypeError("screen()의 pattern은 Pattern 객체여야 합니다.")
 
@@ -587,6 +683,10 @@ class Backtest:
 
     @staticmethod
     def _code_names_for(codes: list[str]) -> list[str]:
+        """
+        코드 목록을 종목명 목록으로 변환한다(없으면 코드 유지).
+        """
+
         if not codes:
             return []
         code_name = _load_code_name_series()
@@ -606,6 +706,10 @@ class Backtest:
         return names
 
     def _build_pattern_mask_matrix(self, pattern_name: str, pattern_fn: Pattern) -> np.ndarray:
+        """
+        전체 기간 패턴 마스크를 생성/캐시한다.
+        """
+
         if pattern_name in self._pattern_mask_cache:
             return self._pattern_mask_cache[pattern_name]
 
@@ -621,15 +725,25 @@ class Backtest:
         self._pattern_mask_cache[pattern_name] = mask_matrix
         return mask_matrix
 
-    def _all_stock_geom_history(self, horizon_days: int, lookback_window: int) -> np.ndarray:
+    def _all_stock_history_metrics(
+        self,
+        horizon_days: int,
+        lookback_window: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        전체 종목 기준 horizon 산술/기하/상승확률 히스토리를 계산한다.
+        """
+
         cache_key = (int(horizon_days), int(lookback_window))
-        if cache_key in self._all_stock_geom_cache:
-            return self._all_stock_geom_cache[cache_key]
+        if cache_key in self._all_stock_metric_cache:
+            return self._all_stock_metric_cache[cache_key]
 
         prices = self.prices
         num_dates, _ = prices.shape
         counts = np.zeros(num_dates, dtype=np.float64)
+        sum_ret = np.zeros(num_dates, dtype=np.float64)
         sum_log = np.zeros(num_dates, dtype=np.float64)
+        pos_counts = np.zeros(num_dates, dtype=np.float64)
         invalid = np.zeros(num_dates, dtype=np.bool_)
 
         for i in range(0, max(0, num_dates - horizon_days)):
@@ -638,11 +752,15 @@ class Backtest:
             valid = np.isfinite(base) & np.isfinite(fwd) & (base > 0.0) & (fwd > 0.0)
             if not np.any(valid):
                 continue
+
             ret = fwd[valid] / base[valid] - 1.0
             cnt = ret.shape[0]
             if cnt <= 0:
                 continue
+
             counts[i] = float(cnt)
+            sum_ret[i] = float(ret.sum())
+            pos_counts[i] = float(np.sum(ret > 0.0))
             if np.any(ret <= -1.0):
                 invalid[i] = True
             else:
@@ -652,8 +770,14 @@ class Backtest:
         roll_counts = (
             pd.Series(counts).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
         )
+        roll_sum_ret = (
+            pd.Series(sum_ret).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
+        )
         roll_sum_log = (
             pd.Series(sum_log).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
+        )
+        roll_pos = (
+            pd.Series(pos_counts).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
         )
         roll_invalid = (
             pd.Series(invalid.astype(np.float64))
@@ -663,14 +787,140 @@ class Backtest:
             > 0.0
         )
 
-        geom = np.full(num_dates, np.nan, dtype=np.float64)
-        valid_geom = (roll_counts > 0.0) & (~roll_invalid)
-        geom[valid_geom] = np.exp(roll_sum_log[valid_geom] / roll_counts[valid_geom]) - 1.0
-        support = np.arange(num_dates) >= (window - 1)
-        geom[~support] = np.nan
+        arith_base = np.full(num_dates, np.nan, dtype=np.float64)
+        geom_base = np.full(num_dates, np.nan, dtype=np.float64)
+        rise_base = np.full(num_dates, np.nan, dtype=np.float64)
 
-        self._all_stock_geom_cache[cache_key] = geom
-        return geom
+        valid = roll_counts > 0.0
+        arith_base[valid] = roll_sum_ret[valid] / roll_counts[valid]
+        rise_base[valid] = roll_pos[valid] / roll_counts[valid]
+        valid_geom = valid & (~roll_invalid)
+        geom_base[valid_geom] = np.exp(roll_sum_log[valid_geom] / roll_counts[valid_geom]) - 1.0
+
+        support = np.arange(num_dates) >= (window - 1)
+        arith_base[~support] = np.nan
+        geom_base[~support] = np.nan
+        rise_base[~support] = np.nan
+
+        def _asof_shift(series: np.ndarray) -> np.ndarray:
+            shifted = np.full(num_dates, np.nan, dtype=np.float64)
+            if horizon_days > 0:
+                if horizon_days < num_dates:
+                    shifted[horizon_days:] = series[:-horizon_days]
+            else:
+                shifted[:] = series
+            return shifted
+
+        arith_asof = _asof_shift(arith_base)
+        geom_asof = _asof_shift(geom_base)
+        rise_asof = _asof_shift(rise_base)
+        self._all_stock_metric_cache[cache_key] = (arith_asof, geom_asof, rise_asof)
+        return arith_asof, geom_asof, rise_asof
+
+    def _all_stock_geom_history(self, horizon_days: int, lookback_window: int) -> np.ndarray:
+        """
+        전체 종목 기준 horizon 기하평균 수익률 히스토리를 계산한다.
+        """
+        cache_key = (int(horizon_days), int(lookback_window))
+        if cache_key in self._all_stock_geom_cache:
+            return self._all_stock_geom_cache[cache_key]
+        _, geom_asof, _ = self._all_stock_history_metrics(horizon_days, lookback_window)
+        self._all_stock_geom_cache[cache_key] = geom_asof
+        return geom_asof
+
+    def _get_marketcap_matrix(self) -> np.ndarray:
+        """
+        시가총액 wide 테이블을 백테스트 날짜/종목 축에 맞춰 정렬해 반환한다.
+        """
+
+        if self._marketcap_matrix is None:
+            mcap_df = DB().load_stock(field="marketcap")
+            aligned = mcap_df.reindex(
+                index=pd.DatetimeIndex(self.dates),
+                columns=pd.Index(self.codes, dtype="object"),
+            )
+            self._marketcap_matrix = aligned.to_numpy(dtype=np.float64, copy=True)
+        return self._marketcap_matrix
+
+    def _get_liquidity_matrix(self, window: int = 20) -> np.ndarray:
+        """
+        거래대금 기준 유동성(ADV) 매트릭스를 날짜/종목 축으로 반환한다.
+        """
+
+        if self._liquidity_matrix is None:
+            amount_df = DB().load_stock(field="amount")
+            aligned = amount_df.reindex(
+                index=pd.DatetimeIndex(self.dates),
+                columns=pd.Index(self.codes, dtype="object"),
+            )
+            adv = aligned.rolling(window=int(window), min_periods=1).mean()
+            self._liquidity_matrix = adv.to_numpy(dtype=np.float64, copy=True)
+        return self._liquidity_matrix
+
+    def _get_vwap_matrix(self) -> np.ndarray:
+        """
+        매매 체결/평가용 VWAP(= (open+high+low+close)/4) 매트릭스를 반환한다.
+        """
+
+        if self._vwap_matrix is None:
+            db = DB()
+            idx = pd.DatetimeIndex(self.dates)
+            cols = pd.Index(self.codes, dtype="object")
+
+            open_df = db.load_stock(field="open").reindex(index=idx, columns=cols)
+            high_df = db.load_stock(field="high").reindex(index=idx, columns=cols)
+            low_df = db.load_stock(field="low").reindex(index=idx, columns=cols)
+            close_df = db.load_stock(field="close").reindex(index=idx, columns=cols)
+            vwap_df = (open_df + high_df + low_df + close_df) / 4.0
+            self._vwap_matrix = vwap_df.to_numpy(dtype=np.float64, copy=True)
+        return self._vwap_matrix
+
+    def _resolve_trade_price_mode(self, trade_price_mode: str) -> tuple[np.ndarray, int, str]:
+        """
+        매매가격 모드를 (가격매트릭스, 실행시차일수, 정규화라벨)로 변환한다.
+        """
+
+        key = str(trade_price_mode).strip().lower().replace(" ", "")
+        if key in {"당일종가", "same_close", "sameclose"}:
+            return self.prices, 0, "same_close"
+        if key in {"익일종가", "next_close", "nextclose"}:
+            return self.prices, 1, "next_close"
+        if key in {"익일vwap", "next_vwap", "nextvwap", "vwap"}:
+            return self._get_vwap_matrix(), 1, "next_vwap"
+        raise ValueError("trade_price_mode은 '당일종가'/'익일종가'/'익일VWAP' 중 하나여야 합니다.")
+
+    def _resolve_top_n_values(self, top_n_type: str) -> np.ndarray:
+        """
+        top_n_type에 해당하는 단면 랭킹 매트릭스를 반환한다.
+        """
+
+        key = str(top_n_type).strip().lower()
+        if key == "marketcap":
+            return self._get_marketcap_matrix()
+        if key == "liquidity":
+            return self._get_liquidity_matrix(window=20)
+        if key == "marketcap+liquidity":
+            mcap = self._get_marketcap_matrix()
+            liquidity = self._get_liquidity_matrix(window=20)
+
+            mcap_rank = pd.DataFrame(mcap).rank(
+                axis=1,
+                method="average",
+                ascending=False,
+                na_option="keep",
+            )
+            liquidity_rank = pd.DataFrame(liquidity).rank(
+                axis=1,
+                method="average",
+                ascending=False,
+                na_option="keep",
+            )
+            # 랭크 숫자가 작을수록 우수하므로 음수로 뒤집어 점수화한다.
+            score = -0.5 * mcap_rank.to_numpy(dtype=np.float64) - 0.5 * liquidity_rank.to_numpy(
+                dtype=np.float64
+            )
+            return score
+        raise ValueError("top_n_type은 'marketcap', 'liquidity', 'marketcap+liquidity'만 지원합니다.")
 
     def screen(
         self,
@@ -678,6 +928,10 @@ class Backtest:
         pattern: Pattern,
         use_cache: bool = True,
     ) -> pd.DataFrame:
+        """
+        특정 거래일에 패턴을 만족하는 종목 목록을 반환한다.
+        """
+
         date_idx = self._resolve_screen_date_index(date)
         pattern_name, pattern_fn, cache_allowed = self._resolve_screen_pattern(pattern)
 
@@ -711,14 +965,22 @@ class Backtest:
         self,
         start=None,
         end=None,
-        pattern: str | None = None,
+        pattern: str = "",
         target_horizon: str | int = "1M",
         aggregate_lookback: int | str = 252,
+        trade_price_mode: str = "익일VWAP",
         fallback_exposure: float = 0.5,
-        max_weight_per_stock: float = 0.03,
+        stop_loss_pct: float | None = None,
+        take_profit_pct: float | None = None,
+        min_marketcap: float | None = None,
+        marketcap_top_pct: float | None = None,
+        cohort_top_n: int | None = None,
+        top_n_type: str = "marketcap",
     ) -> Simulator:
-        if pattern is None:
-            raise ValueError("run()에는 analyze()에서 계산한 pattern 이름(pattern)이 필요합니다.")
+        """
+        분석된 패턴 통계를 기반으로 포트폴리오 시뮬레이션을 실행한다.
+        """
+        # 1) 입력 파라미터를 내부 인덱스/거래일 단위로 정규화
         if pattern not in self._analyzed_patterns or pattern not in self._analyzed_stats:
             available = sorted(self._analyzed_patterns.keys())
             raise ValueError(
@@ -728,6 +990,10 @@ class Backtest:
 
         horizon_label, horizon_days = self._resolve_horizon(target_horizon)
         lookback_window = _parse_lookback_window(aggregate_lookback)
+        top_n = None if cohort_top_n is None else int(cohort_top_n)
+        if top_n is not None and top_n <= 0:
+            raise ValueError("cohort_top_n은 1 이상의 정수이거나 None이어야 합니다.")
+        top_n_type_value = str(top_n_type).strip().lower()
 
         run_start = pd.Timestamp(self.start if start is None else start)
         run_end = pd.Timestamp(self.end if end is None else end)
@@ -740,6 +1006,7 @@ class Backtest:
         if end_idx - start_idx < 2:
             raise ValueError("run 구간에 최소 2개 이상의 거래일이 필요합니다.")
 
+        # 2) 패턴/시장 통계 시계열 준비
         pattern_fn = self._analyzed_patterns[pattern]
         pattern_stats = self._analyzed_stats[pattern]
         pattern_mask = self._build_pattern_mask_matrix(pattern, pattern_fn)
@@ -752,26 +1019,42 @@ class Backtest:
             min_count=1,
             require_full_window=True,
         )
+        pattern_arith_series = (
+            pattern_hist["arith_mean"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
+        )
         pattern_geom_series = (
             pattern_hist["geom_mean"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
         )
-        all_stock_geom_series = self._all_stock_geom_history(horizon_days, lookback_window)
+        pattern_rise_series = (
+            pattern_hist["rise_prob"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
+        )
+        (
+            all_stock_arith_series,
+            all_stock_geom_series,
+            all_stock_rise_series,
+        ) = self._all_stock_history_metrics(horizon_days, lookback_window)
+        top_n_values = self._resolve_top_n_values(top_n_type_value) if top_n is not None else None
+        marketcap_values = (
+            self._get_marketcap_matrix()
+            if (min_marketcap is not None or marketcap_top_pct is not None)
+            else None
+        )
+        code_name_series = _load_code_name_series()
+        code_names = {
+            str(code): str(name).strip()
+            for code, name in code_name_series.items()
+            if pd.notna(name) and str(name).strip()
+        }
 
-        # Look-ahead 방지:
-        # horizon 기반 성과지표(기준일 i -> i+h)는 i+h 시점에야 확정된다.
-        # 의사결정 시점 t에서는 t-h까지의 값만 사용할 수 있으므로 h일 lag를 적용한다.
-        if horizon_days > 0:
-            lagged_pattern_geom = np.full_like(pattern_geom_series, np.nan, dtype=np.float64)
-            lagged_all_stock_geom = np.full_like(all_stock_geom_series, np.nan, dtype=np.float64)
-            lagged_pattern_geom[horizon_days:] = pattern_geom_series[:-horizon_days]
-            lagged_all_stock_geom[horizon_days:] = all_stock_geom_series[:-horizon_days]
-        else:
-            lagged_pattern_geom = pattern_geom_series
-            lagged_all_stock_geom = all_stock_geom_series
-
+        # 3) Simulator로 주문/보유/청산 루프 실행
+        trade_prices, execution_lag_days, execution_price_mode = self._resolve_trade_price_mode(
+            trade_price_mode
+        )
         simulator = Simulator(
             dates=self.dates,
-            prices=self.prices,
+            prices=trade_prices,
+            codes=self.codes,
+            code_names=code_names,
         )
         return simulator.run(
             start_idx=start_idx,
@@ -781,13 +1064,30 @@ class Backtest:
             target_horizon_days=horizon_days,
             aggregate_lookback=aggregate_lookback,
             pattern_mask=pattern_mask,
-            pattern_geom_series=lagged_pattern_geom,
-            all_stock_geom_series=lagged_all_stock_geom,
+            pattern_arith_series=pattern_arith_series,
+            pattern_geom_series=pattern_geom_series,
+            pattern_rise_series=pattern_rise_series,
+            all_stock_arith_series=all_stock_arith_series,
+            all_stock_geom_series=all_stock_geom_series,
+            all_stock_rise_series=all_stock_rise_series,
             fallback_exposure=fallback_exposure,
-            max_weight_per_stock=max_weight_per_stock,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            marketcap_values=marketcap_values,
+            min_marketcap=min_marketcap,
+            marketcap_top_pct=marketcap_top_pct,
+            top_n_values=top_n_values,
+            cohort_top_n=top_n,
+            top_n_type=top_n_type_value,
+            execution_lag_days=execution_lag_days,
+            execution_price_mode=execution_price_mode,
         )
 
     def analyze(self, *patterns: Pattern, include_base: bool = True) -> StatsCollection:
+        """
+        패턴들을 평가해 StatsCollection 결과를 생성한다.
+        """
+
         if not patterns and include_base and self.benchmark is not None:
             result = StatsCollection(
                 dict(self._base_stats),

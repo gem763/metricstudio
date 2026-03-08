@@ -19,6 +19,10 @@ _PLOT_FONT_CONFIGURED = False
 
 
 def _configure_plot_font() -> None:
+    """
+    한글 깨짐을 줄이기 위해 사용 가능한 CJK 폰트를 matplotlib에 적용한다.
+    """
+
     global _PLOT_FONT_CONFIGURED
     if _PLOT_FONT_CONFIGURED:
         return
@@ -79,10 +83,18 @@ def _configure_plot_font() -> None:
 
 
 def _as_percent(values: np.ndarray) -> np.ndarray:
+    """
+    소수 수익률 배열을 퍼센트 스케일로 변환한다.
+    """
+
     return values * 100.0
 
 
 def _normalize_ylim_percent(ylim):
+    """
+    y축 입력 범위를 퍼센트 단위로 정규화한다.
+    """
+
     if ylim is None:
         return None
     lo = float(ylim[0])
@@ -94,6 +106,10 @@ def _normalize_ylim_percent(ylim):
 
 
 def _apply_y_ticks(axes):
+    """
+    수익률/상승확률 축의 눈금 포맷을 정수형으로 맞춘다.
+    """
+
     # Return 축은 정수 눈금을 유지한다.
     for ax in axes[:2]:
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
@@ -121,12 +137,20 @@ def _apply_y_ticks(axes):
 
 
 def _share_return_y_axis(axes):
+    """
+    산술/기하 수익률 패널의 y축을 공유한다.
+    """
+
     axes[1].sharey(axes[0])
     axes[1].set_ylabel("")
     axes[1].tick_params(axis="y", left=False, labelleft=False)
 
 
 def _apply_date_ticks(axes, dates):
+    """
+    날짜 범위에 맞는 포맷과 간격으로 x축 tick을 설정한다.
+    """
+
     n_points = len(dates)
     if n_points <= 0:
         return
@@ -173,6 +197,10 @@ def _apply_date_ticks(axes, dates):
 
 
 def _draw_hline_if_in_view(ax, y: float, **kwargs) -> bool:
+    """
+    현재 y축 범위 안에 있을 때만 기준선을 그린다.
+    """
+
     ymin, ymax = ax.get_ylim()
     lo, hi = (ymin, ymax) if ymin <= ymax else (ymax, ymin)
     if lo <= y <= hi:
@@ -184,6 +212,10 @@ def _draw_hline_if_in_view(ax, y: float, **kwargs) -> bool:
 
 
 def _rolling_sum_1d(values: np.ndarray, window: int) -> np.ndarray:
+    """
+    1차원 배열의 rolling 합계를 누적합으로 계산한다.
+    """
+
     if window <= 1:
         return values.astype(np.float64, copy=True)
     cumsum = np.cumsum(values, dtype=np.float64)
@@ -193,7 +225,41 @@ def _rolling_sum_1d(values: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
+def _shift_known_at_asof(values: np.ndarray, lag_days: int, fill_value: float) -> np.ndarray:
+    """
+    기준일 수치를 확정시점(as-of) 기준으로 lag 이동한다.
+    """
+
+    out = np.full(values.shape, fill_value, dtype=np.float64)
+    lag = int(max(0, lag_days))
+    if lag == 0:
+        out[:] = values
+        return out
+    if lag < values.shape[0]:
+        out[lag:] = values[:-lag]
+    return out
+
+
+def _shift_known_mask_at_asof(values: np.ndarray, lag_days: int) -> np.ndarray:
+    """
+    bool 마스크를 확정시점(as-of) 기준으로 lag 이동한다.
+    """
+
+    out = np.zeros(values.shape, dtype=np.bool_)
+    lag = int(max(0, lag_days))
+    if lag == 0:
+        out[:] = values
+        return out
+    if lag < values.shape[0]:
+        out[lag:] = values[:-lag]
+    return out
+
+
 def _parse_lookback(spec: str):
+    """
+    '1Y'/'6M' 같은 lookback 문자열을 DateOffset/Timedelta로 변환한다.
+    """
+
     text = str(spec).strip().upper()
     if len(text) < 2:
         raise ValueError(f"lookback 형식이 올바르지 않습니다: {spec}")
@@ -216,11 +282,19 @@ def _parse_lookback(spec: str):
 
 
 def _lookback_start(asof: pd.Timestamp, lookback: str) -> pd.Timestamp:
+    """
+    기준일(as-of)에서 lookback을 뺀 시작일을 계산한다.
+    """
+
     return asof - _parse_lookback(lookback)
 
 
 @dataclass
 class Stats:
+    """
+    단일 패턴의 horizon 통계 버퍼와 집계 메서드를 보관한다.
+    """
+
     dates: np.ndarray
     horizons: List[Horizon]
     counts: np.ndarray
@@ -236,6 +310,10 @@ class Stats:
 
     @classmethod
     def create(cls, dates: np.ndarray, horizons: Iterable[Horizon]) -> "Stats":
+        """
+        이벤트(event) 집계 모드용 빈 Stats 버퍼를 생성한다.
+        """
+
         horizon_list = list(horizons)
         length = len(dates)
         num_h = len(horizon_list)
@@ -256,6 +334,10 @@ class Stats:
 
     @classmethod
     def create_daily(cls, dates: np.ndarray, horizons: Iterable[Horizon]) -> "Stats":
+        """
+        daily_mean 집계 모드용 빈 Stats 버퍼를 생성한다.
+        """
+
         horizon_list = list(horizons)
         length = len(dates)
         num_h = len(horizon_list)
@@ -275,6 +357,10 @@ class Stats:
         )
 
     def _slice_indices(self, start=None, end=None) -> Tuple[int, int]:
+        """
+        날짜 경계(start/end)를 내부 인덱스 범위로 변환한다.
+        """
+
         dates = self.dates
         total = len(dates)
         if start is None:
@@ -297,6 +383,10 @@ class Stats:
         end=None,
         ma_window: int | None = None,
     ) -> pd.DataFrame:
+        """
+        일자별 패턴 발생횟수(옵션: 이동평균)를 반환한다.
+        """
+
         start_idx, end_idx = self._slice_indices(start, end)
         dates = pd.to_datetime(self.dates[start_idx:end_idx])
         occ_full = self.occurrence_counts.astype(np.float64, copy=False)
@@ -316,6 +406,10 @@ class Stats:
         return out
 
     def to_frame(self, start=None, end=None) -> pd.DataFrame:
+        """
+        구간 요약 통계(산술/기하/상승확률)를 horizon별로 반환한다.
+        """
+
         start_idx, end_idx = self._slice_indices(start, end)
         rows = []
         if start_idx >= end_idx:
@@ -414,6 +508,10 @@ class Stats:
         min_count: int = 30,
         require_full_window: bool = True,
     ) -> pd.DataFrame:
+        """
+        단일 horizon의 rolling 이력 통계를 as-of 기준 시계열로 반환한다.
+        """
+
         start_idx, end_idx = self._slice_indices(start, end)
         if start_idx >= end_idx:
             raise ValueError("지정한 구간에 데이터가 없습니다.")
@@ -429,6 +527,7 @@ class Stats:
             h_idx = labels.index(horizon)
 
         window = max(1, int(history_window))
+        horizon_days = int(self.horizons[h_idx][1])
 
         if self.aggregation_mode == "daily_mean":
             if self.daily_arith is None or self.daily_geom is None or self.daily_rise is None:
@@ -447,17 +546,24 @@ class Stats:
                 .sum()
                 .to_numpy()
             )
+            support_full = cnt_full >= max(1, int(min_count))
+            if require_full_window:
+                base_idx = np.arange(len(self.dates))
+                support_full &= base_idx >= (window - 1)
+
+            # 기준일 통계를 확정시점(as-of) 축으로 이동한다.
+            known_arith_full = _shift_known_at_asof(arith_full, horizon_days, np.nan)
+            known_geom_full = _shift_known_at_asof(geom_full, horizon_days, np.nan)
+            known_rise_full = _shift_known_at_asof(rise_full, horizon_days, np.nan)
+            known_cnt_full = _shift_known_at_asof(cnt_full, horizon_days, 0.0)
+            known_support_full = _shift_known_mask_at_asof(support_full, horizon_days)
 
             dates = self.dates[start_idx:end_idx]
-            arith = arith_full[start_idx:end_idx]
-            geom = geom_full[start_idx:end_idx]
-            rise = rise_full[start_idx:end_idx]
-            roll_counts = cnt_full[start_idx:end_idx]
-
-            support = roll_counts >= max(1, int(min_count))
-            if require_full_window:
-                global_idx = np.arange(start_idx, end_idx)
-                support &= global_idx >= (window - 1)
+            arith = known_arith_full[start_idx:end_idx]
+            geom = known_geom_full[start_idx:end_idx]
+            rise = known_rise_full[start_idx:end_idx]
+            roll_counts = known_cnt_full[start_idx:end_idx]
+            support = known_support_full[start_idx:end_idx]
 
             out = pd.DataFrame(
                 {
@@ -484,13 +590,6 @@ class Stats:
         roll_pos = _rolling_sum_1d(pos, window)
         roll_invalid = _rolling_sum_1d(invalid.astype(np.float64), window) > 0.0
 
-        dates = self.dates[start_idx:end_idx]
-        roll_counts = roll_counts[start_idx:end_idx]
-        roll_sum_ret = roll_sum_ret[start_idx:end_idx]
-        roll_sum_log = roll_sum_log[start_idx:end_idx]
-        roll_pos = roll_pos[start_idx:end_idx]
-        roll_invalid = roll_invalid[start_idx:end_idx]
-
         arith = np.full_like(roll_sum_ret, np.nan, dtype=np.float64)
         geom = np.full_like(roll_sum_ret, np.nan, dtype=np.float64)
         rise = np.full_like(roll_sum_ret, np.nan, dtype=np.float64)
@@ -504,15 +603,30 @@ class Stats:
 
         support = roll_counts >= max(1, int(min_count))
         if require_full_window:
-            global_idx = np.arange(start_idx, end_idx)
-            support &= global_idx >= (window - 1)
+            base_idx = np.arange(len(self.dates))
+            support &= base_idx >= (window - 1)
+
+        # 기준일 통계를 확정시점(as-of) 축으로 이동한다.
+        known_roll_counts = _shift_known_at_asof(roll_counts, horizon_days, 0.0)
+        known_arith = _shift_known_at_asof(arith, horizon_days, np.nan)
+        known_geom = _shift_known_at_asof(geom, horizon_days, np.nan)
+        known_rise = _shift_known_at_asof(rise, horizon_days, np.nan)
+        known_support = _shift_known_mask_at_asof(support, horizon_days)
+
+        dates = self.dates[start_idx:end_idx]
+        known_roll_counts = known_roll_counts[start_idx:end_idx]
+        known_arith = known_arith[start_idx:end_idx]
+        known_geom = known_geom[start_idx:end_idx]
+        known_rise = known_rise[start_idx:end_idx]
+        known_support = known_support[start_idx:end_idx]
+
         out = pd.DataFrame(
             {
                 "horizon": self.horizons[h_idx][0],
-                "count": roll_counts,
-                "arith_mean": np.where(support, arith, np.nan),
-                "geom_mean": np.where(support, geom, np.nan),
-                "rise_prob": np.where(support, rise, np.nan),
+                "count": known_roll_counts,
+                "arith_mean": np.where(known_support, known_arith, np.nan),
+                "geom_mean": np.where(known_support, known_geom, np.nan),
+                "rise_prob": np.where(known_support, known_rise, np.nan),
             },
             index=pd.to_datetime(dates),
         )
@@ -522,10 +636,18 @@ class Stats:
 
 @dataclass
 class StatsCollection:
+    """
+    여러 패턴의 Stats를 묶어 비교/시각화 기능을 제공한다.
+    """
+
     stats_map: Dict[str, Stats]
     benchmark_names: set[str] = field(default_factory=set)
 
     def _ordered_pattern_names(self, patterns: Iterable[str] | None = None) -> List[str]:
+        """
+        패턴 이름을 benchmark 우선 순서로 정렬해 반환한다.
+        """
+
         if patterns is None:
             names = list(self.stats_map.keys())
         else:
@@ -546,6 +668,10 @@ class StatsCollection:
 
     @staticmethod
     def _apply_legend_order(ax, names: Iterable[str]) -> None:
+        """
+        범례 순서를 지정한 패턴 순서로 맞춘다.
+        """
+
         handles, labels = ax.get_legend_handles_labels()
         handle_by_label = {label: handle for handle, label in zip(handles, labels)}
         ordered_labels = [name for name in names if name in handle_by_label]
@@ -555,6 +681,10 @@ class StatsCollection:
         ax.legend(ordered_handles, ordered_labels)
 
     def _pattern_colors(self, names: Iterable[str]) -> Dict[str, str]:
+        """
+        패턴별 라인 컬러 매핑을 생성한다.
+        """
+
         palette = [
             "#D56062",
             "#067BC2",
@@ -576,14 +706,26 @@ class StatsCollection:
         return mapping
 
     def patterns(self) -> List[str]:
+        """
+        보유 중인 패턴 이름 목록을 반환한다.
+        """
+
         return list(self.stats_map.keys())
 
     def get(self, name: str) -> Stats:
+        """
+        이름으로 단일 Stats 객체를 조회한다.
+        """
+
         if name not in self.stats_map:
             raise KeyError(f"알 수 없는 패턴입니다: {name}")
         return self.stats_map[name]
 
     def to_frame(self, start=None, end=None, pattern: str | None = None) -> pd.DataFrame:
+        """
+        단일/다중 패턴 요약 통계를 DataFrame으로 반환한다.
+        """
+
         if not self.stats_map:
             return pd.DataFrame(
                 columns=["period", "scope", "count", "arith_mean", "geom_mean", "rise_prob"]
@@ -607,6 +749,10 @@ class StatsCollection:
         ma_window: int | None = None,
         pattern: str | None = None,
     ) -> pd.DataFrame:
+        """
+        단일/다중 패턴 발생횟수 시계열을 반환한다.
+        """
+
         cols = ["occurrence"] if ma_window is None else ["occurrence", "occurrence_ma"]
         if not self.stats_map:
             return pd.DataFrame(columns=cols)
@@ -641,6 +787,10 @@ class StatsCollection:
         require_full_window: bool = True,
         pattern: str | None = None,
     ) -> pd.DataFrame:
+        """
+        단일/다중 패턴의 horizon rolling 이력 통계를 반환한다.
+        """
+
         if not self.stats_map:
             return pd.DataFrame(
                 columns=["horizon", "count", "arith_mean", "geom_mean", "rise_prob"]
@@ -682,6 +832,10 @@ class StatsCollection:
         return_ylim=None,
         return_handles: bool = False,
     ):
+        """
+        horizon별 산술/기하/상승확률 비교 차트를 그린다.
+        """
+
         _configure_plot_font()
         if not self.stats_map:
             raise ValueError("StatsCollection이 비어 있습니다.")
@@ -771,6 +925,10 @@ class StatsCollection:
         return_ylim=None,
         return_handles: bool = False,
     ):
+        """
+        기준일 기준 단기/장기 구간 통계를 나란히 시각화한다.
+        """
+
         asof_ts = pd.Timestamp(asof)
         short_start = _lookback_start(asof_ts, short)
         long_start = _lookback_start(asof_ts, long)
@@ -816,6 +974,10 @@ class StatsCollection:
         show_daily: bool = False,
         return_handles: bool = False,
     ):
+        """
+        패턴 발생횟수(일별 또는 이동평균) 시계열을 그린다.
+        """
+
         _configure_plot_font()
         if not self.stats_map:
             raise ValueError("StatsCollection이 비어 있습니다.")
@@ -894,6 +1056,10 @@ class StatsCollection:
         return_ylim=None,
         return_handles: bool = False,
     ):
+        """
+        단일 horizon의 rolling 통계를 날짜축 기준으로 시각화한다.
+        """
+
         _configure_plot_font()
         if not self.stats_map:
             raise ValueError("StatsCollection이 비어 있습니다.")
