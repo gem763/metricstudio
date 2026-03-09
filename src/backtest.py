@@ -29,6 +29,8 @@ HORIZONS: List[Tuple[str, int]] = [
 
 TRIM_MODE_REMOVE = 0
 TRIM_MODE_WINSORIZE = 1
+AGG_MODE_EVENT = "event"
+AGG_MODE_DAY = "day"
 
 
 @dataclass
@@ -332,6 +334,19 @@ def _infer_pattern_trim_config(pattern_fn: Pattern) -> tuple[float | None, str]:
     return trim_q, trim_method
 
 
+def _normalize_analyze_by(mode: str | None) -> str:
+    """
+    analyze(by=...) 가중 모드를 정규화한다.
+    """
+
+    key = str(mode or AGG_MODE_DAY).strip().lower().replace("-", "_")
+    if key in {"event", "events", "event_mean"}:
+        return AGG_MODE_EVENT
+    if key in {"day", "daily", "day_mean", "daily_mean"}:
+        return AGG_MODE_DAY
+    raise ValueError("by는 'event' 또는 'day'여야 합니다.")
+
+
 def _parse_lookback_window(lookback: int | str) -> int:
     """
     lookback 입력(정수/문자열)을 거래일 수로 변환한다.
@@ -603,17 +618,24 @@ class Backtest:
         trim_quantile: float | None = None,
         trim_method: str = "remove",
         progress_label: str = "pattern",
+        aggregation_mode: str = AGG_MODE_EVENT,
     ) -> Stats:
         """
         패턴 trim 설정에 따라 normal/trim 실행 경로를 선택한다.
         """
 
         self._prepare_market_sources(pattern_fn)
+        agg_mode = _normalize_analyze_by(aggregation_mode)
         trim_q = _normalize_trim_quantile(trim_quantile)
         trim_method_text = _normalize_trim_method(trim_method)
-        if trim_q is None or trim_q <= 0.0:
-            return self._run_pattern_normal(pattern_fn, progress_label)
-        return self._run_pattern_trim(pattern_fn, trim_q, trim_method_text, progress_label)
+        if agg_mode == AGG_MODE_EVENT:
+            if trim_q is None or trim_q <= 0.0:
+                return self._run_pattern_normal(pattern_fn, progress_label)
+            return self._run_pattern_trim(pattern_fn, trim_q, trim_method_text, progress_label)
+
+        # day_mean 모드: trim 미설정(None)이어도 일자균등 평균을 계산한다.
+        daily_trim_q = 0.0 if trim_q is None else float(trim_q)
+        return self._run_pattern_trim(pattern_fn, daily_trim_q, trim_method_text, progress_label)
 
     @staticmethod
     def _resolve_horizon(h: str | int) -> tuple[str, int]:
@@ -976,6 +998,8 @@ class Backtest:
         marketcap_top_pct: float | None = None,
         cohort_top_n: int | None = None,
         top_n_type: str = "marketcap",
+        allow_reentry: bool = True,
+        min_cohort_size: int = 1,
     ) -> Simulator:
         """
         분석된 패턴 통계를 기반으로 포트폴리오 시뮬레이션을 실행한다.
@@ -1081,26 +1105,66 @@ class Backtest:
             top_n_type=top_n_type_value,
             execution_lag_days=execution_lag_days,
             execution_price_mode=execution_price_mode,
+            allow_reentry=allow_reentry,
+            min_cohort_size=min_cohort_size,
         )
 
-    def analyze(self, *patterns: Pattern, include_base: bool = True) -> StatsCollection:
+    def analyze(
+        self,
+        *patterns: Pattern,
+        include_base: bool = True,
+        by: str = AGG_MODE_DAY,
+    ) -> StatsCollection:
         """
         패턴들을 평가해 StatsCollection 결과를 생성한다.
         """
 
+        aggregation_mode = _normalize_analyze_by(by)
+
         if not patterns and include_base and self.benchmark is not None:
+            if aggregation_mode == AGG_MODE_EVENT:
+                base_stats_map = dict(self._base_stats)
+            else:
+                base_name = _infer_pattern_label(self.benchmark, 0)
+                base_trim_q, base_trim_method = _infer_pattern_trim_config(self.benchmark)
+                base_stats = self._run_pattern(
+                    self.benchmark,
+                    trim_quantile=base_trim_q,
+                    trim_method=base_trim_method,
+                    progress_label=base_name,
+                    aggregation_mode=aggregation_mode,
+                )
+                base_stats_map = {base_name: base_stats}
+                self._analyzed_patterns[base_name] = self.benchmark
+                self._analyzed_stats[base_name] = base_stats
+
             result = StatsCollection(
-                dict(self._base_stats),
-                benchmark_names=set(self._base_stats.keys()),
+                base_stats_map,
+                benchmark_names=set(base_stats_map.keys()),
             )
             self._last_stats_collection = result
             return result
 
         stats_map: Dict[str, Stats] = {}
         benchmark_names: set[str] = set()
-        if include_base:
-            stats_map.update(self._base_stats)
-            benchmark_names = set(self._base_stats.keys())
+        if include_base and self.benchmark is not None:
+            if aggregation_mode == AGG_MODE_EVENT:
+                stats_map.update(self._base_stats)
+                benchmark_names = set(self._base_stats.keys())
+            else:
+                base_name = _infer_pattern_label(self.benchmark, 0)
+                base_trim_q, base_trim_method = _infer_pattern_trim_config(self.benchmark)
+                base_stats = self._run_pattern(
+                    self.benchmark,
+                    trim_quantile=base_trim_q,
+                    trim_method=base_trim_method,
+                    progress_label=base_name,
+                    aggregation_mode=aggregation_mode,
+                )
+                stats_map[base_name] = base_stats
+                benchmark_names = {base_name}
+                self._analyzed_patterns[base_name] = self.benchmark
+                self._analyzed_stats[base_name] = base_stats
 
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
             if not isinstance(pattern_fn, Pattern):
@@ -1112,6 +1176,7 @@ class Backtest:
                 trim_quantile=trim_q,
                 trim_method=trim_method,
                 progress_label=base_name,
+                aggregation_mode=aggregation_mode,
             )
             name = base_name
             suffix = 2

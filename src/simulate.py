@@ -40,6 +40,8 @@ class Simulator:
     max_weight_per_stock: float | None = field(default=None, init=False)
     cohort_top_n: int | None = field(default=None, init=False)
     top_n_type: str | None = field(default=None, init=False)
+    allow_reentry: bool | None = field(default=None, init=False)
+    min_cohort_size: int | None = field(default=None, init=False)
     run_years: float | None = field(default=None, init=False)
     total_return: float | None = field(default=None, init=False)
     cagr: float | None = field(default=None, init=False)
@@ -278,6 +280,10 @@ class Simulator:
             if self.cohort_top_n is not None
             else float("nan"),
             "top_n_type": str(self.top_n_type) if self.top_n_type is not None else "none",
+            "allow_reentry": bool(self.allow_reentry) if self.allow_reentry is not None else True,
+            "min_cohort_size": float(self.min_cohort_size)
+            if self.min_cohort_size is not None
+            else float("nan"),
             "buy_fee": float(self.buy_fee),
             "sell_fee": float(self.sell_fee),
             "run_years": float(self.run_years),
@@ -389,6 +395,8 @@ class Simulator:
         marketcap_top_pct: float | None = None,
         execution_lag_days: int = 1,
         execution_price_mode: str = "next_vwap",
+        allow_reentry: bool = True,
+        min_cohort_size: int = 1,
     ) -> Simulator:
         """
         코호트별 fallback을 적용한 포트폴리오 시뮬레이션.
@@ -421,6 +429,10 @@ class Simulator:
             raise ValueError(
                 "top_n_type은 'marketcap', 'liquidity', 'marketcap+liquidity'만 지원합니다."
             )
+        allow_reentry_value = bool(allow_reentry)
+        min_cohort_size_value = int(min_cohort_size)
+        if min_cohort_size_value <= 0:
+            raise ValueError("min_cohort_size는 1 이상의 정수여야 합니다.")
         buy_fee_value = float(self.buy_fee)
         sell_fee_value = float(self.sell_fee)
         cohort_weight = 1.0 / float(horizon_days)
@@ -476,6 +488,18 @@ class Simulator:
                 ranking = np.where(np.isfinite(ranking_row), ranking_row, -np.inf)
                 order = np.argsort(ranking)[::-1]
                 selected = selected[order[:top_n]]
+            if (not allow_reentry_value) and selected.size > 0 and active_buckets:
+                active_idx_parts: list[np.ndarray] = []
+                for bucket in active_buckets:
+                    idx_bucket = np.asarray(bucket["idx"], dtype=np.int64)
+                    if idx_bucket.size > 0:
+                        active_idx_parts.append(idx_bucket)
+                if active_idx_parts:
+                    held_idx = np.unique(np.concatenate(active_idx_parts))
+                    if held_idx.size > 0:
+                        selected = selected[~np.isin(selected, held_idx)]
+            if selected.size < min_cohort_size_value:
+                selected = selected[:0]
             actual_selected = 0
 
             # lag=1: t 기준 판정 -> t+1 체결, lag=0: t+1 기준 판정 -> t+1 체결
@@ -702,6 +726,8 @@ class Simulator:
         out.attrs["max_weight_per_stock"] = float("nan")
         out.attrs["cohort_top_n"] = float(top_n) if top_n is not None else float("nan")
         out.attrs["top_n_type"] = top_n_type_value if top_n is not None else "none"
+        out.attrs["allow_reentry"] = bool(allow_reentry_value)
+        out.attrs["min_cohort_size"] = float(min_cohort_size_value)
         out.attrs["buy_fee"] = buy_fee_value
         out.attrs["sell_fee"] = sell_fee_value
         out.attrs["total_buy_fee_paid"] = total_buy_fee_paid
@@ -723,6 +749,8 @@ class Simulator:
         self.max_weight_per_stock = float("nan")
         self.cohort_top_n = top_n
         self.top_n_type = top_n_type_value if top_n is not None else "none"
+        self.allow_reentry = bool(allow_reentry_value)
+        self.min_cohort_size = int(min_cohort_size_value)
         self.run_years = years
         self.total_return = total_return
         self.cagr = cagr
