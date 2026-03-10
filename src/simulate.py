@@ -31,6 +31,12 @@ class Simulator:
     target_horizon_days: int | None = field(default=None, init=False)
     aggregate_lookback: int | str | None = field(default=None, init=False)
     fallback_exposure: float | None = field(default=None, init=False)
+    gate_geom_min: float | None = field(default=None, init=False)
+    gate_arith_min: float | None = field(default=None, init=False)
+    gate_rise_min: float | None = field(default=None, init=False)
+    gate_use_geom: bool | None = field(default=None, init=False)
+    gate_use_arith: bool | None = field(default=None, init=False)
+    gate_use_rise: bool | None = field(default=None, init=False)
     stop_loss_pct: float | None = field(default=None, init=False)
     take_profit_pct: float | None = field(default=None, init=False)
     min_marketcap: float | None = field(default=None, init=False)
@@ -45,6 +51,9 @@ class Simulator:
     run_years: float | None = field(default=None, init=False)
     total_return: float | None = field(default=None, init=False)
     cagr: float | None = field(default=None, init=False)
+    cohort_win_rate: float | None = field(default=None, init=False)
+    cohort_payoff_ratio: float | None = field(default=None, init=False)
+    active_day_ratio: float | None = field(default=None, init=False)
     total_buy_fee_paid: float | None = field(default=None, init=False)
     total_sell_fee_paid: float | None = field(default=None, init=False)
     _portfolio_snapshots: dict[int, list[dict[str, np.ndarray | int]]] | None = field(
@@ -115,6 +124,34 @@ class Simulator:
         if value <= 0.0 or value >= 1.0:
             raise ValueError("stop_loss_pct는 0~1(소수) 또는 1~100(%) 범위여야 합니다.")
         return value
+
+    @staticmethod
+    def _normalize_return_gate_min(value: float, name: str) -> float:
+        """
+        산술/기하 수익률 최소 기준값을 정규화한다.
+        """
+
+        out = float(value)
+        if not np.isfinite(out):
+            raise ValueError(f"{name}는 유한한 숫자여야 합니다.")
+        if out <= -1.0:
+            raise ValueError(f"{name}는 -1보다 커야 합니다.")
+        return out
+
+    @staticmethod
+    def _normalize_rise_gate_min(value: float) -> float:
+        """
+        상승확률 최소 기준값을 소수 비율(예: 0.55=55%)로 정규화한다.
+        """
+
+        out = float(value)
+        if not np.isfinite(out):
+            raise ValueError("gate_rise_min은 유한한 숫자여야 합니다.")
+        if out > 1.0:
+            out = out / 100.0
+        if out < 0.0 or out > 1.0:
+            raise ValueError("gate_rise_min은 0~1(소수) 또는 0~100(%) 범위여야 합니다.")
+        return out
 
     @staticmethod
     def _normalize_take_profit_pct(take_profit_pct: float | None) -> float | None:
@@ -261,6 +298,18 @@ class Simulator:
             "target_horizon_days": float(self.target_horizon_days),
             "aggregate_lookback": str(self.aggregate_lookback),
             "fallback_exposure": float(self.fallback_exposure),
+            "gate_geom_min": float(self.gate_geom_min)
+            if self.gate_geom_min is not None
+            else float("nan"),
+            "gate_arith_min": float(self.gate_arith_min)
+            if self.gate_arith_min is not None
+            else float("nan"),
+            "gate_rise_min": float(self.gate_rise_min)
+            if self.gate_rise_min is not None
+            else float("nan"),
+            "gate_use_geom": bool(self.gate_use_geom) if self.gate_use_geom is not None else False,
+            "gate_use_arith": bool(self.gate_use_arith) if self.gate_use_arith is not None else False,
+            "gate_use_rise": bool(self.gate_use_rise) if self.gate_use_rise is not None else False,
             "stop_loss_pct": float(self.stop_loss_pct) if self.stop_loss_pct is not None else float("nan"),
             "take_profit_pct": float(self.take_profit_pct)
             if self.take_profit_pct is not None
@@ -289,6 +338,22 @@ class Simulator:
             "run_years": float(self.run_years),
             "total_return": float(self.total_return),
             "cagr": float(self.cagr),
+            "win_rate": float(self.cohort_win_rate)
+            if self.cohort_win_rate is not None
+            else float("nan"),
+            "payoff_ratio": float(self.cohort_payoff_ratio)
+            if self.cohort_payoff_ratio is not None
+            else float("nan"),
+            "cohort_win_rate": float(self.cohort_win_rate)
+            if self.cohort_win_rate is not None
+            else float("nan"),
+            "cohort_payoff_ratio": float(self.cohort_payoff_ratio)
+            if self.cohort_payoff_ratio is not None
+            else float("nan"),
+            "active_day_ratio": float(self.active_day_ratio)
+            if self.active_day_ratio is not None
+            else float("nan"),
+            "closed_cohort_count": float(self.data.attrs.get("closed_cohort_count", np.nan)),
             "total_buy_fee_paid": float(self.total_buy_fee_paid),
             "total_sell_fee_paid": float(self.total_sell_fee_paid),
             "total_fee_paid": float(self.total_fee_paid),
@@ -296,7 +361,7 @@ class Simulator:
 
     def plot(self, figsize=(12, 5), return_handles: bool = False):
         """
-        스프레드/보유종목수/자산곡선을 3개 패널로 시각화한다.
+        게이트 스프레드/보유종목수/자산곡선을 3개 패널로 시각화한다.
         """
 
         out = self._require_result()
@@ -317,14 +382,56 @@ class Simulator:
         ann_vol_text = f"{ann_vol * 100.0:.2f}%" if np.isfinite(ann_vol) else "nan"
         ir = cagr / ann_vol if np.isfinite(cagr) and np.isfinite(ann_vol) and ann_vol > 0.0 else float("nan")
         ir_text = f"{ir:.2f}" if np.isfinite(ir) else "nan"
-        spread = out["pattern_geom_mean"] - out["all_stock_geom_mean"]
+        win_rate = float(meta["win_rate"])
+        payoff_ratio = float(meta["payoff_ratio"])
+        active_day_ratio = float(meta.get("active_day_ratio", np.nan))
+        win_text = f"{win_rate * 100.0:.2f}%" if np.isfinite(win_rate) else "nan"
+        payoff_text = f"{payoff_ratio:.2f}" if np.isfinite(payoff_ratio) else "nan"
+        active_text = f"{active_day_ratio * 100.0:.2f}%" if np.isfinite(active_day_ratio) else "nan"
+        gate_arith_min = float(meta.get("gate_arith_min", 0.0))
+        gate_geom_min = float(meta.get("gate_geom_min", 0.0))
+        gate_rise_min = float(meta.get("gate_rise_min", 0.5))
+        arith_spread = out["pattern_arith_mean"] - np.maximum(
+            gate_arith_min,
+            out["all_stock_arith_mean"],
+        )
+        geom_spread = out["pattern_geom_mean"] - np.maximum(
+            gate_geom_min,
+            out["all_stock_geom_mean"],
+        )
+        rise_spread = out["pattern_rise_prob"] - np.maximum(
+            gate_rise_min,
+            out["all_stock_rise_prob"],
+        )
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=False, sharex=True)
         for ax in axes:
             ax.set_box_aspect(1.0)
 
-        axes[0].plot(out.index, spread, color="#D56062", linewidth=1.8)
+        axes[0].plot(
+            out.index,
+            arith_spread,
+            color="#F37748",
+            linewidth=1.5,
+            label="arith - max(a, market_arith)",
+        )
+        axes[0].plot(
+            out.index,
+            geom_spread,
+            color="#D56062",
+            linewidth=1.8,
+            label="geom - max(b, market_geom)",
+        )
+        axes[0].plot(
+            out.index,
+            rise_spread,
+            color="#067BC2",
+            linewidth=1.5,
+            alpha=0.95,
+            label="rise - max(c, market_rise)",
+        )
         axes[0].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[0].set_title("Geometic mean spread")
+        axes[0].set_title("Gate metric spreads")
+        axes[0].legend(loc="upper left", fontsize=8)
         axes[0].grid(alpha=0.25, linestyle="--")
 
         axes[1].plot(
@@ -354,7 +461,14 @@ class Simulator:
         axes[2].text(
             0.02,
             0.98,
-            f"CAGR: {cagr_text}\n연변동성: {ann_vol_text}\nIR: {ir_text}",
+            "CAGR: {cagr}\n연변동성: {vol}\nIR: {ir}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
+                cagr=cagr_text,
+                vol=ann_vol_text,
+                ir=ir_text,
+                win=win_text,
+                payoff=payoff_text,
+                active=active_text,
+            ),
             transform=axes[2].transAxes,
             ha="left",
             va="top",
@@ -385,6 +499,12 @@ class Simulator:
         all_stock_geom_series: np.ndarray,
         all_stock_rise_series: np.ndarray,
         fallback_exposure: float = 0.5,
+        gate_geom_min: float = 0.0,
+        gate_arith_min: float = 0.0,
+        gate_rise_min: float = 0.5,
+        gate_use_geom: bool = False,
+        gate_use_arith: bool = False,
+        gate_use_rise: bool = False,
         top_n_values: np.ndarray | None = None,
         cohort_top_n: int | None = None,
         top_n_type: str = "marketcap",
@@ -403,7 +523,9 @@ class Simulator:
 
         - 기본 코호트 크기: 전체자산의 1/horizon
         - 진입일 신호 기준으로 코호트 단위만 100% 또는 fallback_exposure 배정
-        - 진입 조건: 기하/산술/상승확률 3조건 동시 만족(AND)
+        - 게이트 조건: 활성화된 지표(geom/arith/rise) 각각에 대해
+          pattern_metric > max(metric_min, market_metric)
+        - gate_use_geom/gate_use_arith/gate_use_rise 중 최소 1개는 True여야 함
         - 종목별 비중 상한은 적용하지 않음(동등비중)
         """
 
@@ -417,6 +539,21 @@ class Simulator:
             raise ValueError("execution_lag_days는 0(당일) 또는 1(익일)만 지원합니다.")
 
         fallback_exposure_value = float(fallback_exposure)
+        gate_geom_min_value = self._normalize_return_gate_min(
+            gate_geom_min, "gate_geom_min"
+        )
+        gate_arith_min_value = self._normalize_return_gate_min(
+            gate_arith_min, "gate_arith_min"
+        )
+        gate_rise_min_value = self._normalize_rise_gate_min(gate_rise_min)
+        gate_use_geom_value = bool(gate_use_geom)
+        gate_use_arith_value = bool(gate_use_arith)
+        gate_use_rise_value = bool(gate_use_rise)
+        if not (gate_use_geom_value or gate_use_arith_value or gate_use_rise_value):
+            raise ValueError(
+                "게이트 지표를 모두 비활성화할 수 없습니다. "
+                "gate_use_geom/gate_use_arith/gate_use_rise 중 최소 1개는 True여야 합니다."
+            )
         stop_loss_value = self._normalize_stop_loss_pct(stop_loss_pct)
         take_profit_value = self._normalize_take_profit_pct(take_profit_pct)
         min_marketcap_value = self._normalize_min_marketcap(min_marketcap)
@@ -453,8 +590,12 @@ class Simulator:
         exposure = np.full(len(self.dates), np.nan, dtype=np.float64)
         selected_count = np.full(len(self.dates), np.nan, dtype=np.float64)
         active_count = np.full(len(self.dates), np.nan, dtype=np.float64)
+        pattern_arith_out = np.full(len(self.dates), np.nan, dtype=np.float64)
+        all_arith_out = np.full(len(self.dates), np.nan, dtype=np.float64)
         pattern_geom_out = np.full(len(self.dates), np.nan, dtype=np.float64)
         all_geom_out = np.full(len(self.dates), np.nan, dtype=np.float64)
+        pattern_rise_out = np.full(len(self.dates), np.nan, dtype=np.float64)
+        all_rise_out = np.full(len(self.dates), np.nan, dtype=np.float64)
 
         wealth[start_idx] = 1.0
         cash = 1.0
@@ -463,6 +604,9 @@ class Simulator:
         total_buy_fee_paid = 0.0
         total_sell_fee_paid = 0.0
         next_cohort_id = 1
+        cohort_entry_net: dict[int, float] = {}
+        cohort_exit_net: dict[int, float] = {}
+        closed_cohort_returns: list[float] = []
 
         for t in range(start_idx, end_idx - 1):
             signal_idx = t if lag_days == 1 else (t + 1)
@@ -563,15 +707,30 @@ class Simulator:
                     gross_sell_value = float(vals.sum())
                     sell_fee_paid = gross_sell_value * sell_fee_value
                     total_sell_fee_paid += sell_fee_paid
-                    cash += gross_sell_value - sell_fee_paid
+                    net_sell_value = gross_sell_value - sell_fee_paid
+                    cash += net_sell_value
+                    cohort_id = int(bucket["cohort_id"])
+                    cohort_exit_net[cohort_id] = float(
+                        cohort_exit_net.get(cohort_id, 0.0) + net_sell_value
+                    )
+                    entry_net = float(cohort_entry_net.get(cohort_id, np.nan))
+                    if np.isfinite(entry_net) and entry_net > 0.0:
+                        closed_cohort_returns.append(cohort_exit_net[cohort_id] / entry_net - 1.0)
+                    cohort_entry_net.pop(cohort_id, None)
+                    cohort_exit_net.pop(cohort_id, None)
                     continue
 
                 if np.any(exit_mask):
+                    cohort_id = int(bucket["cohort_id"])
                     sell_value = float(vals[exit_mask].sum())
                     if sell_value > 0.0:
                         sell_fee_paid = sell_value * sell_fee_value
                         total_sell_fee_paid += sell_fee_paid
-                        cash += sell_value - sell_fee_paid
+                        net_sell_value = sell_value - sell_fee_paid
+                        cash += net_sell_value
+                        cohort_exit_net[cohort_id] = float(
+                            cohort_exit_net.get(cohort_id, 0.0) + net_sell_value
+                        )
 
                     keep = ~exit_mask
                     if np.any(keep):
@@ -580,6 +739,14 @@ class Simulator:
                         bucket["entry_values"] = entry_vals[keep]
                         bucket.pop("exit_next_mask", None)
                         next_active.append(bucket)
+                    else:
+                        entry_net = float(cohort_entry_net.get(cohort_id, np.nan))
+                        if np.isfinite(entry_net) and entry_net > 0.0:
+                            closed_cohort_returns.append(
+                                cohort_exit_net[cohort_id] / entry_net - 1.0
+                            )
+                        cohort_entry_net.pop(cohort_id, None)
+                        cohort_exit_net.pop(cohort_id, None)
                     continue
 
                 bucket.pop("exit_next_mask", None)
@@ -598,16 +765,28 @@ class Simulator:
                 market_geom = all_stock_geom_series[signal_idx]
                 pattern_rise = pattern_rise_series[signal_idx]
                 market_rise = all_stock_rise_series[signal_idx]
-                full_cohort = (
+                has_metrics = (
                     np.isfinite(pattern_arith)
                     and np.isfinite(market_arith)
                     and np.isfinite(pattern_geom)
                     and np.isfinite(market_geom)
                     and np.isfinite(pattern_rise)
                     and np.isfinite(market_rise)
-                    and (pattern_geom > max(0.0, market_geom))
-                    and (pattern_arith > max(0.0, market_arith))
-                    and (pattern_rise > max(0.5, market_rise))
+                )
+                full_cohort = (
+                    has_metrics
+                    and (
+                        (not gate_use_geom_value)
+                        or (pattern_geom > max(gate_geom_min_value, market_geom))
+                    )
+                    and (
+                        (not gate_use_arith_value)
+                        or (pattern_arith > max(gate_arith_min_value, market_arith))
+                    )
+                    and (
+                        (not gate_use_rise_value)
+                        or (pattern_rise > max(gate_rise_min_value, market_rise))
+                    )
                 )
                 cohort_scale = 1.0 if full_cohort else fallback_exposure_value
 
@@ -624,6 +803,7 @@ class Simulator:
                         gross_spend = invested_net + buy_fee_paid
                         total_buy_fee_paid += buy_fee_paid
                         cash -= gross_spend
+                        cohort_id = int(next_cohort_id)
                         active_buckets.append(
                             {
                                 "idx": buy_idx,
@@ -631,9 +811,11 @@ class Simulator:
                                 "entry_values": buy_values.copy(),
                                 "age": 0,
                                 "entry_idx": t + 1,
-                                "cohort_id": next_cohort_id,
+                                "cohort_id": cohort_id,
                             }
                         )
+                        cohort_entry_net[cohort_id] = invested_net
+                        cohort_exit_net[cohort_id] = 0.0
                         next_cohort_id += 1
                         actual_selected = int(buy_idx.size)
 
@@ -648,8 +830,12 @@ class Simulator:
             exposure[t] = invested_value / next_wealth if next_wealth > 0.0 else np.nan
             selected_count[t] = float(actual_selected)
             active_count[t] = float(total_active)
+            pattern_arith_out[t] = pattern_arith_series[signal_idx]
+            all_arith_out[t] = all_stock_arith_series[signal_idx]
             pattern_geom_out[t] = pattern_geom_series[signal_idx]
             all_geom_out[t] = all_stock_geom_series[signal_idx]
+            pattern_rise_out[t] = pattern_rise_series[signal_idx]
+            all_rise_out[t] = all_stock_rise_series[signal_idx]
             snapshots[t + 1] = self._clone_active_buckets(active_buckets)
 
         final_invested = 0.0
@@ -662,8 +848,12 @@ class Simulator:
         exposure[end_idx - 1] = final_invested / final_wealth if final_wealth > 0.0 else np.nan
         selected_count[end_idx - 1] = 0.0
         active_count[end_idx - 1] = float(final_active)
+        pattern_arith_out[end_idx - 1] = pattern_arith_series[end_idx - 1]
+        all_arith_out[end_idx - 1] = all_stock_arith_series[end_idx - 1]
         pattern_geom_out[end_idx - 1] = pattern_geom_series[end_idx - 1]
         all_geom_out[end_idx - 1] = all_stock_geom_series[end_idx - 1]
+        pattern_rise_out[end_idx - 1] = pattern_rise_series[end_idx - 1]
+        all_rise_out[end_idx - 1] = all_stock_rise_series[end_idx - 1]
 
         out_index = pd.DatetimeIndex(self.dates[start_idx:end_idx])
         out = pd.DataFrame(
@@ -672,12 +862,30 @@ class Simulator:
                 "exposure": exposure[start_idx:end_idx],
                 "selected_count": selected_count[start_idx:end_idx],
                 "active_count": active_count[start_idx:end_idx],
+                "pattern_arith_mean": pattern_arith_out[start_idx:end_idx],
+                "all_stock_arith_mean": all_arith_out[start_idx:end_idx],
                 "pattern_geom_mean": pattern_geom_out[start_idx:end_idx],
                 "all_stock_geom_mean": all_geom_out[start_idx:end_idx],
+                "pattern_rise_prob": pattern_rise_out[start_idx:end_idx],
+                "all_stock_rise_prob": all_rise_out[start_idx:end_idx],
             },
             index=out_index,
         )
         out.index.name = "date"
+
+        exposure_prev = out["exposure"].to_numpy(dtype=np.float64)[:-1]
+        active_mask = np.isfinite(exposure_prev) & (exposure_prev > 1e-12)
+        cohort_ret = np.asarray(closed_cohort_returns, dtype=np.float64)
+        cohort_ret = cohort_ret[np.isfinite(cohort_ret)]
+        win_rate_value = float("nan")
+        payoff_ratio_value = float("nan")
+        if cohort_ret.size > 0:
+            winners = cohort_ret[cohort_ret > 0.0]
+            losers = cohort_ret[cohort_ret < 0.0]
+            win_rate_value = float(np.mean(cohort_ret > 0.0))
+            if winners.size > 0 and losers.size > 0:
+                payoff_ratio_value = float(winners.mean() / abs(losers.mean()))
+        active_day_ratio_value = float(np.mean(active_mask)) if active_mask.size > 0 else float("nan")
 
         start_wealth = float(out["wealth"].iloc[0]) if len(out) > 0 else float("nan")
         end_wealth = float(out["wealth"].iloc[-1]) if len(out) > 0 else float("nan")
@@ -708,11 +916,23 @@ class Simulator:
         out.attrs["cagr"] = cagr
         out.attrs["total_return"] = total_return
         out.attrs["run_years"] = years
+        out.attrs["win_rate"] = win_rate_value
+        out.attrs["payoff_ratio"] = payoff_ratio_value
+        out.attrs["cohort_win_rate"] = win_rate_value
+        out.attrs["cohort_payoff_ratio"] = payoff_ratio_value
+        out.attrs["active_day_ratio"] = active_day_ratio_value
+        out.attrs["closed_cohort_count"] = float(cohort_ret.size)
         out.attrs["pattern"] = pattern
         out.attrs["target_horizon"] = target_horizon
         out.attrs["target_horizon_days"] = horizon_days
         out.attrs["aggregate_lookback"] = str(aggregate_lookback)
         out.attrs["fallback_exposure"] = fallback_exposure_value
+        out.attrs["gate_geom_min"] = gate_geom_min_value
+        out.attrs["gate_arith_min"] = gate_arith_min_value
+        out.attrs["gate_rise_min"] = gate_rise_min_value
+        out.attrs["gate_use_geom"] = bool(gate_use_geom_value)
+        out.attrs["gate_use_arith"] = bool(gate_use_arith_value)
+        out.attrs["gate_use_rise"] = bool(gate_use_rise_value)
         out.attrs["stop_loss_pct"] = stop_loss_value if stop_loss_value is not None else float("nan")
         out.attrs["take_profit_pct"] = (
             take_profit_value if take_profit_value is not None else float("nan")
@@ -740,6 +960,12 @@ class Simulator:
         self.target_horizon_days = horizon_days
         self.aggregate_lookback = aggregate_lookback
         self.fallback_exposure = fallback_exposure_value
+        self.gate_geom_min = gate_geom_min_value
+        self.gate_arith_min = gate_arith_min_value
+        self.gate_rise_min = gate_rise_min_value
+        self.gate_use_geom = bool(gate_use_geom_value)
+        self.gate_use_arith = bool(gate_use_arith_value)
+        self.gate_use_rise = bool(gate_use_rise_value)
         self.stop_loss_pct = stop_loss_value
         self.take_profit_pct = take_profit_value
         self.min_marketcap = min_marketcap_value
@@ -754,6 +980,9 @@ class Simulator:
         self.run_years = years
         self.total_return = total_return
         self.cagr = cagr
+        self.cohort_win_rate = win_rate_value
+        self.cohort_payoff_ratio = payoff_ratio_value
+        self.active_day_ratio = active_day_ratio_value
         self.total_buy_fee_paid = total_buy_fee_paid
         self.total_sell_fee_paid = total_sell_fee_paid
         self._portfolio_snapshots = snapshots
