@@ -12,7 +12,8 @@ import pandas as pd
 from numba import njit
 from tqdm.auto import tqdm
 
-from src.db_manager import DB
+from src.db_manager import DB as DuckDBManager
+from src.db_manager_archive import DB as ArchiveDBManager
 from src.pattern import Pattern
 from src.simulate import Simulator
 from src.stats import Stats, StatsCollection
@@ -43,6 +44,7 @@ class StockTable:
     dates: np.ndarray  # shape (T,)
     prices: np.ndarray  # shape (T, N)
     codes: List[str]
+    code_names: Dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -209,28 +211,118 @@ class GateDiagnostics:
         return None
 
 
-_STOCK_TABLE: Optional[StockTable] = None
-_MARKET_TABLE: Dict[str, pd.DataFrame] = {}
-_CODE_NAME_SERIES: Optional[pd.Series] = None
+DB_MODE_DUCKDB = 0
+DB_MODE_LEGACY = 1
+
+_INDEX_NAME_MAP: Dict[str, str] = {
+    "kospi": "코스피",
+    "kosdaq": "코스닥",
+    "kospi200": "코스피200",
+    "ks11": "코스피",
+    "kq11": "코스닥",
+    "ks200": "코스피200",
+}
+
+_STOCK_TABLE_CACHE: Dict[int, StockTable] = {}
+_MARKET_TABLE_CACHE: Dict[int, Dict[str, pd.DataFrame]] = {}
+_CODE_NAME_SERIES_CACHE: Dict[int, pd.Series] = {}
+_STOCK_FIELD_TABLE_CACHE: Dict[int, Dict[str, pd.DataFrame]] = {}
+_DB_MANAGER_CACHE: Dict[int, object] = {}
 
 
-def _load_stock_table() -> StockTable:
+def _normalize_db_mode(db: int) -> int:
+    mode = int(db)
+    if mode not in {DB_MODE_DUCKDB, DB_MODE_LEGACY}:
+        raise ValueError("db는 0(duckdb adjusted/index) 또는 1(legacy db/stock, db/market)만 지원합니다.")
+    return mode
+
+
+def _get_db_manager(db_mode: int):
+    mode = _normalize_db_mode(db_mode)
+    if mode in _DB_MANAGER_CACHE:
+        return _DB_MANAGER_CACHE[mode]
+    manager = DuckDBManager() if mode == DB_MODE_DUCKDB else ArchiveDBManager()
+    _DB_MANAGER_CACHE[mode] = manager
+    return manager
+
+
+def _load_stock_field_table(field: str, db_mode: int) -> pd.DataFrame:
+    mode = _normalize_db_mode(db_mode)
+    key = str(field).strip().lower()
+    cache = _STOCK_FIELD_TABLE_CACHE.setdefault(mode, {})
+    if key in cache:
+        return cache[key]
+
+    if mode == DB_MODE_LEGACY:
+        out = _get_db_manager(mode).load_stock(field=key)
+        cache[key] = out
+        return out
+
+    # duckdb adjusted-stock 모드
+    field_map = {"marketcap": "market_cap"}
+    source_field = field_map.get(key, key)
+    long_df = _get_db_manager(mode).load_adjusted_stock_duckdb(columns=[source_field])
+    if source_field not in long_df.columns:
+        raise ValueError(f"adjusted-stock 데이터에 '{source_field}' 컬럼이 없습니다.")
+    wide = pd.to_numeric(long_df[source_field], errors="coerce").unstack("ticker")
+    wide.index = pd.to_datetime(wide.index, errors="coerce")
+    wide = wide[wide.index.notna()]
+    wide.columns = pd.Index([str(c) for c in wide.columns], dtype="object")
+    out = wide.sort_index().sort_index(axis=1)
+    cache[key] = out
+    return out
+
+
+def _load_stock_table(db_mode: int) -> StockTable:
     """
     종가 테이블을 로드해 전역 캐시에 보관한다.
     """
 
-    global _STOCK_TABLE
-    if _STOCK_TABLE is None:
+    mode = _normalize_db_mode(db_mode)
+    if mode in _STOCK_TABLE_CACHE:
+        return _STOCK_TABLE_CACHE[mode]
+
+    if mode == DB_MODE_LEGACY:
         # DB 기본 경로: db/stock/close.parquet 또는 db/stock/data/*.parquet
-        df = DB().load_stock(field="close")
+        df = _load_stock_field_table("close", mode)
         dates = df.index.to_numpy(dtype="datetime64[ns]")
         prices = df.to_numpy(dtype=np.float64, copy=True)
         codes = [str(c) for c in df.columns]
-        _STOCK_TABLE = StockTable(dates=dates, prices=prices, codes=codes)
-    return _STOCK_TABLE
+        table = StockTable(dates=dates, prices=prices, codes=codes, code_names={})
+        _STOCK_TABLE_CACHE[mode] = table
+        return table
+
+    # duckdb adjusted-stock 모드
+    long_df = _get_db_manager(mode).load_adjusted_stock_duckdb(columns=["name", "close"])
+    close_wide = pd.to_numeric(long_df["close"], errors="coerce").unstack("ticker")
+    close_wide.index = pd.to_datetime(close_wide.index, errors="coerce")
+    close_wide = close_wide[close_wide.index.notna()]
+    close_wide.columns = pd.Index([str(c) for c in close_wide.columns], dtype="object")
+    close_wide = close_wide.sort_index().sort_index(axis=1)
+
+    name_df = (
+        long_df.reset_index()[["date", "ticker", "name"]]
+        .sort_values(["date", "ticker"], kind="mergesort")
+        .dropna(subset=["ticker", "name"])
+        .drop_duplicates(subset=["ticker"], keep="last")
+    )
+    code_names = {
+        str(code): str(name).strip()
+        for code, name in zip(name_df["ticker"].to_numpy(), name_df["name"].to_numpy())
+        if str(name).strip()
+    }
+
+    table = StockTable(
+        dates=close_wide.index.to_numpy(dtype="datetime64[ns]"),
+        prices=close_wide.to_numpy(dtype=np.float64, copy=True),
+        codes=[str(c) for c in close_wide.columns],
+        code_names=code_names,
+    )
+    _STOCK_TABLE_CACHE[mode] = table
+    return table
 
 
-def _load_market_table(market: str) -> pd.DataFrame:
+def _load_market_table(market: str, db_mode: int) -> pd.DataFrame:
     """
     시장 보조지표 테이블을 로드해 전역 캐시에 보관한다.
     """
@@ -239,21 +331,49 @@ def _load_market_table(market: str) -> pd.DataFrame:
     if not key:
         raise ValueError("market은 비어 있을 수 없습니다.")
 
-    if key not in _MARKET_TABLE:
-        _MARKET_TABLE[key] = DB().load_market(market=key)
+    mode = _normalize_db_mode(db_mode)
+    market_cache = _MARKET_TABLE_CACHE.setdefault(mode, {})
+    if key in market_cache:
+        return market_cache[key]
 
-    return _MARKET_TABLE[key]
+    if mode == DB_MODE_LEGACY:
+        market_cache[key] = _get_db_manager(mode).load_market(market=key)
+        return market_cache[key]
+
+    index_name = _INDEX_NAME_MAP.get(key, str(market).strip())
+    df = _get_db_manager(mode).load_index_duckdb(names=[index_name])
+    if isinstance(df.index, pd.MultiIndex) and "name" in df.index.names:
+        df = df.droplevel("name")
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[df.index.notna()].sort_index()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if "market_cap" in df.columns and "marketcap" not in df.columns:
+        df = df.rename(columns={"market_cap": "marketcap"})
+    market_cache[key] = df
+    return market_cache[key]
 
 
-def _load_code_name_series() -> pd.Series:
+def _load_code_name_series(db_mode: int) -> pd.Series:
     """
     종목코드-종목명 매핑 시리즈를 로드한다.
     """
 
-    global _CODE_NAME_SERIES
-    if _CODE_NAME_SERIES is None:
-        _CODE_NAME_SERIES = DB().load_code_name(mapping_pkl="code_name.pkl")
-    return _CODE_NAME_SERIES
+    mode = _normalize_db_mode(db_mode)
+    if mode in _CODE_NAME_SERIES_CACHE:
+        return _CODE_NAME_SERIES_CACHE[mode]
+
+    if mode == DB_MODE_LEGACY:
+        out = _get_db_manager(mode).load_code_name(mapping_pkl="code_name.pkl")
+        _CODE_NAME_SERIES_CACHE[mode] = out
+        return out
+
+    table = _load_stock_table(mode)
+    if table.code_names:
+        out = pd.Series(table.code_names, dtype="object")
+    else:
+        out = _get_db_manager(mode).load_code_name()
+    _CODE_NAME_SERIES_CACHE[mode] = out
+    return out
 
 
 @njit(cache=True)
@@ -681,6 +801,7 @@ class Backtest:
         start,
         end,
         benchmark: Pattern | None = None,
+        db: int = 0,
     ):
         """
         백테스트 기간과 기준 패턴(옵션)을 초기화한다.
@@ -688,10 +809,12 @@ class Backtest:
 
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
-        table = _load_stock_table()
+        self.db_mode = _normalize_db_mode(db)
+        table = _load_stock_table(self.db_mode)
         self.dates = table.dates
         self.prices = table.prices
         self.codes = table.codes
+        self.code_names = dict(table.code_names)
         self._market_values_cache: Dict[tuple[str, str], np.ndarray] = {}
         self.horizon_offsets = np.asarray([int(days) for _, days in HORIZONS], dtype=np.int64)
         self.start_idx = int(np.searchsorted(self.dates, self.start.to_datetime64(), side="left"))
@@ -755,7 +878,7 @@ class Backtest:
             raise ValueError("field는 비어 있을 수 없습니다.")
 
         if key not in self._market_values_cache:
-            df = _load_market_table(key[0])
+            df = _load_market_table(key[0], self.db_mode)
             if key[1] not in df.columns:
                 raise ValueError(
                     f"market='{key[0]}' 데이터에 field='{key[1]}' 컬럼이 없습니다."
@@ -1256,15 +1379,22 @@ class Backtest:
         inferred_name = _infer_pattern_label(pattern, len(self._analyzed_patterns) + 1)
         return inferred_name, pattern, False
 
-    @staticmethod
-    def _code_names_for(codes: list[str]) -> list[str]:
+    def _code_names_for(self, codes: list[str]) -> list[str]:
         """
         코드 목록을 종목명 목록으로 변환한다(없으면 코드 유지).
         """
 
         if not codes:
             return []
-        code_name = _load_code_name_series()
+        if self.code_names:
+            names = []
+            for code in codes:
+                code_key = str(code)
+                name = str(self.code_names.get(code_key, "")).strip()
+                names.append(name if name else code_key)
+            return names
+
+        code_name = _load_code_name_series(self.db_mode)
         if code_name.empty:
             return list(codes)
 
@@ -1409,7 +1539,7 @@ class Backtest:
         """
 
         if self._marketcap_matrix is None:
-            mcap_df = DB().load_stock(field="marketcap")
+            mcap_df = _load_stock_field_table("marketcap", self.db_mode)
             aligned = mcap_df.reindex(
                 index=pd.DatetimeIndex(self.dates),
                 columns=pd.Index(self.codes, dtype="object"),
@@ -1423,7 +1553,7 @@ class Backtest:
         """
 
         if self._liquidity_matrix is None:
-            amount_df = DB().load_stock(field="amount")
+            amount_df = _load_stock_field_table("amount", self.db_mode)
             aligned = amount_df.reindex(
                 index=pd.DatetimeIndex(self.dates),
                 columns=pd.Index(self.codes, dtype="object"),
@@ -1438,14 +1568,13 @@ class Backtest:
         """
 
         if self._vwap_matrix is None:
-            db = DB()
             idx = pd.DatetimeIndex(self.dates)
             cols = pd.Index(self.codes, dtype="object")
 
-            open_df = db.load_stock(field="open").reindex(index=idx, columns=cols)
-            high_df = db.load_stock(field="high").reindex(index=idx, columns=cols)
-            low_df = db.load_stock(field="low").reindex(index=idx, columns=cols)
-            close_df = db.load_stock(field="close").reindex(index=idx, columns=cols)
+            open_df = _load_stock_field_table("open", self.db_mode).reindex(index=idx, columns=cols)
+            high_df = _load_stock_field_table("high", self.db_mode).reindex(index=idx, columns=cols)
+            low_df = _load_stock_field_table("low", self.db_mode).reindex(index=idx, columns=cols)
+            close_df = _load_stock_field_table("close", self.db_mode).reindex(index=idx, columns=cols)
             vwap_df = (open_df + high_df + low_df + close_df) / 4.0
             self._vwap_matrix = vwap_df.to_numpy(dtype=np.float64, copy=True)
         return self._vwap_matrix
@@ -1819,12 +1948,15 @@ class Backtest:
             if (min_marketcap_value is not None or marketcap_top_pct_value is not None)
             else None
         )
-        code_name_series = _load_code_name_series()
-        code_names = {
-            str(code): str(name).strip()
-            for code, name in code_name_series.items()
-            if pd.notna(name) and str(name).strip()
-        }
+        if self.code_names:
+            code_names = dict(self.code_names)
+        else:
+            code_name_series = _load_code_name_series(self.db_mode)
+            code_names = {
+                str(code): str(name).strip()
+                for code, name in code_name_series.items()
+                if pd.notna(name) and str(name).strip()
+            }
 
         # 3) Simulator로 주문/보유/청산 루프 실행
         trade_prices, execution_lag_days, execution_price_mode = self._resolve_trade_price_mode(
