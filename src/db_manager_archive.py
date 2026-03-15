@@ -7,7 +7,17 @@ import warnings
 
 import FinanceDataReader as fdr
 import pandas as pd
-from tqdm.auto import tqdm
+from tqdm import tqdm
+
+
+def _progress(*args, **kwargs):
+    """
+    노트북 저장 시 widget 출력이 남지 않도록 일반 tqdm를 사용한다.
+    """
+
+    kwargs.setdefault("leave", False)
+    kwargs.setdefault("dynamic_ncols", True)
+    return tqdm(*args, **kwargs)
 
 class DB:
     def __init__(
@@ -22,7 +32,6 @@ class DB:
         market_dir: str | Path | None = None,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        self.project_root = root
         self.static_dir = Path(static_dir) if static_dir is not None else root / "static"
         self.db_root_dir = (
             Path(db_root_dir) if db_root_dir is not None else root / "db" / "archive"
@@ -692,7 +701,7 @@ class DB:
         marcap_all = marcap_all[marcap_all["code"].isin(code_set)]
         marcap_by_code = marcap_all.groupby("code", sort=False)
 
-        for code_norm in tqdm(code_set.tolist(), total=len(code_set), desc="collect_stock"):
+        for code_norm in _progress(code_set.tolist(), total=len(code_set), desc="collect_stock"):
             adj_s = adjclose.xs(code_norm, level="code").sort_index()
             try:
                 m = marcap_by_code.get_group(code_norm)
@@ -714,7 +723,7 @@ class DB:
         code_paths = self._code_parquet_paths()
         fields_list = ["open", "high", "low", "close", "volume", "amount", "marketcap", "shares"]
 
-        for field in tqdm(fields_list, total=len(fields_list), desc="build_fields"):
+        for field in _progress(fields_list, total=len(fields_list), desc="build_fields"):
             merged = self._load_field_series_from_paths(
                 code_paths,
                 field=field,

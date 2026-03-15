@@ -23,7 +23,7 @@ def bollinger(
     narrow_width: float = 1.0,
     narrow_stay_days: int = 1,
     narrow_width_type: Literal["absolute", "percentile"] = "absolute",
-    narrow_percentile_window: int = 252,
+    narrow_percentile_window: int = 240,
     uptrend_window: int | None = None,
     high_window: int | None = None,
     high_threshold: float = 0.9,

@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 from typing import Iterable, Sequence
 
+import duckdb
 import pandas as pd
 
 
@@ -19,16 +20,9 @@ _INDEX_NAME_MAP: dict[str, str] = {
     "ks200": "코스피200",
 }
 
-
-def _require_duckdb():
-    try:
-        import duckdb
-    except ImportError as exc:
-        raise ImportError(
-            "duckdb가 필요합니다. metricstudio 환경에서 `python -m pip install duckdb`를 실행하세요."
-        ) from exc
-    return duckdb
-
+def _configure_duckdb_connection(con) -> None:
+    con.execute("SET enable_progress_bar=false")
+    con.execute("SET enable_progress_bar_print=false")
 
 def _normalize_ticker_series(values: Iterable[object]) -> pd.Series:
     s = pd.Series(list(values), dtype="object").astype(str).str.strip().str.upper()
@@ -94,7 +88,6 @@ class DB:
         index_file: str = "index.parquet",
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        self.project_root = root
         self.db_root_dir = Path(db_root_dir) if db_root_dir is not None else root / "db"
         self.adjusted_pattern = str(adjusted_pattern)
         self.index_file = str(index_file)
@@ -128,16 +121,13 @@ class DB:
         """
         adjusted-stock parquet를 DuckDB view(adjusted_stock)로 등록한 뒤 SQL을 실행한다.
         """
-        duckdb = _require_duckdb()
         parquet_glob = self._adjusted_glob(adjusted_pattern=adjusted_pattern)
-        con = duckdb.connect(database=":memory:")
-        try:
+        with duckdb.connect(database=":memory:") as con:
+            _configure_duckdb_connection(con)
             con.execute(
                 "CREATE VIEW adjusted_stock AS SELECT * FROM read_parquet(" + _quote_sql_text(parquet_glob) + ")"
             )
             return con.execute(str(query)).df()
-        finally:
-            con.close()
 
     def load_adjusted_stock_duckdb(
         self,
@@ -149,14 +139,10 @@ class DB:
         market: Sequence[str] | None = DEFAULT_MARKETS,
         is_tradable: bool | None = True,
         dept_excludes: Sequence[str] = DEFAULT_DEPT_EXCLUDES,
-        market_cap_quantile: str | None = None,
     ) -> pd.DataFrame:
         """
         DuckDB로 adjusted-stock parquet를 읽어 필터링한 뒤
         (date, ticker) MultiIndex DataFrame으로 반환한다.
-
-        market_cap_quantile은 날짜별 단면에서 10분위(1Q~10Q)로 계산한다.
-        분위 계산은 market/is_tradable/dept_excludes 등 선행 필터를 반영한 집합에서 수행한다.
         """
         select_cols = "*"
         if columns is not None:
@@ -196,49 +182,16 @@ class DB:
                 quoted = ", ".join(_quote_sql_text(d) for d in depts)
                 where_parts.append(f"(dept IS NULL OR dept NOT IN ({quoted}))")
 
-        quantile_q: int | None = None
-        if market_cap_quantile is not None:
-            q_text = str(market_cap_quantile).strip().upper()
-            m = re.fullmatch(r"(10|[1-9])Q", q_text)
-            if m is None:
-                raise ValueError("market_cap_quantile은 '1Q' ~ '10Q' 형식이어야 합니다.")
-            quantile_q = int(m.group(1))
-
         base_where_sql = ""
         if where_parts:
             base_where_sql = "WHERE " + " AND ".join(where_parts)
 
-        if quantile_q is None:
-            sql = f"""
-            SELECT {select_cols}
-            FROM adjusted_stock
-            {base_where_sql}
-            ORDER BY date, ticker, name
-            """
-        else:
-            quant_where_parts = list(where_parts)
-            quant_where_parts.append("market_cap IS NOT NULL")
-            quant_where_sql = "WHERE " + " AND ".join(quant_where_parts)
-            sql = f"""
-            WITH filtered AS (
-                SELECT *
-                FROM adjusted_stock
-                {quant_where_sql}
-            ),
-            ranked AS (
-                SELECT
-                    *,
-                    NTILE(10) OVER (
-                        PARTITION BY date
-                        ORDER BY market_cap ASC NULLS LAST
-                    ) AS _market_cap_q
-                FROM filtered
-            )
-            SELECT {select_cols}
-            FROM ranked
-            WHERE _market_cap_q = {quantile_q}
-            ORDER BY date, ticker, name
-            """
+        sql = f"""
+        SELECT {select_cols}
+        FROM adjusted_stock
+        {base_where_sql}
+        ORDER BY date, ticker, name
+        """
 
         out = self.query_adjusted_stock_duckdb(
             query=sql,
@@ -264,7 +217,6 @@ class DB:
         DuckDB로 index parquet를 읽어 필터링한 뒤
         (date, name) MultiIndex DataFrame으로 반환한다.
         """
-        duckdb = _require_duckdb()
         path = self._index_path(index_file=index_file)
 
         select_cols = "*"
@@ -297,11 +249,9 @@ class DB:
         {where_sql}
         ORDER BY date, name
         """
-        con = duckdb.connect(database=":memory:")
-        try:
+        with duckdb.connect(database=":memory:") as con:
+            _configure_duckdb_connection(con)
             out = con.execute(sql).df()
-        finally:
-            con.close()
 
         if not {"date", "name"}.issubset(out.columns):
             raise ValueError("DuckDB 결과에 date/name 컬럼이 없어 인덱스를 만들 수 없습니다.")
@@ -314,21 +264,15 @@ class DB:
         self,
         codes: Iterable[str] | str | None = None,
         field: str = "close",
-        mapping_pkl: str | None = None,
-        exclude_spac: bool | None = None,
         start: str | pd.Timestamp | None = None,
         end: str | pd.Timestamp | None = None,
         market: Sequence[str] | None = DEFAULT_MARKETS,
         is_tradable: bool | None = True,
         dept_excludes: Sequence[str] = DEFAULT_DEPT_EXCLUDES,
-        market_cap_quantile: str | None = None,
     ) -> pd.DataFrame:
         """
         adjusted-stock long 포맷을 (date x ticker) wide 포맷으로 변환한다.
         """
-        # mapping_pkl/exclude_spac는 구형 시그니처 호환용으로 유지한다.
-        _ = (mapping_pkl, exclude_spac)
-
         field_name = str(field).strip()
         if not field_name:
             raise ValueError("field는 비어 있을 수 없습니다.")
@@ -347,7 +291,6 @@ class DB:
             market=market,
             is_tradable=is_tradable,
             dept_excludes=dept_excludes,
-            market_cap_quantile=market_cap_quantile,
         )
         if field_name not in long_df.columns:
             raise ValueError(f"adjusted-stock 데이터에 '{field_name}' 컬럼이 없습니다.")
@@ -394,20 +337,25 @@ class DB:
         out.name = field_key
         return out
 
-    def load_code_name(self, mapping_pkl: str | None = None) -> pd.Series:
+    def load_code_name(self) -> pd.Series:
         """
         adjusted-stock에서 종목코드-종목명 매핑을 생성한다.
         """
-        _ = mapping_pkl  # 구형 시그니처 호환용
-        df = self.load_adjusted_stock_duckdb(columns=["name"])
+        sql = """
+        SELECT
+            ticker,
+            arg_max(name, date) AS name
+        FROM adjusted_stock
+        WHERE name IS NOT NULL
+        GROUP BY ticker
+        ORDER BY ticker
+        """
+        df = self.query_adjusted_stock_duckdb(sql)
         if df.empty:
             return pd.Series(dtype="object")
 
         out = (
-            df.reset_index()[["date", "ticker", "name"]]
-            .dropna(subset=["ticker", "name"])
-            .sort_values(["date", "ticker"], kind="mergesort")
-            .drop_duplicates(subset=["ticker"], keep="last")
+            df.dropna(subset=["ticker", "name"])
             .set_index("ticker")["name"]
             .astype("object")
         )
@@ -438,7 +386,6 @@ def load_adjusted_stock_duckdb(
     market: Sequence[str] | None = DEFAULT_MARKETS,
     is_tradable: bool | None = True,
     dept_excludes: Sequence[str] = DEFAULT_DEPT_EXCLUDES,
-    market_cap_quantile: str | None = None,
 ) -> pd.DataFrame:
     return DB(db_root_dir=db_root_dir, adjusted_pattern=adjusted_pattern).load_adjusted_stock_duckdb(
         adjusted_pattern=adjusted_pattern,
@@ -449,7 +396,6 @@ def load_adjusted_stock_duckdb(
         market=market,
         is_tradable=is_tradable,
         dept_excludes=dept_excludes,
-        market_cap_quantile=market_cap_quantile,
     )
 
 

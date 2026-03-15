@@ -24,8 +24,20 @@ class Pattern:
         self.market_name: str | None = None
         self.market_field: str = "close"
         self._market_values: np.ndarray | None = None
+        self._stock_values: dict[str, np.ndarray | None] = {}
+        self._cached_exit_mask_key: tuple[object, ...] | None = None
+        self._cached_exit_mask_value: np.ndarray | None = None
         self.params: SimpleNamespace | None = None
         self._post_mask_fn: Callable[[np.ndarray], np.ndarray] = self._post_mask_base
+
+    @staticmethod
+    def _normalize_loss_cut(loss_cut: str | None) -> str | None:
+        if loss_cut is None:
+            return None
+        loss_cut_text = str(loss_cut).strip().lower().replace("-", "_").replace(" ", "_")
+        if loss_cut_text not in {"mid_stop", "trailing_stop"}:
+            raise ValueError("loss_cut은 현재 'mid_stop' 또는 'trailing_stop'만 지원합니다.")
+        return loss_cut_text
 
     @staticmethod
     def _normalize_trim_quantile(quantile: float) -> float:
@@ -78,6 +90,18 @@ class Pattern:
     def _set_market_values(self, values: np.ndarray | None) -> None:
         self._market_values = values
 
+    def _set_stock_values(self, field: str, values: np.ndarray | None) -> None:
+        self._stock_values[str(field).strip().lower()] = values
+
+    def _get_stock_values(self, field: str) -> np.ndarray:
+        key = str(field).strip().lower()
+        values = self._stock_values.get(key)
+        if values is None:
+            raise ValueError(
+                f"패턴 '{self.name}'의 stock field='{key}' 데이터가 준비되지 않았습니다."
+            )
+        return np.asarray(values, dtype=np.float64)
+
     def _chain_post_mask(
         self,
         step_fn: Callable[[np.ndarray], np.ndarray],
@@ -110,6 +134,9 @@ class Pattern:
             raise ValueError(f"패턴 '{self.name}'의 후처리 mask shape이 일치하지 않습니다.")
         return base_mask & post_mask
 
+    def exit_mask(self, values: np.ndarray) -> np.ndarray:
+        return self._get_cached_exit_mask(values)
+
     def __add__(self, other: "Pattern"):
         if not isinstance(other, Pattern):
             return NotImplemented
@@ -118,6 +145,56 @@ class Pattern:
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         return np.isfinite(prices) & (prices > 0)
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        return ()
+
+    def _exit_mask(self, values: np.ndarray) -> np.ndarray:
+        prices = np.asarray(values, dtype=np.float64)
+        return np.zeros(prices.shape[0], dtype=np.bool_)
+
+    def _get_cached_exit_mask(self, values: np.ndarray) -> np.ndarray:
+        prices = np.asarray(values, dtype=np.float64)
+        stock_keys = tuple(
+            (field, id(arr) if arr is not None else None)
+            for field, arr in sorted(self._stock_values.items())
+        )
+        cache_key = (
+            id(prices),
+            id(self._market_values) if self._market_values is not None else None,
+            stock_keys,
+        )
+        if self._cached_exit_mask_key != cache_key or self._cached_exit_mask_value is None:
+            exit_mask = np.asarray(self._exit_mask(prices), dtype=np.bool_)
+            if exit_mask.shape != prices.shape:
+                raise ValueError(f"패턴 '{self.name}'의 exit mask shape이 일치하지 않습니다.")
+            self._cached_exit_mask_key = cache_key
+            self._cached_exit_mask_value = exit_mask
+        return self._cached_exit_mask_value
+
+    def has_exit_rule(self) -> bool:
+        return False
+
+    def has_entry_dependent_exit(self) -> bool:
+        return False
+
+    def first_exit_index(
+        self,
+        values: np.ndarray,
+        entry_idx: int,
+        last_idx: int,
+    ) -> int:
+        if not self.has_exit_rule():
+            return -1
+        exit_mask = self._get_cached_exit_mask(values)
+        lo = max(0, int(entry_idx) + 1)
+        hi = min(len(exit_mask), int(last_idx) + 1)
+        if hi <= lo:
+            return -1
+        hits = np.flatnonzero(exit_mask[lo:hi])
+        if hits.size == 0:
+            return -1
+        return int(lo + hits[0])
 
 
 class CombinedPattern(Pattern):
@@ -170,6 +247,33 @@ class CombinedPattern(Pattern):
         if left_mask.shape != right_mask.shape:
             raise ValueError("결합 패턴의 mask shape이 일치하지 않습니다.")
         return left_mask & right_mask
+
+    def _exit_mask(self, values: np.ndarray) -> np.ndarray:
+        left_exit = np.asarray(self.left.exit_mask(values), dtype=np.bool_)
+        right_exit = np.asarray(self.right.exit_mask(values), dtype=np.bool_)
+        if left_exit.shape != right_exit.shape:
+            raise ValueError("결합 패턴의 exit mask shape이 일치하지 않습니다.")
+        return left_exit | right_exit
+
+    def has_exit_rule(self) -> bool:
+        return self.left.has_exit_rule() or self.right.has_exit_rule()
+
+    def has_entry_dependent_exit(self) -> bool:
+        return self.left.has_entry_dependent_exit() or self.right.has_entry_dependent_exit()
+
+    def first_exit_index(
+        self,
+        values: np.ndarray,
+        entry_idx: int,
+        last_idx: int,
+    ) -> int:
+        left_idx = self.left.first_exit_index(values, entry_idx, last_idx)
+        right_idx = self.right.first_exit_index(values, entry_idx, last_idx)
+        if left_idx < 0:
+            return right_idx
+        if right_idx < 0:
+            return left_idx
+        return min(left_idx, right_idx)
 
 
 class High(Pattern):
@@ -249,6 +353,144 @@ class Disparity(Pattern):
         disparity = np.zeros(n, dtype=np.float64)
         disparity[valid] = prices[valid] / ma[valid]
         cond = valid & np.isfinite(prices) & (prices > 0.0) & (disparity < self.params.threshold)
+        return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
+
+
+class MFI(Pattern):
+    def __init__(
+        self,
+        window: int = 14,
+        name: str | None = None,
+    ):
+        super().__init__(name=name)
+        self.window = int(window)
+
+    def on(
+        self,
+        trigger: Literal[
+            "oversold_rebound",
+            "bullish_failure_swing",
+            "above",
+            "below",
+        ] = "oversold_rebound",
+        lower: float = 20.0,
+        threshold: float | None = None,
+        stay_days: int = 1,
+        cooldown_days: int = 0,
+    ):
+        window_value = int(self.window)
+        if window_value <= 0:
+            raise ValueError("window는 1 이상이어야 합니다.")
+        trigger_text = str(trigger or "oversold_rebound").lower()
+        if trigger_text not in {"oversold_rebound", "bullish_failure_swing", "above", "below"}:
+            raise ValueError(
+                "trigger는 {'oversold_rebound', 'bullish_failure_swing', 'above', 'below'} 중 하나여야 합니다."
+            )
+        lower_value = float(lower)
+        if not np.isfinite(lower_value) or lower_value <= 0.0 or lower_value >= 100.0:
+            raise ValueError("lower는 0과 100 사이의 값이어야 합니다.")
+        threshold_value = None if threshold is None else float(threshold)
+        if trigger_text in {"above", "below"}:
+            if threshold_value is None or not np.isfinite(threshold_value):
+                raise ValueError("trigger가 'above' 또는 'below'일 때는 threshold를 지정해야 합니다.")
+            if threshold_value <= 0.0 or threshold_value >= 100.0:
+                raise ValueError("threshold는 0과 100 사이의 값이어야 합니다.")
+
+        self.params = SimpleNamespace(
+            trigger=trigger_text,
+            lower=lower_value,
+            threshold=threshold_value,
+            stay_days=int(max(1, stay_days)),
+            cooldown_days=int(max(0, cooldown_days)),
+        )
+        return self
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        return ("high", "low", "volume")
+
+    @staticmethod
+    def _bullish_failure_swing_mask(
+        mfi: np.ndarray,
+        valid_end: np.ndarray,
+        lower: float,
+    ) -> np.ndarray:
+        n = mfi.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        oversold_seen = False
+        rebound_high = np.nan
+        pullback_seen = False
+
+        for i in range(n):
+            if not valid_end[i]:
+                continue
+            value = float(mfi[i])
+            if not np.isfinite(value):
+                continue
+
+            if value <= lower:
+                oversold_seen = True
+                rebound_high = np.nan
+                pullback_seen = False
+                continue
+
+            if not oversold_seen:
+                continue
+
+            if not np.isfinite(rebound_high):
+                rebound_high = value
+                continue
+
+            if value > rebound_high:
+                if pullback_seen:
+                    out[i] = True
+                    oversold_seen = False
+                    rebound_high = np.nan
+                    pullback_seen = False
+                else:
+                    rebound_high = value
+                continue
+
+            pullback_seen = True
+
+        return out
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("MFI는 사용 전에 on(...)으로 설정해야 합니다.")
+
+        close = np.asarray(values, dtype=np.float64)
+        high = self._get_stock_values("high")
+        low = self._get_stock_values("low")
+        volume = self._get_stock_values("volume")
+        if not (high.shape == low.shape == close.shape == volume.shape):
+            raise ValueError("MFI 입력 시계열 shape이 일치하지 않습니다.")
+
+        mfi, valid_end = u.money_flow_index(high, low, close, volume, self.window)
+        trigger = self.params.trigger
+        lower = float(self.params.lower)
+        threshold = getattr(self.params, "threshold", None)
+
+        if trigger == "above":
+            cond = valid_end & np.isfinite(mfi) & (mfi > float(threshold))
+            return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
+
+        if trigger == "below":
+            cond = valid_end & np.isfinite(mfi) & (mfi < float(threshold))
+            return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
+
+        if trigger == "oversold_rebound":
+            cond = np.zeros(close.shape[0], dtype=np.bool_)
+            for i in range(1, close.shape[0]):
+                if not (valid_end[i] and valid_end[i - 1]):
+                    continue
+                prev_val = float(mfi[i - 1])
+                curr_val = float(mfi[i])
+                if not (np.isfinite(prev_val) and np.isfinite(curr_val)):
+                    continue
+                cond[i] = prev_val <= lower and curr_val > lower
+            return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
+
+        cond = self._bullish_failure_swing_mask(mfi, valid_end, lower)
         return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
 
 
@@ -385,10 +627,11 @@ class Bollinger(Pattern):
         bandwidth_max: float = 1.0,
         bandwidth_stay_days: int = 1,
         bandwidth_type: Literal["absolute", "percentile"] = "absolute",
-        bandwidth_percentile_window: int = 252,
+        bandwidth_percentile_window: int = 240,
         breakout_cooldown_days: int = 0,
         near_tolerance: float = 0.03,
         near_stay_days: int = 1,
+        loss_cut: Literal["mid_stop", "trailing_stop"] | None = None,
     ):
         trigger_text = None if trigger is None else str(trigger).lower()
         if trigger_text is not None and trigger_text not in {
@@ -421,8 +664,35 @@ class Bollinger(Pattern):
             breakout_cooldown_days=int(max(0, breakout_cooldown_days)),
             near_tolerance=float(near_tolerance),
             near_stay_days=int(max(1, near_stay_days)),
+            loss_cut=self._normalize_loss_cut(loss_cut),
         )
         return self
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        if self.params is None:
+            return ()
+        loss_cut = getattr(self.params, "loss_cut", None)
+        if loss_cut == "trailing_stop":
+            return ("high", "low")
+        return ()
+
+    def _get_trailing_atr(
+        self,
+        prices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        high = self._get_stock_values("high")
+        low = self._get_stock_values("low")
+        if high.shape != prices.shape or low.shape != prices.shape:
+            raise ValueError("Bollinger trailing_stop 입력 시계열 shape이 일치하지 않습니다.")
+
+        cache_key = (id(prices), id(high), id(low))
+        cached_key = getattr(self, "_cached_trailing_atr_key", None)
+        cached_value = getattr(self, "_cached_trailing_atr_value", None)
+        if cached_key != cache_key or cached_value is None:
+            cached_value = u.average_true_range(high, low, prices, self.window)
+            self._cached_trailing_atr_key = cache_key
+            self._cached_trailing_atr_value = cached_value
+        return cached_value
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -495,11 +765,68 @@ class Bollinger(Pattern):
 
         raise ValueError(f"지원하지 않는 trigger 종류입니다: {trigger}")
 
+    def _exit_mask(self, values: np.ndarray) -> np.ndarray:
+        prices = np.asarray(values, dtype=np.float64)
+        out = np.zeros(prices.shape[0], dtype=np.bool_)
+        if self.params is None:
+            raise ValueError("Bollinger는 사용 전에 on(...)으로 설정해야 합니다.")
+
+        loss_cut = getattr(self.params, "loss_cut", None)
+        if loss_cut is None:
+            return out
+        if loss_cut == "mid_stop":
+            if self.window <= 0 or prices.shape[0] < self.window:
+                return out
+
+            mean, valid_end = u.rolling_mean(prices, self.window)
+            valid = valid_end & np.isfinite(prices) & (prices > 0.0) & np.isfinite(mean)
+            out[valid] = prices[valid] < mean[valid]
+            return out
+        if loss_cut == "trailing_stop":
+            return out
+        else:
+            raise ValueError(f"지원하지 않는 Bollinger loss_cut 입니다: {loss_cut}")
+
+    def has_exit_rule(self) -> bool:
+        return self.params is not None and getattr(self.params, "loss_cut", None) is not None
+
+    def has_entry_dependent_exit(self) -> bool:
+        return self.params is not None and getattr(self.params, "loss_cut", None) == "trailing_stop"
+
+    def first_exit_index(
+        self,
+        values: np.ndarray,
+        entry_idx: int,
+        last_idx: int,
+    ) -> int:
+        prices = np.asarray(values, dtype=np.float64)
+        if self.params is None:
+            raise ValueError("Bollinger는 사용 전에 on(...)으로 설정해야 합니다.")
+
+        loss_cut = getattr(self.params, "loss_cut", None)
+        if loss_cut != "trailing_stop":
+            return super().first_exit_index(prices, entry_idx, last_idx)
+        if self.window <= 0 or prices.shape[0] <= self.window:
+            return -1
+
+        atr, atr_valid_end = self._get_trailing_atr(prices)
+        return int(
+            u.trailing_stop_first_exit_index(
+                prices,
+                atr,
+                atr_valid_end,
+                int(entry_idx),
+                int(last_idx),
+                3.0,
+            )
+        )
+
 
 __all__ = [
     "Pattern",
     "High",
     "Disparity",
+    "MFI",
     "Trending",
     "GoldenCross",
     "Bollinger",

@@ -7,15 +7,27 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 import warnings
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib import font_manager
-from matplotlib.ticker import MaxNLocator, StrMethodFormatter
+from src.simulate import BUY_FEE, SELL_FEE
+
+TRADING_DAYS_PER_YEAR = 240
 
 
 Horizon = Tuple[str, int]
 _PLOT_FONT_CONFIGURED = False
+_PLOT_MODULES = None
+
+
+def _plot_modules():
+    global _PLOT_MODULES
+    if _PLOT_MODULES is None:
+        import matplotlib.pyplot as plt
+        from matplotlib import font_manager
+        from matplotlib.ticker import MaxNLocator, StrMethodFormatter
+
+        _PLOT_MODULES = (plt, font_manager, MaxNLocator, StrMethodFormatter)
+    return _PLOT_MODULES
 
 
 def _configure_plot_font() -> None:
@@ -26,6 +38,8 @@ def _configure_plot_font() -> None:
     global _PLOT_FONT_CONFIGURED
     if _PLOT_FONT_CONFIGURED:
         return
+
+    plt, font_manager, _, _ = _plot_modules()
 
     # WSL에서는 윈도우 폰트를 직접 등록해야 인식되는 경우가 많다.
     font_files = [
@@ -90,6 +104,61 @@ def _as_percent(values: np.ndarray) -> np.ndarray:
     return values * 100.0
 
 
+def _nan_geomean_from_returns(values: np.ndarray) -> float:
+    """
+    유효한 코호트 수익률 시계열의 기하평균을 계산한다.
+    """
+
+    valid = np.isfinite(values)
+    if not np.any(valid):
+        return float("nan")
+    clean = np.asarray(values[valid], dtype=np.float64)
+    if np.any(clean <= -1.0):
+        return float("nan")
+    return float(np.exp(np.mean(np.log1p(clean))) - 1.0)
+
+
+def _annualize_returns(values: np.ndarray, horizon_days: np.ndarray, mode: str) -> np.ndarray:
+    """
+    horizon 수익률 배열을 연율화한다.
+    """
+
+    out = np.full(values.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(values) & np.isfinite(horizon_days) & (horizon_days > 0.0)
+    if not np.any(valid):
+        return out
+
+    scale = float(TRADING_DAYS_PER_YEAR) / horizon_days[valid]
+    if mode == "arith":
+        out[valid] = values[valid] * scale
+        return out
+    if mode == "geom":
+        clean = values[valid]
+        valid_geom = clean > -1.0
+        if np.any(valid_geom):
+            out_idx = np.flatnonzero(valid)[valid_geom]
+            out[out_idx] = np.power(1.0 + clean[valid_geom], scale[valid_geom]) - 1.0
+        return out
+    raise ValueError("mode는 'arith' 또는 'geom'이어야 합니다.")
+
+
+def _apply_roundtrip_cost(values: np.ndarray) -> np.ndarray:
+    """
+    horizon 수익률에 1회 매수+1회 매도 비용을 반영한 순수익률을 계산한다.
+    """
+
+    out = np.full(values.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(values)
+    if not np.any(valid):
+        return out
+    gross = values[valid]
+    net = ((1.0 + gross) * (1.0 - SELL_FEE) / (1.0 + BUY_FEE)) - 1.0
+    out_idx = np.flatnonzero(valid)
+    out[out_idx] = net
+    out[out <= -1.0] = np.nan
+    return out
+
+
 def _normalize_ylim_percent(ylim):
     """
     y축 입력 범위를 퍼센트 단위로 정규화한다.
@@ -109,6 +178,8 @@ def _apply_y_ticks(axes):
     """
     수익률/상승확률 축의 눈금 포맷을 정수형으로 맞춘다.
     """
+
+    _, _, MaxNLocator, StrMethodFormatter = _plot_modules()
 
     # Return 축은 정수 눈금을 유지한다.
     for ax in axes[:2]:
@@ -303,6 +374,8 @@ class Stats:
     pos_counts: np.ndarray
     geom_invalid: np.ndarray
     occurrence_counts: np.ndarray
+    eval_start_idx: int = 0
+    eval_end_idx: int | None = None
     aggregation_mode: str = "event"
     daily_arith: np.ndarray | None = None
     daily_geom: np.ndarray | None = None
@@ -326,6 +399,8 @@ class Stats:
             pos_counts=np.zeros((num_h, length), dtype=np.int64),
             geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
             occurrence_counts=np.zeros(length, dtype=np.int64),
+            eval_start_idx=0,
+            eval_end_idx=length,
             aggregation_mode="event",
             daily_arith=None,
             daily_geom=None,
@@ -350,6 +425,8 @@ class Stats:
             pos_counts=np.zeros((num_h, length), dtype=np.int64),
             geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
             occurrence_counts=np.zeros(length, dtype=np.int64),
+            eval_start_idx=0,
+            eval_end_idx=length,
             aggregation_mode="daily_mean",
             daily_arith=np.full((num_h, length), np.nan, dtype=np.float64),
             daily_geom=np.full((num_h, length), np.nan, dtype=np.float64),
@@ -363,18 +440,21 @@ class Stats:
 
         dates = self.dates
         total = len(dates)
+        eval_start = max(0, min(int(self.eval_start_idx), total))
+        eval_end_raw = total if self.eval_end_idx is None else int(self.eval_end_idx)
+        eval_end = max(eval_start, min(eval_end_raw, total))
         if start is None:
-            start_idx = 0
+            start_idx = eval_start
         else:
             start_ts = np.datetime64(pd.Timestamp(start).to_datetime64())
             start_idx = int(np.searchsorted(dates, start_ts, side="left"))
         if end is None:
-            end_idx = total
+            end_idx = eval_end
         else:
             end_ts = np.datetime64(pd.Timestamp(end).to_datetime64())
             end_idx = int(np.searchsorted(dates, end_ts, side="right"))
-        start_idx = max(0, min(start_idx, total))
-        end_idx = max(start_idx, min(end_idx, total))
+        start_idx = max(eval_start, min(start_idx, eval_end))
+        end_idx = max(start_idx, min(end_idx, eval_end))
         return start_idx, end_idx
 
     def occurrence(
@@ -423,20 +503,18 @@ class Stats:
                 scope_label = f"{start_date}~{end_date}"
 
         if self.aggregation_mode == "daily_mean":
-            if self.daily_arith is None or self.daily_geom is None or self.daily_rise is None:
+            if self.daily_arith is None or self.daily_rise is None:
                 raise ValueError("daily_mean 모드에서는 daily metric 배열이 필요합니다.")
             for h_idx, (label, _) in enumerate(self.horizons):
                 day_arith = self.daily_arith[h_idx, start_idx:end_idx]
-                day_geom = self.daily_geom[h_idx, start_idx:end_idx]
                 day_rise = self.daily_rise[h_idx, start_idx:end_idx]
 
                 valid_arith = np.isfinite(day_arith)
-                valid_geom = np.isfinite(day_geom)
                 valid_rise = np.isfinite(day_rise)
 
                 cnt = float(valid_arith.sum())
                 arith = float(np.nanmean(day_arith)) if valid_arith.any() else float("nan")
-                geom = float(np.nanmean(day_geom)) if valid_geom.any() else float("nan")
+                geom = _nan_geomean_from_returns(day_arith)
                 rise = float(np.nanmean(day_rise)) if valid_rise.any() else float("nan")
 
                 rows.append(
@@ -504,7 +582,7 @@ class Stats:
         horizon: str | int = "1M",
         start=None,
         end=None,
-        history_window: int = 252,
+        history_window: int = TRADING_DAYS_PER_YEAR,
         min_count: int = 30,
         require_full_window: bool = True,
     ) -> pd.DataFrame:
@@ -530,15 +608,13 @@ class Stats:
         horizon_days = int(self.horizons[h_idx][1])
 
         if self.aggregation_mode == "daily_mean":
-            if self.daily_arith is None or self.daily_geom is None or self.daily_rise is None:
+            if self.daily_arith is None or self.daily_rise is None:
                 raise ValueError("daily_mean 모드에서는 daily metric 배열이 필요합니다.")
 
             day_arith = self.daily_arith[h_idx]
-            day_geom = self.daily_geom[h_idx]
             day_rise = self.daily_rise[h_idx]
 
             arith_full = pd.Series(day_arith).rolling(window=window, min_periods=1).mean().to_numpy()
-            geom_full = pd.Series(day_geom).rolling(window=window, min_periods=1).mean().to_numpy()
             rise_full = pd.Series(day_rise).rolling(window=window, min_periods=1).mean().to_numpy()
             cnt_full = (
                 pd.Series(np.isfinite(day_arith).astype(np.float64))
@@ -546,10 +622,24 @@ class Stats:
                 .sum()
                 .to_numpy()
             )
+            log_source = np.full(day_arith.shape, np.nan, dtype=np.float64)
+            valid_geom_input = np.isfinite(day_arith) & (day_arith > -1.0)
+            log_source[valid_geom_input] = np.log1p(day_arith[valid_geom_input])
+            geom_full = np.exp(
+                pd.Series(log_source).rolling(window=window, min_periods=1).mean().to_numpy()
+            ) - 1.0
+            invalid_geom_full = (
+                pd.Series((np.isfinite(day_arith) & (day_arith <= -1.0)).astype(np.float64))
+                .rolling(window=window, min_periods=1)
+                .sum()
+                .to_numpy()
+                > 0.0
+            )
+            geom_full[invalid_geom_full] = np.nan
             support_full = cnt_full >= max(1, int(min_count))
             if require_full_window:
                 base_idx = np.arange(len(self.dates))
-                support_full &= base_idx >= (window - 1)
+                support_full &= base_idx >= (int(self.eval_start_idx) + window - 1)
 
             # 기준일 통계를 확정시점(as-of) 축으로 이동한다.
             known_arith_full = _shift_known_at_asof(arith_full, horizon_days, np.nan)
@@ -604,7 +694,7 @@ class Stats:
         support = roll_counts >= max(1, int(min_count))
         if require_full_window:
             base_idx = np.arange(len(self.dates))
-            support &= base_idx >= (window - 1)
+            support &= base_idx >= (int(self.eval_start_idx) + window - 1)
 
         # 기준일 통계를 확정시점(as-of) 축으로 이동한다.
         known_roll_counts = _shift_known_at_asof(roll_counts, horizon_days, 0.0)
@@ -696,7 +786,7 @@ class StatsCollection:
         mapping: Dict[str, str] = {}
         for name in names:
             if name in self.benchmark_names or name in {"market", "benchmark", "default"}:
-                mapping[name] = "black"
+                mapping[name] = "#666666" if name.endswith("(필터적용)") else "black"
                 continue
             color = next(colors, None)
             if color is None:
@@ -782,7 +872,7 @@ class StatsCollection:
         horizon: str | int = "1M",
         start=None,
         end=None,
-        history_window: int = 252,
+        history_window: int = TRADING_DAYS_PER_YEAR,
         min_count: int = 30,
         require_full_window: bool = True,
         pattern: str | None = None,
@@ -828,6 +918,8 @@ class StatsCollection:
         start=None,
         end=None,
         figsize=(12, 4),
+        annualized: bool = False,
+        cost: bool | None = None,
         rise_ylim=None,
         return_ylim=None,
         return_handles: bool = False,
@@ -837,20 +929,44 @@ class StatsCollection:
         """
 
         _configure_plot_font()
+        plt, _, _, _ = _plot_modules()
         if not self.stats_map:
             raise ValueError("StatsCollection이 비어 있습니다.")
 
         names = self._ordered_pattern_names(patterns)
         if not names:
             raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
+        cost_enabled = annualized if cost is None else bool(cost)
+        if cost_enabled and not annualized:
+            raise ValueError("cost=True는 annualized=True일 때만 사용할 수 있습니다.")
 
         color_map = self._pattern_colors(names)
         frames = []
+        horizon_day_map = {label: int(days) for label, days in next(iter(self.stats_map.values())).horizons}
         for name in names:
             df = self.get(name).to_frame(start, end).reset_index()
             df["pattern"] = name
             frames.append(df)
         combined = pd.concat(frames, ignore_index=True)
+        combined["horizon_days"] = combined["period"].map(horizon_day_map).astype(float)
+        if cost_enabled:
+            combined["arith_mean"] = _apply_roundtrip_cost(
+                combined["arith_mean"].to_numpy(dtype=float),
+            )
+            combined["geom_mean"] = _apply_roundtrip_cost(
+                combined["geom_mean"].to_numpy(dtype=float),
+            )
+        if annualized:
+            combined["arith_mean"] = _annualize_returns(
+                combined["arith_mean"].to_numpy(dtype=float),
+                combined["horizon_days"].to_numpy(dtype=float),
+                mode="arith",
+            )
+            combined["geom_mean"] = _annualize_returns(
+                combined["geom_mean"].to_numpy(dtype=float),
+                combined["horizon_days"].to_numpy(dtype=float),
+                mode="geom",
+            )
 
         periods = combined["period"].unique().tolist()
         x = np.arange(len(periods))
@@ -870,9 +986,13 @@ class StatsCollection:
             )
             axes[2].plot(xs, group["rise_prob"] * 100.0, marker="o", color=color, label=name)
 
+        return_title_prefix = "Annualized " if annualized else ""
+        if cost_enabled:
+            return_title_prefix += "After Cost "
+        return_ylabel = "Annualized Return (%)" if annualized else "Return (%)"
         for ax, title, ylabel, draw_zero in [
-            (axes[0], "Arithmetic Mean", "Return (%)", True),
-            (axes[1], "Geometric Mean", "Return (%)", True),
+            (axes[0], f"{return_title_prefix}Arithmetic Mean", return_ylabel, True),
+            (axes[1], f"{return_title_prefix}Geometric Mean", return_ylabel, True),
             (axes[2], "Rise Probability (%)", "Rise Probability (%)", False),
         ]:
             if draw_zero:
@@ -880,8 +1000,8 @@ class StatsCollection:
             ax.set_xticks(x)
             ax.set_xticklabels(periods, rotation=0)
             ax.set_title(title)
+            ax.set_ylabel(ylabel)
 
-        axes[0].set_ylabel("Return (%)")
         axes[2].set_ylabel("")
         self._apply_legend_order(axes[0], names)
 
@@ -969,7 +1089,7 @@ class StatsCollection:
         start=None,
         end=None,
         figsize=(3, 3),
-        ma_window: int | None = 252,
+        ma_window: int | None = TRADING_DAYS_PER_YEAR,
         ylim=None,
         show_daily: bool = False,
         return_handles: bool = False,
@@ -979,6 +1099,7 @@ class StatsCollection:
         """
 
         _configure_plot_font()
+        plt, _, _, _ = _plot_modules()
         if not self.stats_map:
             raise ValueError("StatsCollection이 비어 있습니다.")
 
@@ -1049,7 +1170,7 @@ class StatsCollection:
         start=None,
         end=None,
         figsize=(12, 4),
-        history_window: int = 252,
+        history_window: int = TRADING_DAYS_PER_YEAR,
         min_count: int = 30,
         require_full_window: bool = True,
         rise_ylim=None,
@@ -1061,6 +1182,7 @@ class StatsCollection:
         """
 
         _configure_plot_font()
+        plt, _, _, _ = _plot_modules()
         if not self.stats_map:
             raise ValueError("StatsCollection이 비어 있습니다.")
 

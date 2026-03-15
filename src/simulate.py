@@ -4,12 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+
+TRADING_DAYS_PER_YEAR = 240
 
 BUY_FEE = 0.0003
 SELL_FEE = 0.0020
+
+
+def _progress(*args, **kwargs):
+    kwargs.setdefault("leave", True)
+    kwargs.setdefault("dynamic_ncols", True)
+    return tqdm(*args, **kwargs)
+
+
+def _plot_modules():
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 @dataclass
@@ -39,13 +53,9 @@ class Simulator:
     gate_use_rise: bool | None = field(default=None, init=False)
     stop_loss_pct: float | None = field(default=None, init=False)
     take_profit_pct: float | None = field(default=None, init=False)
-    min_marketcap: float | None = field(default=None, init=False)
-    marketcap_top_pct: float | None = field(default=None, init=False)
     execution_lag_days: int | None = field(default=None, init=False)
     execution_price_mode: str | None = field(default=None, init=False)
     max_weight_per_stock: float | None = field(default=None, init=False)
-    cohort_top_n: int | None = field(default=None, init=False)
-    top_n_type: str | None = field(default=None, init=False)
     allow_reentry: bool | None = field(default=None, init=False)
     min_cohort_size: int | None = field(default=None, init=False)
     run_years: float | None = field(default=None, init=False)
@@ -103,6 +113,7 @@ class Simulator:
                     "entry_values": np.asarray(bucket["entry_values"], dtype=np.float64).copy(),
                     "age": int(bucket["age"]),
                     "entry_idx": int(bucket["entry_idx"]),
+                    "signal_entry_idx": int(bucket.get("signal_entry_idx", bucket["entry_idx"])),
                     "cohort_id": int(bucket["cohort_id"]),
                 }
             )
@@ -168,36 +179,6 @@ class Simulator:
             value = value / 100.0
         if value <= 0.0 or value >= 1.0:
             raise ValueError("take_profit_pct는 0~1(소수) 또는 1~100(%) 범위여야 합니다.")
-        return value
-
-    @staticmethod
-    def _normalize_min_marketcap(min_marketcap: float | None) -> float | None:
-        """
-        시가총액 하한을 정규화한다.
-        """
-
-        if min_marketcap is None:
-            return None
-        value = float(min_marketcap)
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError("min_marketcap은 양수여야 합니다.")
-        return value
-
-    @staticmethod
-    def _normalize_marketcap_top_pct(marketcap_top_pct: float | None) -> float | None:
-        """
-        시가총액 상위 비율을 소수 비율(예: 0.2=상위 20%)로 정규화한다.
-        """
-
-        if marketcap_top_pct is None:
-            return None
-        value = float(marketcap_top_pct)
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError("marketcap_top_pct는 양수여야 합니다.")
-        if value > 1.0:
-            value = value / 100.0
-        if value <= 0.0 or value > 1.0:
-            raise ValueError("marketcap_top_pct는 0~1(소수) 또는 1~100(%) 범위여야 합니다.")
         return value
 
     def port_at(self, date) -> pd.DataFrame:
@@ -314,10 +295,6 @@ class Simulator:
             "take_profit_pct": float(self.take_profit_pct)
             if self.take_profit_pct is not None
             else float("nan"),
-            "min_marketcap": float(self.min_marketcap) if self.min_marketcap is not None else float("nan"),
-            "marketcap_top_pct": float(self.marketcap_top_pct)
-            if self.marketcap_top_pct is not None
-            else float("nan"),
             "execution_lag_days": float(self.execution_lag_days)
             if self.execution_lag_days is not None
             else float("nan"),
@@ -325,10 +302,6 @@ class Simulator:
             if self.execution_price_mode is not None
             else "none",
             "max_weight_per_stock": float(self.max_weight_per_stock),
-            "cohort_top_n": float(self.cohort_top_n)
-            if self.cohort_top_n is not None
-            else float("nan"),
-            "top_n_type": str(self.top_n_type) if self.top_n_type is not None else "none",
             "allow_reentry": bool(self.allow_reentry) if self.allow_reentry is not None else True,
             "min_cohort_size": float(self.min_cohort_size)
             if self.min_cohort_size is not None
@@ -361,7 +334,7 @@ class Simulator:
 
     def plot(self, figsize=(12, 5), return_handles: bool = False):
         """
-        게이트 스프레드/보유종목수/자산곡선을 3개 패널로 시각화한다.
+        노출도/보유종목수/자산곡선을 3개 패널로 시각화한다.
         """
 
         out = self._require_result()
@@ -375,7 +348,7 @@ class Simulator:
         daily_ret = wealth_vals[1:] / wealth_vals[:-1] - 1.0
         daily_ret = daily_ret[np.isfinite(daily_ret)]
         ann_vol = (
-            float(np.std(daily_ret, ddof=1) * np.sqrt(252.0))
+            float(np.std(daily_ret, ddof=1) * np.sqrt(float(TRADING_DAYS_PER_YEAR)))
             if daily_ret.size >= 2
             else float("nan")
         )
@@ -385,52 +358,33 @@ class Simulator:
         win_rate = float(meta["win_rate"])
         payoff_ratio = float(meta["payoff_ratio"])
         active_day_ratio = float(meta.get("active_day_ratio", np.nan))
+        mean_exposure = float(np.nanmean(out["exposure"].to_numpy(dtype=float)))
         win_text = f"{win_rate * 100.0:.2f}%" if np.isfinite(win_rate) else "nan"
         payoff_text = f"{payoff_ratio:.2f}" if np.isfinite(payoff_ratio) else "nan"
         active_text = f"{active_day_ratio * 100.0:.2f}%" if np.isfinite(active_day_ratio) else "nan"
-        gate_arith_min = float(meta.get("gate_arith_min", 0.0))
-        gate_geom_min = float(meta.get("gate_geom_min", 0.0))
-        gate_rise_min = float(meta.get("gate_rise_min", 0.5))
-        arith_spread = out["pattern_arith_mean"] - np.maximum(
-            gate_arith_min,
-            out["all_stock_arith_mean"],
-        )
-        geom_spread = out["pattern_geom_mean"] - np.maximum(
-            gate_geom_min,
-            out["all_stock_geom_mean"],
-        )
-        rise_spread = out["pattern_rise_prob"] - np.maximum(
-            gate_rise_min,
-            out["all_stock_rise_prob"],
-        )
+        mean_exposure_text = f"{mean_exposure * 100.0:.2f}%" if np.isfinite(mean_exposure) else "nan"
+        plt = _plot_modules()
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=False, sharex=True)
         for ax in axes:
             ax.set_box_aspect(1.0)
 
         axes[0].plot(
             out.index,
-            arith_spread,
-            color="#F37748",
-            linewidth=1.5,
-            label="arith - max(a, market_arith)",
-        )
-        axes[0].plot(
-            out.index,
-            geom_spread,
-            color="#D56062",
-            linewidth=1.8,
-            label="geom - max(b, market_geom)",
-        )
-        axes[0].plot(
-            out.index,
-            rise_spread,
+            out["exposure"] * 100.0,
             color="#067BC2",
             linewidth=1.5,
-            alpha=0.95,
-            label="rise - max(c, market_rise)",
+            label="Daily exposure",
         )
-        axes[0].axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
-        axes[0].set_title("Gate metric spreads")
+        if np.isfinite(mean_exposure):
+            axes[0].axhline(
+                mean_exposure * 100.0,
+                color="gray",
+                linewidth=1.0,
+                linestyle="--",
+                label=f"Mean {mean_exposure * 100.0:.1f}%",
+            )
+        axes[0].set_title("Portfolio Exposure")
+        axes[0].set_ylabel("Exposure (%)")
         axes[0].legend(loc="upper left", fontsize=8)
         axes[0].grid(alpha=0.25, linestyle="--")
 
@@ -461,10 +415,11 @@ class Simulator:
         axes[2].text(
             0.02,
             0.98,
-            "CAGR: {cagr}\n연변동성: {vol}\nIR: {ir}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
+            "CAGR: {cagr}\n연변동성: {vol}\nIR: {ir}\n평균 노출도: {exposure}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
                 cagr=cagr_text,
                 vol=ann_vol_text,
                 ir=ir_text,
+                exposure=mean_exposure_text,
                 win=win_text,
                 payoff=payoff_text,
                 active=active_text,
@@ -492,6 +447,8 @@ class Simulator:
         target_horizon_days: int,
         aggregate_lookback: int | str,
         pattern_mask: np.ndarray,
+        pattern_exit_mask: np.ndarray | None,
+        pattern_dynamic_exit_index: np.ndarray | None,
         pattern_arith_series: np.ndarray,
         pattern_geom_series: np.ndarray,
         pattern_rise_series: np.ndarray,
@@ -505,14 +462,8 @@ class Simulator:
         gate_use_geom: bool = False,
         gate_use_arith: bool = False,
         gate_use_rise: bool = False,
-        top_n_values: np.ndarray | None = None,
-        cohort_top_n: int | None = None,
-        top_n_type: str = "marketcap",
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
-        marketcap_values: np.ndarray | None = None,
-        min_marketcap: float | None = None,
-        marketcap_top_pct: float | None = None,
         execution_lag_days: int = 1,
         execution_price_mode: str = "next_vwap",
         allow_reentry: bool = True,
@@ -549,23 +500,9 @@ class Simulator:
         gate_use_geom_value = bool(gate_use_geom)
         gate_use_arith_value = bool(gate_use_arith)
         gate_use_rise_value = bool(gate_use_rise)
-        if not (gate_use_geom_value or gate_use_arith_value or gate_use_rise_value):
-            raise ValueError(
-                "게이트 지표를 모두 비활성화할 수 없습니다. "
-                "gate_use_geom/gate_use_arith/gate_use_rise 중 최소 1개는 True여야 합니다."
-            )
+        use_gate = gate_use_geom_value or gate_use_arith_value or gate_use_rise_value
         stop_loss_value = self._normalize_stop_loss_pct(stop_loss_pct)
         take_profit_value = self._normalize_take_profit_pct(take_profit_pct)
-        min_marketcap_value = self._normalize_min_marketcap(min_marketcap)
-        marketcap_top_pct_value = self._normalize_marketcap_top_pct(marketcap_top_pct)
-        top_n = None if cohort_top_n is None else int(cohort_top_n)
-        if top_n is not None and top_n <= 0:
-            raise ValueError("cohort_top_n은 1 이상의 정수이거나 None이어야 합니다.")
-        top_n_type_value = str(top_n_type).strip().lower()
-        if top_n_type_value not in {"marketcap", "liquidity", "marketcap+liquidity"}:
-            raise ValueError(
-                "top_n_type은 'marketcap', 'liquidity', 'marketcap+liquidity'만 지원합니다."
-            )
         allow_reentry_value = bool(allow_reentry)
         min_cohort_size_value = int(min_cohort_size)
         if min_cohort_size_value <= 0:
@@ -573,18 +510,6 @@ class Simulator:
         buy_fee_value = float(self.buy_fee)
         sell_fee_value = float(self.sell_fee)
         cohort_weight = 1.0 / float(horizon_days)
-
-        marketcap_top_threshold: np.ndarray | None = None
-        if marketcap_top_pct_value is not None:
-            if marketcap_values is None:
-                raise ValueError("marketcap_top_pct 사용 시 marketcap_values 배열이 필요합니다.")
-            q = 1.0 - marketcap_top_pct_value
-            marketcap_top_threshold = np.full(len(self.dates), np.nan, dtype=np.float64)
-            for i in range(len(self.dates)):
-                row = marketcap_values[i]
-                valid = row[np.isfinite(row)]
-                if valid.size > 0:
-                    marketcap_top_threshold[i] = float(np.quantile(valid, q))
 
         wealth = np.full(len(self.dates), np.nan, dtype=np.float64)
         exposure = np.full(len(self.dates), np.nan, dtype=np.float64)
@@ -607,31 +532,20 @@ class Simulator:
         cohort_entry_net: dict[int, float] = {}
         cohort_exit_net: dict[int, float] = {}
         closed_cohort_returns: list[float] = []
+        has_pattern_exit = pattern_exit_mask is not None and np.any(pattern_exit_mask)
+        has_dynamic_pattern_exit = (
+            pattern_dynamic_exit_index is not None
+            and np.any(np.asarray(pattern_dynamic_exit_index) >= 0)
+        )
 
-        for t in range(start_idx, end_idx - 1):
+        iterator = _progress(
+            range(start_idx, end_idx - 1),
+            desc=f"{pattern} | run",
+        )
+        for t in iterator:
             signal_idx = t if lag_days == 1 else (t + 1)
             signal_mask = pattern_mask[signal_idx]
             selected = np.where(signal_mask)[0]
-            if min_marketcap_value is not None and selected.size > 0:
-                if marketcap_values is None:
-                    raise ValueError("min_marketcap 사용 시 marketcap_values 배열이 필요합니다.")
-                mcap_row = marketcap_values[signal_idx, selected]
-                selected = selected[np.isfinite(mcap_row) & (mcap_row >= min_marketcap_value)]
-            if marketcap_top_threshold is not None and selected.size > 0:
-                threshold = marketcap_top_threshold[signal_idx]
-                if np.isfinite(threshold):
-                    mcap_row = marketcap_values[signal_idx, selected]
-                    selected = selected[np.isfinite(mcap_row) & (mcap_row >= threshold)]
-                else:
-                    selected = selected[:0]
-            if top_n is not None and selected.size > top_n:
-                if top_n_values is None:
-                    raise ValueError("cohort_top_n 사용 시 top_n_values 배열이 필요합니다.")
-                ranking_row = top_n_values[signal_idx, selected]
-                # NaN 랭킹값은 우선순위를 낮춰 가능한 경우 유효값 종목부터 선택한다.
-                ranking = np.where(np.isfinite(ranking_row), ranking_row, -np.inf)
-                order = np.argsort(ranking)[::-1]
-                selected = selected[order[:top_n]]
             if (not allow_reentry_value) and selected.size > 0 and active_buckets:
                 active_idx_parts: list[np.ndarray] = []
                 for bucket in active_buckets:
@@ -647,16 +561,31 @@ class Simulator:
             actual_selected = 0
 
             # lag=1: t 기준 판정 -> t+1 체결, lag=0: t+1 기준 판정 -> t+1 체결
-            if (stop_loss_value is not None or take_profit_value is not None) and lag_days == 1:
+            if (
+                stop_loss_value is not None
+                or take_profit_value is not None
+                or has_pattern_exit
+                or has_dynamic_pattern_exit
+            ) and lag_days == 1:
                 for bucket in active_buckets:
                     vals_t = np.asarray(bucket["values"], dtype=np.float64)
                     entry_vals = np.asarray(bucket["entry_values"], dtype=np.float64)
+                    idx = np.asarray(bucket["idx"], dtype=np.int64)
                     hit = np.zeros(vals_t.shape, dtype=np.bool_)
                     valid = np.isfinite(vals_t) & np.isfinite(entry_vals) & (entry_vals > 0.0)
                     if stop_loss_value is not None:
                         hit |= valid & (vals_t <= entry_vals * (1.0 - stop_loss_value))
                     if take_profit_value is not None:
                         hit |= valid & (vals_t >= entry_vals * (1.0 + take_profit_value))
+                    if has_pattern_exit:
+                        hit |= np.asarray(pattern_exit_mask[t, idx], dtype=np.bool_)
+                    if has_dynamic_pattern_exit:
+                        signal_entry_idx = int(bucket["signal_entry_idx"])
+                        exit_idx = np.asarray(
+                            pattern_dynamic_exit_index[signal_entry_idx, idx],
+                            dtype=np.int32,
+                        )
+                        hit |= exit_idx == t
                     bucket["exit_next_mask"] = hit
 
             # 1) 기존 버킷을 하루 전진(mark-to-market)
@@ -677,16 +606,31 @@ class Simulator:
                 bucket["values"] = vals
                 bucket["age"] = int(bucket["age"]) + 1
 
-            if (stop_loss_value is not None or take_profit_value is not None) and lag_days == 0:
+            if (
+                stop_loss_value is not None
+                or take_profit_value is not None
+                or has_pattern_exit
+                or has_dynamic_pattern_exit
+            ) and lag_days == 0:
                 for bucket in active_buckets:
                     vals_t = np.asarray(bucket["values"], dtype=np.float64)
                     entry_vals = np.asarray(bucket["entry_values"], dtype=np.float64)
+                    idx = np.asarray(bucket["idx"], dtype=np.int64)
                     hit = np.zeros(vals_t.shape, dtype=np.bool_)
                     valid = np.isfinite(vals_t) & np.isfinite(entry_vals) & (entry_vals > 0.0)
                     if stop_loss_value is not None:
                         hit |= valid & (vals_t <= entry_vals * (1.0 - stop_loss_value))
                     if take_profit_value is not None:
                         hit |= valid & (vals_t >= entry_vals * (1.0 + take_profit_value))
+                    if has_pattern_exit:
+                        hit |= np.asarray(pattern_exit_mask[t + 1, idx], dtype=np.bool_)
+                    if has_dynamic_pattern_exit:
+                        signal_entry_idx = int(bucket["signal_entry_idx"])
+                        exit_idx = np.asarray(
+                            pattern_dynamic_exit_index[signal_entry_idx, idx],
+                            dtype=np.int32,
+                        )
+                        hit |= exit_idx == (t + 1)
                     bucket["exit_next_mask"] = hit
 
             # 2) 보유기간(horizon) 만료 버킷 청산
@@ -773,21 +717,24 @@ class Simulator:
                     and np.isfinite(pattern_rise)
                     and np.isfinite(market_rise)
                 )
-                full_cohort = (
-                    has_metrics
-                    and (
-                        (not gate_use_geom_value)
-                        or (pattern_geom > max(gate_geom_min_value, market_geom))
+                if not use_gate:
+                    full_cohort = True
+                else:
+                    full_cohort = (
+                        has_metrics
+                        and (
+                            (not gate_use_geom_value)
+                            or (pattern_geom > max(gate_geom_min_value, market_geom))
+                        )
+                        and (
+                            (not gate_use_arith_value)
+                            or (pattern_arith > max(gate_arith_min_value, market_arith))
+                        )
+                        and (
+                            (not gate_use_rise_value)
+                            or (pattern_rise > max(gate_rise_min_value, market_rise))
+                        )
                     )
-                    and (
-                        (not gate_use_arith_value)
-                        or (pattern_arith > max(gate_arith_min_value, market_arith))
-                    )
-                    and (
-                        (not gate_use_rise_value)
-                        or (pattern_rise > max(gate_rise_min_value, market_rise))
-                    )
-                )
                 cohort_scale = 1.0 if full_cohort else fallback_exposure_value
 
                 target_gross = curr_wealth * cohort_weight * cohort_scale
@@ -811,6 +758,7 @@ class Simulator:
                                 "entry_values": buy_values.copy(),
                                 "age": 0,
                                 "entry_idx": t + 1,
+                                "signal_entry_idx": signal_idx,
                                 "cohort_id": cohort_id,
                             }
                         )
@@ -937,15 +885,9 @@ class Simulator:
         out.attrs["take_profit_pct"] = (
             take_profit_value if take_profit_value is not None else float("nan")
         )
-        out.attrs["min_marketcap"] = min_marketcap_value if min_marketcap_value is not None else float("nan")
-        out.attrs["marketcap_top_pct"] = (
-            marketcap_top_pct_value if marketcap_top_pct_value is not None else float("nan")
-        )
         out.attrs["execution_lag_days"] = float(lag_days)
         out.attrs["execution_price_mode"] = str(execution_price_mode)
         out.attrs["max_weight_per_stock"] = float("nan")
-        out.attrs["cohort_top_n"] = float(top_n) if top_n is not None else float("nan")
-        out.attrs["top_n_type"] = top_n_type_value if top_n is not None else "none"
         out.attrs["allow_reentry"] = bool(allow_reentry_value)
         out.attrs["min_cohort_size"] = float(min_cohort_size_value)
         out.attrs["buy_fee"] = buy_fee_value
@@ -968,13 +910,9 @@ class Simulator:
         self.gate_use_rise = bool(gate_use_rise_value)
         self.stop_loss_pct = stop_loss_value
         self.take_profit_pct = take_profit_value
-        self.min_marketcap = min_marketcap_value
-        self.marketcap_top_pct = marketcap_top_pct_value
         self.execution_lag_days = lag_days
         self.execution_price_mode = str(execution_price_mode)
         self.max_weight_per_stock = float("nan")
-        self.cohort_top_n = top_n
-        self.top_n_type = top_n_type_value if top_n is not None else "none"
         self.allow_reentry = bool(allow_reentry_value)
         self.min_cohort_size = int(min_cohort_size_value)
         self.run_years = years

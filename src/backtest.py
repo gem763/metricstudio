@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Callable, Dict, List, Tuple, Optional
 import math
 import re
 
 import numpy as np
 import pandas as pd
 from numba import njit
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
-from src.db_manager import DB as DuckDBManager
+from src.db_manager import (
+    DB as DuckDBManager,
+    DEFAULT_DEPT_EXCLUDES,
+    DEFAULT_MARKETS,
+)
 from src.db_manager_archive import DB as ArchiveDBManager
 from src.pattern import Pattern
 from src.simulate import Simulator
@@ -28,11 +32,22 @@ HORIZONS: List[Tuple[str, int]] = [
     ("3M", 60),
     ("6M", 120),
 ]
+TRADING_DAYS_PER_YEAR = 240
 
 TRIM_MODE_REMOVE = 0
 TRIM_MODE_WINSORIZE = 1
 AGG_MODE_EVENT = "event"
 AGG_MODE_DAY = "day"
+
+
+def _progress(*args, **kwargs):
+    """
+    노트북 저장 시 widget 출력이 남지 않도록 일반 tqdm를 사용한다.
+    """
+
+    kwargs.setdefault("leave", True)
+    kwargs.setdefault("dynamic_ncols", True)
+    return tqdm(*args, **kwargs)
 
 
 @dataclass
@@ -47,16 +62,323 @@ class StockTable:
     code_names: Dict[str, str]
 
 
+def _normalize_univ_markets(values) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        items = [values]
+    else:
+        items = list(values)
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip().upper()
+        if text and text not in out:
+            out.append(text)
+    if not out:
+        raise ValueError("market은 비어 있을 수 없습니다.")
+    return tuple(out)
+
+
+def _normalize_univ_depts(values) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        items = [values]
+    else:
+        items = list(values)
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
-class AnalyzeFilterConfig:
+class Univ:
+    market: tuple[str, ...] | None = DEFAULT_MARKETS
+    is_tradable: bool | None = True
+    dept_excludes: tuple[str, ...] = DEFAULT_DEPT_EXCLUDES
+
+    def __init__(
+        self,
+        market=DEFAULT_MARKETS,
+        is_tradable: bool | None = True,
+        dept_excludes=DEFAULT_DEPT_EXCLUDES,
+    ):
+        object.__setattr__(self, "market", _normalize_univ_markets(market))
+        object.__setattr__(self, "is_tradable", None if is_tradable is None else bool(is_tradable))
+        object.__setattr__(self, "dept_excludes", _normalize_univ_depts(dept_excludes))
+
+    def cache_key(self) -> tuple[tuple[str, ...] | None, bool | None, tuple[str, ...]]:
+        return self.market, self.is_tradable, self.dept_excludes
+
+
+def _normalize_bucket_list(values, name: str) -> tuple[int, ...] | None:
     """
-    analyze()에서 사용한 실행 필터 옵션 스냅샷.
+    10분위 구간 입력을 1~10 정수 튜플로 정규화한다.
     """
 
-    min_marketcap: float | None
-    marketcap_top_pct: float | None
-    cohort_top_n: int | None
-    top_n_type: str
+    if values is None:
+        return None
+    if isinstance(values, (str, int, np.integer)):
+        items = [values]
+    else:
+        items = list(values)
+    if not items:
+        return None
+
+    out: list[int] = []
+    for item in items:
+        if isinstance(item, (int, np.integer)):
+            q = int(item)
+        else:
+            match = re.fullmatch(r"(10|[1-9])\s*[QqDd]?", str(item).strip())
+            if match is None:
+                raise ValueError(f"{name}는 1~10 또는 '1Q'~'10Q' 형식만 지원합니다.")
+            q = int(match.group(1))
+        if q < 1 or q > 10:
+            raise ValueError(f"{name}는 1~10 또는 '1Q'~'10Q' 형식만 지원합니다.")
+        if q not in out:
+            out.append(q)
+    return tuple(sorted(out))
+
+
+def _normalize_filter_order(values) -> tuple[str, ...] | None:
+    """
+    순차 적용할 필터 순서를 정규화한다.
+    """
+
+    if values is None:
+        return None
+    if isinstance(values, str):
+        items = [values]
+    else:
+        items = list(values)
+    if not items:
+        return None
+
+    alias_map = {
+        "market_cap": "market_cap",
+        "marketcap": "market_cap",
+        "liquidity": "liquidity",
+    }
+    out: list[str] = []
+    for item in items:
+        key = str(item).strip().lower()
+        if key not in alias_map:
+            raise ValueError("order는 'market_cap'과 'liquidity'만 지원합니다.")
+        normalized = alias_map[key]
+        if normalized not in out:
+            out.append(normalized)
+    return tuple(out)
+
+
+class Filter:
+    """
+    날짜별 종목 필터 마스크를 계산하고 조회한다.
+    """
+
+    def __init__(self, market_cap=None, liquidity=None, order=None):
+        self.market_cap_buckets = _normalize_bucket_list(market_cap, "market_cap")
+        self.liquidity_buckets = _normalize_bucket_list(liquidity, "liquidity")
+        self.order = _normalize_filter_order(order)
+        self._dates: np.ndarray | None = None
+        self._codes: list[str] | None = None
+        self._prices: np.ndarray | None = None
+        self._db_mode: int | None = None
+        self._univ: Univ | None = None
+        self._marketcap_matrix: np.ndarray | None = None
+        self._liquidity_matrix: np.ndarray | None = None
+        self._mask_matrix: np.ndarray | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.market_cap_buckets is not None or self.liquidity_buckets is not None
+
+    def bind(
+        self,
+        *,
+        dates: np.ndarray,
+        codes: list[str],
+        prices: np.ndarray,
+        db_mode: int,
+        univ: Univ,
+    ) -> None:
+        self._dates = dates
+        self._codes = codes
+        self._prices = prices
+        self._db_mode = db_mode
+        self._univ = univ
+        self._marketcap_matrix = None
+        self._liquidity_matrix = None
+        self._mask_matrix = None
+
+    def _require_bound(self) -> tuple[np.ndarray, list[str], np.ndarray, int, Univ]:
+        if (
+            self._dates is None
+            or self._codes is None
+            or self._prices is None
+            or self._db_mode is None
+            or self._univ is None
+        ):
+            raise ValueError("Filter는 Backtest.analyze(..., filter=...) 이후에 사용할 수 있습니다.")
+        return self._dates, self._codes, self._prices, self._db_mode, self._univ
+
+    @staticmethod
+    def _build_decile_mask_matrix(
+        values: np.ndarray,
+        buckets: tuple[int, ...],
+        base_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        mask = np.zeros(values.shape, dtype=np.bool_)
+        selected_buckets = set(int(q) for q in buckets)
+        for row_idx in range(values.shape[0]):
+            row = values[row_idx]
+            valid_mask = np.isfinite(row)
+            if base_mask is not None:
+                valid_mask &= base_mask[row_idx]
+            valid_idx = np.flatnonzero(valid_mask)
+            if valid_idx.size == 0:
+                continue
+            order = valid_idx[np.argsort(row[valid_idx], kind="mergesort")]
+            deciles = ((np.arange(order.size) * 10) // order.size) + 1
+            keep = np.fromiter((int(q) in selected_buckets for q in deciles), dtype=np.bool_)
+            mask[row_idx, order[keep]] = True
+        return mask
+
+    def _ordered_steps(self) -> list[tuple[str, tuple[int, ...]]]:
+        steps: list[tuple[str, tuple[int, ...]]] = []
+        if self.market_cap_buckets is not None:
+            steps.append(("market_cap", self.market_cap_buckets))
+        if self.liquidity_buckets is not None:
+            steps.append(("liquidity", self.liquidity_buckets))
+        if not steps:
+            return steps
+        if self.order is None:
+            return steps
+
+        step_map = {name: buckets for name, buckets in steps}
+        ordered: list[tuple[str, tuple[int, ...]]] = []
+        for name in self.order:
+            buckets = step_map.pop(name, None)
+            if buckets is not None:
+                ordered.append((name, buckets))
+        for name, buckets in steps:
+            if name in step_map:
+                ordered.append((name, buckets))
+                step_map.pop(name, None)
+        return ordered
+
+    def _get_marketcap_matrix(self) -> np.ndarray:
+        dates, codes, _, db_mode, univ = self._require_bound()
+        if self._marketcap_matrix is None:
+            mcap_df = _load_stock_field_table("marketcap", db_mode, univ)
+            aligned = mcap_df.reindex(
+                index=pd.DatetimeIndex(dates),
+                columns=pd.Index(codes, dtype="object"),
+            )
+            self._marketcap_matrix = aligned.to_numpy(dtype=np.float64, copy=True)
+        return self._marketcap_matrix
+
+    def _get_liquidity_matrix(self) -> np.ndarray:
+        dates, codes, _, db_mode, univ = self._require_bound()
+        if self._liquidity_matrix is None:
+            tables = _load_stock_field_tables(["amount", "marketcap"], db_mode, univ)
+            amount_df = tables["amount"].reindex(index=pd.DatetimeIndex(dates), columns=pd.Index(codes, dtype="object"))
+            marketcap_df = tables["marketcap"].reindex(index=pd.DatetimeIndex(dates), columns=pd.Index(codes, dtype="object"))
+            amount = amount_df.to_numpy(dtype=np.float64, copy=True)
+            marketcap = marketcap_df.to_numpy(dtype=np.float64, copy=True)
+            ratio = np.full(amount.shape, np.nan, dtype=np.float64)
+            valid = np.isfinite(amount) & np.isfinite(marketcap) & (marketcap > 0.0)
+            ratio[valid] = amount[valid] / marketcap[valid]
+            self._liquidity_matrix = ratio
+        return self._liquidity_matrix
+
+    def _build_mask_matrix(self) -> np.ndarray:
+        _, _, prices, _, _ = self._require_bound()
+        mask = np.isfinite(prices) & (prices > 0.0)
+        if self.order is None:
+            if self.market_cap_buckets is not None:
+                marketcap = self._get_marketcap_matrix()
+                marketcap_mask = self._build_decile_mask_matrix(
+                    np.where(marketcap > 0.0, marketcap, np.nan),
+                    self.market_cap_buckets,
+                )
+                mask &= marketcap_mask
+            if self.liquidity_buckets is not None:
+                liquidity = self._get_liquidity_matrix()
+                liquidity_mask = self._build_decile_mask_matrix(liquidity, self.liquidity_buckets)
+                mask &= liquidity_mask
+            return mask
+
+        for step_name, buckets in self._ordered_steps():
+            if step_name == "market_cap":
+                marketcap = self._get_marketcap_matrix()
+                step_mask = self._build_decile_mask_matrix(
+                    np.where(marketcap > 0.0, marketcap, np.nan),
+                    buckets,
+                    base_mask=mask,
+                )
+            elif step_name == "liquidity":
+                liquidity = self._get_liquidity_matrix()
+                step_mask = self._build_decile_mask_matrix(
+                    liquidity,
+                    buckets,
+                    base_mask=mask,
+                )
+            else:
+                raise ValueError(f"지원하지 않는 필터 단계입니다: {step_name}")
+            mask &= step_mask
+        return mask
+
+    def prepare(self, show_progress: bool = True) -> None:
+        if not self.is_active:
+            return
+        self._require_bound()
+
+        tasks: list[tuple[str, Callable[[], np.ndarray]]] = []
+        if self.market_cap_buckets is not None and self._marketcap_matrix is None:
+            tasks.append(("시가총액 로드", self._get_marketcap_matrix))
+        if self.liquidity_buckets is not None and self._liquidity_matrix is None:
+            tasks.append(("유동성 로드", self._get_liquidity_matrix))
+        if self._mask_matrix is None:
+            tasks.append(("필터 마스크", self._build_mask_matrix))
+        if not tasks:
+            return
+
+        progress_bar = _progress(total=len(tasks), desc="실행필터 준비") if show_progress else None
+        try:
+            for label, task in tasks:
+                if progress_bar is not None:
+                    progress_bar.set_description_str(f"실행필터 준비 | {label}")
+                result = task()
+                if label == "필터 마스크":
+                    self._mask_matrix = result
+                if progress_bar is not None:
+                    progress_bar.update(1)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+    def mask_matrix(self) -> np.ndarray | None:
+        if not self.is_active:
+            return None
+        self.prepare(show_progress=False)
+        return self._mask_matrix
+
+    def get(self, at) -> list[str]:
+        dates, codes, _, _, _ = self._require_bound()
+        mask_matrix = self.mask_matrix()
+        if mask_matrix is None:
+            return list(codes)
+
+        target = pd.Timestamp(at).to_datetime64()
+        idx = int(np.searchsorted(dates, target, side="left"))
+        if idx >= len(dates) or dates[idx] != target:
+            raise ValueError(f"날짜 {pd.Timestamp(at).date()} 가 Backtest 거래일 범위에 없습니다.")
+        selected = np.flatnonzero(mask_matrix[idx])
+        return [codes[i] for i in selected]
 
 
 @dataclass
@@ -223,10 +545,13 @@ _INDEX_NAME_MAP: Dict[str, str] = {
     "ks200": "코스피200",
 }
 
-_STOCK_TABLE_CACHE: Dict[int, StockTable] = {}
+_STOCK_TABLE_CACHE: Dict[tuple[int, tuple[tuple[str, ...] | None, bool | None, tuple[str, ...]]], StockTable] = {}
 _MARKET_TABLE_CACHE: Dict[int, Dict[str, pd.DataFrame]] = {}
 _CODE_NAME_SERIES_CACHE: Dict[int, pd.Series] = {}
-_STOCK_FIELD_TABLE_CACHE: Dict[int, Dict[str, pd.DataFrame]] = {}
+_STOCK_FIELD_TABLE_CACHE: Dict[
+    tuple[int, tuple[tuple[str, ...] | None, bool | None, tuple[str, ...]]],
+    Dict[str, pd.DataFrame],
+] = {}
 _DB_MANAGER_CACHE: Dict[int, object] = {}
 
 
@@ -246,79 +571,103 @@ def _get_db_manager(db_mode: int):
     return manager
 
 
-def _load_stock_field_table(field: str, db_mode: int) -> pd.DataFrame:
+def _resolve_univ(univ: Univ | None) -> Univ:
+    return univ if isinstance(univ, Univ) else Univ()
+
+
+def _load_stock_field_table(field: str, db_mode: int, univ: Univ | None = None) -> pd.DataFrame:
+    return _load_stock_field_tables([field], db_mode, univ)[str(field).strip().lower()]
+
+
+def _load_stock_field_tables(fields: list[str], db_mode: int, univ: Univ | None = None) -> Dict[str, pd.DataFrame]:
     mode = _normalize_db_mode(db_mode)
-    key = str(field).strip().lower()
-    cache = _STOCK_FIELD_TABLE_CACHE.setdefault(mode, {})
-    if key in cache:
-        return cache[key]
+    resolved_univ = _resolve_univ(univ)
+    cache_key = (mode, resolved_univ.cache_key())
+    cache = _STOCK_FIELD_TABLE_CACHE.setdefault(cache_key, {})
+    keys: list[str] = []
+    for field in fields:
+        key = str(field).strip().lower()
+        if key and key not in keys:
+            keys.append(key)
+
+    if not keys:
+        return {}
 
     if mode == DB_MODE_LEGACY:
-        out = _get_db_manager(mode).load_stock(field=key)
-        cache[key] = out
-        return out
+        if resolved_univ.cache_key() != Univ().cache_key():
+            raise ValueError("db=1(legacy)에서는 Univ 사용자 지정이 아직 지원되지 않습니다.")
+        for key in keys:
+            if key in cache:
+                continue
+            cache[key] = _get_db_manager(mode).load_stock(field=key)
+        return {key: cache[key] for key in keys}
 
     # duckdb adjusted-stock 모드
     field_map = {"marketcap": "market_cap"}
-    source_field = field_map.get(key, key)
-    long_df = _get_db_manager(mode).load_adjusted_stock_duckdb(columns=[source_field])
-    if source_field not in long_df.columns:
-        raise ValueError(f"adjusted-stock 데이터에 '{source_field}' 컬럼이 없습니다.")
-    wide = pd.to_numeric(long_df[source_field], errors="coerce").unstack("ticker")
-    wide.index = pd.to_datetime(wide.index, errors="coerce")
-    wide = wide[wide.index.notna()]
-    wide.columns = pd.Index([str(c) for c in wide.columns], dtype="object")
-    out = wide.sort_index().sort_index(axis=1)
-    cache[key] = out
-    return out
+    missing_keys = [key for key in keys if key not in cache]
+    if missing_keys:
+        source_fields = [field_map.get(key, key) for key in missing_keys]
+        long_df = _get_db_manager(mode).load_adjusted_stock_duckdb(
+            columns=source_fields,
+            market=resolved_univ.market,
+            is_tradable=resolved_univ.is_tradable,
+            dept_excludes=resolved_univ.dept_excludes,
+        )
+        for key in missing_keys:
+            source_field = field_map.get(key, key)
+            if source_field not in long_df.columns:
+                raise ValueError(f"adjusted-stock 데이터에 '{source_field}' 컬럼이 없습니다.")
+            wide = pd.to_numeric(long_df[source_field], errors="coerce").unstack("ticker")
+            wide.index = pd.to_datetime(wide.index, errors="coerce")
+            wide = wide[wide.index.notna()]
+            wide.columns = pd.Index([str(c) for c in wide.columns], dtype="object")
+            cache[key] = wide.sort_index().sort_index(axis=1)
+
+    return {key: cache[key] for key in keys}
 
 
-def _load_stock_table(db_mode: int) -> StockTable:
+def _load_stock_table(db_mode: int, univ: Univ | None = None) -> StockTable:
     """
     종가 테이블을 로드해 전역 캐시에 보관한다.
     """
 
     mode = _normalize_db_mode(db_mode)
-    if mode in _STOCK_TABLE_CACHE:
-        return _STOCK_TABLE_CACHE[mode]
+    resolved_univ = _resolve_univ(univ)
+    cache_key = (mode, resolved_univ.cache_key())
+    if cache_key in _STOCK_TABLE_CACHE:
+        return _STOCK_TABLE_CACHE[cache_key]
 
     if mode == DB_MODE_LEGACY:
+        if resolved_univ.cache_key() != Univ().cache_key():
+            raise ValueError("db=1(legacy)에서는 Univ 사용자 지정이 아직 지원되지 않습니다.")
         # DB 기본 경로: db/stock/close.parquet 또는 db/stock/data/*.parquet
-        df = _load_stock_field_table("close", mode)
+        df = _load_stock_field_table("close", mode, resolved_univ)
         dates = df.index.to_numpy(dtype="datetime64[ns]")
         prices = df.to_numpy(dtype=np.float64, copy=True)
         codes = [str(c) for c in df.columns]
         table = StockTable(dates=dates, prices=prices, codes=codes, code_names={})
-        _STOCK_TABLE_CACHE[mode] = table
+        _STOCK_TABLE_CACHE[cache_key] = table
         return table
 
     # duckdb adjusted-stock 모드
-    long_df = _get_db_manager(mode).load_adjusted_stock_duckdb(columns=["name", "close"])
-    close_wide = pd.to_numeric(long_df["close"], errors="coerce").unstack("ticker")
+    close_wide = _get_db_manager(mode).load_stock(
+        field="close",
+        market=resolved_univ.market,
+        is_tradable=resolved_univ.is_tradable,
+        dept_excludes=resolved_univ.dept_excludes,
+    )
     close_wide.index = pd.to_datetime(close_wide.index, errors="coerce")
     close_wide = close_wide[close_wide.index.notna()]
     close_wide.columns = pd.Index([str(c) for c in close_wide.columns], dtype="object")
     close_wide = close_wide.sort_index().sort_index(axis=1)
 
-    name_df = (
-        long_df.reset_index()[["date", "ticker", "name"]]
-        .sort_values(["date", "ticker"], kind="mergesort")
-        .dropna(subset=["ticker", "name"])
-        .drop_duplicates(subset=["ticker"], keep="last")
-    )
-    code_names = {
-        str(code): str(name).strip()
-        for code, name in zip(name_df["ticker"].to_numpy(), name_df["name"].to_numpy())
-        if str(name).strip()
-    }
-
     table = StockTable(
         dates=close_wide.index.to_numpy(dtype="datetime64[ns]"),
         prices=close_wide.to_numpy(dtype=np.float64, copy=True),
         codes=[str(c) for c in close_wide.columns],
-        code_names=code_names,
+        code_names={},
     )
-    _STOCK_TABLE_CACHE[mode] = table
+    _STOCK_TABLE_CACHE[cache_key] = table
     return table
 
 
@@ -363,7 +712,7 @@ def _load_code_name_series(db_mode: int) -> pd.Series:
         return _CODE_NAME_SERIES_CACHE[mode]
 
     if mode == DB_MODE_LEGACY:
-        out = _get_db_manager(mode).load_code_name(mapping_pkl="code_name.pkl")
+        out = _get_db_manager(mode).load_code_name()
         _CODE_NAME_SERIES_CACHE[mode] = out
         return out
 
@@ -383,6 +732,8 @@ def _numba_accumulate_returns(
     start_idx,
     end_idx,
     horizon_offsets,
+    exit_mask,
+    use_exit_mask,
     counts,
     sum_ret,
     sum_log,
@@ -409,7 +760,13 @@ def _numba_accumulate_returns(
             j = i + step
             if j >= length:
                 continue
-            fwd = values[j]
+            target_idx = j
+            if use_exit_mask:
+                for k in range(i + 1, j + 1):
+                    if exit_mask[k]:
+                        target_idx = k
+                        break
+            fwd = values[target_idx]
             if not np.isfinite(fwd) or fwd <= 0:
                 continue
             ret = fwd / base - 1.0
@@ -466,6 +823,11 @@ def _numba_accumulate_trim_for_date(
     mask_row,
     date_idx,
     horizon_offsets,
+    exit_mask,
+    use_exit_mask,
+    dynamic_exit_index,
+    dynamic_exit_offset,
+    use_dynamic_exit,
     trim_q,
     trim_mode,
     counts,
@@ -501,7 +863,18 @@ def _numba_accumulate_trim_for_date(
             if not np.isfinite(base) or base <= 0.0:
                 continue
 
-            fwd = prices[fwd_idx, code_idx]
+            target_idx = fwd_idx
+            if use_dynamic_exit:
+                exit_idx = dynamic_exit_index[date_idx - dynamic_exit_offset, code_idx]
+                if exit_idx > date_idx and exit_idx <= fwd_idx:
+                    target_idx = exit_idx
+            if use_exit_mask:
+                for k in range(date_idx + 1, target_idx + 1):
+                    if exit_mask[k, code_idx]:
+                        target_idx = k
+                        break
+
+            fwd = prices[target_idx, code_idx]
             if not np.isfinite(fwd) or fwd <= 0.0:
                 continue
 
@@ -568,6 +941,11 @@ def _numba_accumulate_for_date(
     mask_row,
     date_idx,
     horizon_offsets,
+    exit_mask,
+    use_exit_mask,
+    dynamic_exit_index,
+    dynamic_exit_offset,
+    use_dynamic_exit,
     counts,
     sum_ret,
     sum_log,
@@ -606,7 +984,18 @@ def _numba_accumulate_for_date(
             if not np.isfinite(base) or base <= 0.0:
                 continue
 
-            fwd = prices[fwd_idx, code_idx]
+            target_idx = fwd_idx
+            if use_dynamic_exit:
+                exit_idx = dynamic_exit_index[date_idx - dynamic_exit_offset, code_idx]
+                if exit_idx > date_idx and exit_idx <= fwd_idx:
+                    target_idx = exit_idx
+            if use_exit_mask:
+                for k in range(date_idx + 1, target_idx + 1):
+                    if exit_mask[k, code_idx]:
+                        target_idx = k
+                        break
+
+            fwd = prices[target_idx, code_idx]
             if not np.isfinite(fwd) or fwd <= 0.0:
                 continue
 
@@ -697,7 +1086,7 @@ def _infer_pattern_trim_config(pattern_fn: Pattern) -> tuple[float | None, str]:
 
 def _normalize_analyze_by(mode: str | None) -> str:
     """
-    analyze(by=...) 가중 모드를 정규화한다.
+    집계 모드 입력을 정규화한다.
     """
 
     key = str(mode or AGG_MODE_DAY).strip().lower().replace("-", "_")
@@ -706,60 +1095,6 @@ def _normalize_analyze_by(mode: str | None) -> str:
     if key in {"day", "daily", "day_mean", "daily_mean"}:
         return AGG_MODE_DAY
     raise ValueError("by는 'event' 또는 'day'여야 합니다.")
-
-
-def _normalize_min_marketcap_for_filter(min_marketcap: float | None) -> float | None:
-    """
-    analyze 필터용 시가총액 하한을 정규화한다.
-    """
-
-    if min_marketcap is None:
-        return None
-    value = float(min_marketcap)
-    if not np.isfinite(value) or value <= 0.0:
-        raise ValueError("min_marketcap은 양수여야 합니다.")
-    return value
-
-
-def _normalize_marketcap_top_pct_for_filter(marketcap_top_pct: float | None) -> float | None:
-    """
-    analyze 필터용 시가총액 상위 비율을 정규화한다.
-    """
-
-    if marketcap_top_pct is None:
-        return None
-    value = float(marketcap_top_pct)
-    if not np.isfinite(value) or value <= 0.0:
-        raise ValueError("marketcap_top_pct는 양수여야 합니다.")
-    if value > 1.0:
-        value = value / 100.0
-    if value <= 0.0 or value > 1.0:
-        raise ValueError("marketcap_top_pct는 0~1(소수) 또는 1~100(%) 범위여야 합니다.")
-    return value
-
-
-def _normalize_cohort_top_n_for_filter(cohort_top_n: int | None) -> int | None:
-    """
-    analyze 필터용 상위 종목 수를 정규화한다.
-    """
-
-    if cohort_top_n is None:
-        return None
-    top_n = int(cohort_top_n)
-    if top_n <= 0:
-        raise ValueError("cohort_top_n은 1 이상의 정수이거나 None이어야 합니다.")
-    return top_n
-
-
-def _normalize_top_n_type_for_filter(top_n_type: str | None) -> str:
-    """
-    analyze 필터용 top_n_type 문자열을 정규화한다.
-    """
-
-    key = str(top_n_type or "marketcap").strip().lower()
-    if key not in {"marketcap", "liquidity", "marketcap+liquidity"}:
-        raise ValueError("top_n_type은 'marketcap', 'liquidity', 'marketcap+liquidity'만 지원합니다.")
-    return key
 
 
 def _parse_lookback_window(lookback: int | str) -> int:
@@ -787,7 +1122,7 @@ def _parse_lookback_window(lookback: int | str) -> int:
     if unit == "M":
         return value * 21
     if unit == "Y":
-        return value * 252
+        return value * TRADING_DAYS_PER_YEAR
     raise ValueError("지원하지 않는 lookback 단위입니다. D/W/M/Y만 사용 가능합니다.")
 
 
@@ -801,6 +1136,8 @@ class Backtest:
         start,
         end,
         benchmark: Pattern | None = None,
+        univ: Univ | None = None,
+        by: str = AGG_MODE_DAY,
         db: int = 0,
     ):
         """
@@ -809,8 +1146,12 @@ class Backtest:
 
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
+        self.by = _normalize_analyze_by(by)
         self.db_mode = _normalize_db_mode(db)
-        table = _load_stock_table(self.db_mode)
+        if univ is not None and not isinstance(univ, Univ):
+            raise TypeError("univ는 Univ 객체여야 합니다.")
+        self.univ = univ if isinstance(univ, Univ) else Univ()
+        table = _load_stock_table(self.db_mode, self.univ)
         self.dates = table.dates
         self.prices = table.prices
         self.codes = table.codes
@@ -826,13 +1167,14 @@ class Backtest:
         self._base_stats = {}
         self._analyzed_patterns: Dict[str, Pattern] = {}
         self._analyzed_stats: Dict[str, Stats] = {}
-        self._analyzed_filter_configs: Dict[str, AnalyzeFilterConfig] = {}
+        self._analyzed_filters: Dict[str, Filter | None] = {}
         self._last_stats_collection: StatsCollection | None = None
-        self._pattern_mask_cache: Dict[str, np.ndarray] = {}
+        self._pattern_mask_cache: Dict[tuple[str, bool], np.ndarray] = {}
+        self._pattern_exit_mask_cache: Dict[str, np.ndarray] = {}
+        self._pattern_exit_index_cache: Dict[tuple[str, int], np.ndarray] = {}
         self._all_stock_geom_cache: Dict[tuple[int, int], np.ndarray] = {}
         self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._marketcap_matrix: np.ndarray | None = None
-        self._liquidity_matrix: np.ndarray | None = None
+        self._stock_field_matrix_cache: Dict[str, np.ndarray] = {}
         self._vwap_matrix: np.ndarray | None = None
         if benchmark is not None:
             base_name = _infer_pattern_label(benchmark, 0)
@@ -842,15 +1184,12 @@ class Backtest:
                 trim_quantile=base_trim_q,
                 trim_method=base_trim_method,
                 progress_label=base_name,
+                aggregation_mode=self.by,
+                filter_obj=None,
             )
             self._analyzed_patterns[base_name] = benchmark
             self._analyzed_stats[base_name] = self._base_stats[base_name]
-            self._analyzed_filter_configs[base_name] = AnalyzeFilterConfig(
-                min_marketcap=None,
-                marketcap_top_pct=None,
-                cohort_top_n=None,
-                top_n_type="marketcap",
-            )
+            self._analyzed_filters[base_name] = None
 
     @staticmethod
     def _compute_mask(pattern_fn: Pattern, values: np.ndarray, code: str) -> np.ndarray | None:
@@ -865,6 +1204,18 @@ class Backtest:
         if mask_arr.shape != values.shape:
             raise ValueError(f"패턴 mask shape이 종목 코드 {code}의 가격 배열 shape과 일치하지 않습니다.")
         return mask_arr
+
+    @staticmethod
+    def _is_default_price_pattern(pattern_fn: Pattern) -> bool:
+        """
+        종가가 유효한 모든 구간을 그대로 선택하는 기본 패턴인지 판별한다.
+        """
+
+        return (
+            type(pattern_fn) is Pattern
+            and pattern_fn.market_name is None
+            and pattern_fn._post_mask_fn is Pattern._post_mask_base
+        )
 
     def _get_market_values(self, market: str, field: str) -> np.ndarray:
         """
@@ -927,14 +1278,47 @@ class Backtest:
             market_values = self._get_market_values(market_name, market_field)
             node._set_market_values(market_values)
 
+    def _get_stock_field_matrix(self, field: str) -> np.ndarray:
+        """
+        종목 필드 wide 테이블을 백테스트 날짜/종목 축에 맞춰 정렬해 반환한다.
+        """
+
+        key = str(field).strip().lower()
+        if not key:
+            raise ValueError("field는 비어 있을 수 없습니다.")
+        if key not in self._stock_field_matrix_cache:
+            df = _load_stock_field_table(key, self.db_mode, self.univ)
+            aligned = df.reindex(
+                index=pd.DatetimeIndex(self.dates),
+                columns=pd.Index(self.codes, dtype="object"),
+            )
+            self._stock_field_matrix_cache[key] = aligned.to_numpy(dtype=np.float64, copy=True)
+        return self._stock_field_matrix_cache[key]
+
+    def _prepare_stock_sources(self, pattern_fn: Pattern, col_idx: int) -> None:
+        """
+        종목별 보조 필드(high/low/volume 등)가 필요한 패턴 노드에 시계열을 주입한다.
+        """
+
+        for node in self._iter_pattern_nodes(pattern_fn):
+            fields = tuple(node._required_stock_fields())
+            for field in fields:
+                matrix = self._get_stock_field_matrix(field)
+                node._set_stock_values(field, matrix[:, col_idx])
+
     def _run_pattern_normal(self, pattern_fn: Pattern, progress_label: str) -> Stats:
         """
         trim 없이 이벤트 기반 통계를 계산한다.
         """
 
         stats = Stats.create(self.dates, HORIZONS)
-        for col_idx, code in enumerate(tqdm(self.codes, desc=f"{progress_label} | codes")):
+        stats.eval_start_idx = self.start_idx
+        stats.eval_end_idx = self.end_idx
+        exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
+        use_exit_mask = bool(pattern_fn.has_exit_rule())
+        for col_idx, code in enumerate(_progress(self.codes, desc=progress_label)):
             values = self.prices[:, col_idx]
+            self._prepare_stock_sources(pattern_fn, col_idx)
             mask = self._compute_mask(pattern_fn, values, code)
             if mask is None:
                 continue
@@ -950,6 +1334,8 @@ class Backtest:
                 self.start_idx,
                 self.end_idx,
                 self.horizon_offsets,
+                exit_mask_matrix[:, col_idx],
+                use_exit_mask,
                 stats.counts,
                 stats.sum_ret,
                 stats.sum_log,
@@ -958,7 +1344,13 @@ class Backtest:
             )
         return stats
 
-    def _build_mask_matrix(self, pattern_fn: Pattern, eval_len: int) -> np.ndarray:
+    def _build_mask_matrix(
+        self,
+        pattern_fn: Pattern,
+        eval_len: int,
+        allowed_cols: np.ndarray | None = None,
+        prefilter_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
         """
         분석 구간의 [일자 x 종목] 패턴 마스크 행렬을 생성한다.
         """
@@ -968,21 +1360,147 @@ class Backtest:
         if eval_len == 0:
             return mask_matrix
 
-        for col_idx, code in enumerate(self.codes):
+        slice_start = self.start_idx
+        if eval_len == len(self.dates):
+            slice_start = 0
+        slice_end = min(len(self.dates), slice_start + eval_len)
+
+        if self._is_default_price_pattern(pattern_fn):
+            window = self.prices[slice_start:slice_end]
+            mask_matrix = np.isfinite(window) & (window > 0.0)
+            if allowed_cols is not None:
+                mask_matrix[:, ~allowed_cols] = False
+            if prefilter_mask is not None:
+                mask_matrix &= prefilter_mask
+            return mask_matrix
+
+        column_indices = range(num_codes)
+        if allowed_cols is not None:
+            column_indices = np.flatnonzero(allowed_cols)
+
+        for col_idx in column_indices:
+            code = self.codes[col_idx]
             values = self.prices[:, col_idx]
+            self._prepare_stock_sources(pattern_fn, col_idx)
             mask = self._compute_mask(pattern_fn, values, code)
             if mask is None:
                 continue
-            mask_matrix[:, col_idx] = mask[self.start_idx:self.end_idx]
+            eval_mask = mask[slice_start:slice_end]
+            if prefilter_mask is not None:
+                eval_mask = eval_mask & prefilter_mask[:, col_idx]
+            mask_matrix[:, col_idx] = eval_mask
         return mask_matrix
+
+    def _build_exit_mask_matrix(
+        self,
+        pattern_fn: Pattern,
+        eval_len: int,
+    ) -> np.ndarray:
+        """
+        [일자 x 종목] 청산 마스크 행렬을 생성한다.
+        """
+
+        num_codes = len(self.codes)
+        exit_mask_matrix = np.zeros((eval_len, num_codes), dtype=np.bool_)
+        if eval_len == 0 or not pattern_fn.has_exit_rule():
+            return exit_mask_matrix
+
+        slice_start = self.start_idx
+        if eval_len == len(self.dates):
+            slice_start = 0
+        slice_end = min(len(self.dates), slice_start + eval_len)
+
+        for col_idx in range(num_codes):
+            values = self.prices[:, col_idx]
+            self._prepare_stock_sources(pattern_fn, col_idx)
+            exit_mask = pattern_fn.exit_mask(values)
+            if exit_mask is None:
+                continue
+            exit_mask_matrix[:, col_idx] = np.asarray(
+                exit_mask[slice_start:slice_end],
+                dtype=np.bool_,
+            )
+        return exit_mask_matrix
+
+    def _build_pattern_exit_mask_matrix(
+        self,
+        pattern_name: str,
+        pattern_fn: Pattern,
+    ) -> np.ndarray:
+        """
+        전체 기간 청산 마스크를 생성/캐시한다.
+        """
+
+        if pattern_name in self._pattern_exit_mask_cache:
+            return self._pattern_exit_mask_cache[pattern_name]
+        exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
+        self._pattern_exit_mask_cache[pattern_name] = exit_mask_matrix
+        return exit_mask_matrix
+
+    def _build_dynamic_exit_index_matrix(
+        self,
+        pattern_fn: Pattern,
+        mask_matrix: np.ndarray,
+        slice_start: int,
+        max_horizon: int,
+    ) -> np.ndarray:
+        """
+        진입일별 첫 청산일 인덱스를 [entry_date x code] 형태로 계산한다.
+        """
+
+        exit_index = np.full(mask_matrix.shape, -1, dtype=np.int32)
+        if mask_matrix.size == 0 or max_horizon <= 0:
+            return exit_index
+
+        active_cols = np.flatnonzero(np.any(mask_matrix, axis=0))
+        for col_idx in active_cols:
+            entry_rows = np.flatnonzero(mask_matrix[:, col_idx])
+            if entry_rows.size == 0:
+                continue
+            values = self.prices[:, col_idx]
+            self._prepare_stock_sources(pattern_fn, col_idx)
+            for row in entry_rows:
+                entry_idx = slice_start + int(row)
+                last_idx = min(len(self.dates) - 1, entry_idx + int(max_horizon))
+                exit_idx = pattern_fn.first_exit_index(values, entry_idx, last_idx)
+                if exit_idx > entry_idx:
+                    exit_index[row, col_idx] = int(exit_idx)
+        return exit_index
+
+    def _build_pattern_dynamic_exit_index_matrix(
+        self,
+        pattern_name: str,
+        pattern_fn: Pattern,
+        pattern_mask: np.ndarray,
+        max_horizon: int,
+    ) -> np.ndarray:
+        """
+        run()용 전체 기간 진입별 청산일 인덱스를 생성/캐시한다.
+        """
+
+        cache_key = (pattern_name, int(max_horizon))
+        if cache_key in self._pattern_exit_index_cache:
+            return self._pattern_exit_index_cache[cache_key]
+        exit_index = self._build_dynamic_exit_index_matrix(
+            pattern_fn,
+            pattern_mask,
+            0,
+            max_horizon,
+        )
+        self._pattern_exit_index_cache[cache_key] = exit_index
+        return exit_index
 
     def _accumulate_trim_dates(
         self,
         mask_matrix: np.ndarray,
+        exit_mask: np.ndarray,
+        use_exit_mask: bool,
+        dynamic_exit_index: np.ndarray | None,
         trim_q: float,
         trim_mode: int,
         stats: Stats,
         progress_label: str,
+        progress_bar=None,
     ) -> None:
         """
         날짜별 단면 데이터에 trim 집계를 누적한다.
@@ -994,13 +1512,26 @@ class Backtest:
         if daily_arith is None or daily_geom is None or daily_rise is None:
             raise ValueError("trim 모드에서는 daily 통계 버퍼가 필요합니다.")
 
-        for i_local in tqdm(range(mask_matrix.shape[0]), desc=f"{progress_label} | trim"):
+        iterator = range(mask_matrix.shape[0])
+        if progress_bar is None:
+            iterator = _progress(iterator, desc=f"{progress_label} | trim")
+
+        if dynamic_exit_index is None:
+            dynamic_exit_index = np.full((1, 1), -1, dtype=np.int32)
+        use_dynamic_exit = dynamic_exit_index.shape == mask_matrix.shape
+
+        for i_local in iterator:
             i = self.start_idx + i_local
             _numba_accumulate_trim_for_date(
                 self.prices,
                 mask_matrix[i_local],
                 i,
                 self.horizon_offsets,
+                exit_mask,
+                use_exit_mask,
+                dynamic_exit_index,
+                self.start_idx,
+                use_dynamic_exit,
                 trim_q,
                 trim_mode,
                 stats.counts,
@@ -1012,10 +1543,15 @@ class Backtest:
                 daily_geom,
                 daily_rise,
             )
+            if progress_bar is not None:
+                progress_bar.update(1)
 
     def _accumulate_trim_dates_with_buffers(
         self,
         mask_matrix: np.ndarray,
+        exit_mask: np.ndarray,
+        use_exit_mask: bool,
+        dynamic_exit_index: np.ndarray | None,
         trim_q: float,
         trim_mode: int,
         stats: Stats,
@@ -1023,18 +1559,32 @@ class Backtest:
         daily_arith: np.ndarray,
         daily_geom: np.ndarray,
         daily_rise: np.ndarray,
+        progress_bar=None,
     ) -> None:
         """
         외부 daily 버퍼를 사용해 날짜별 trim 집계를 누적한다.
         """
 
-        for i_local in tqdm(range(mask_matrix.shape[0]), desc=f"{progress_label} | trim"):
+        iterator = range(mask_matrix.shape[0])
+        if progress_bar is None:
+            iterator = _progress(iterator, desc=f"{progress_label} | trim")
+
+        if dynamic_exit_index is None:
+            dynamic_exit_index = np.full((1, 1), -1, dtype=np.int32)
+        use_dynamic_exit = dynamic_exit_index.shape == mask_matrix.shape
+
+        for i_local in iterator:
             i = self.start_idx + i_local
             _numba_accumulate_trim_for_date(
                 self.prices,
                 mask_matrix[i_local],
                 i,
                 self.horizon_offsets,
+                exit_mask,
+                use_exit_mask,
+                dynamic_exit_index,
+                self.start_idx,
+                use_dynamic_exit,
                 trim_q,
                 trim_mode,
                 stats.counts,
@@ -1046,13 +1596,19 @@ class Backtest:
                 daily_geom,
                 daily_rise,
             )
+            if progress_bar is not None:
+                progress_bar.update(1)
 
     def _accumulate_dates(
         self,
         mask_matrix: np.ndarray,
+        exit_mask: np.ndarray,
+        use_exit_mask: bool,
+        dynamic_exit_index: np.ndarray | None,
         stats: Stats,
         progress_label: str,
         write_daily: bool,
+        progress_bar=None,
     ) -> None:
         """
         날짜별 단면 수익률을 trim 없이 누적한다.
@@ -1069,13 +1625,26 @@ class Backtest:
             daily_geom = np.full((1, 1), np.nan, dtype=np.float64)
             daily_rise = np.full((1, 1), np.nan, dtype=np.float64)
 
-        for i_local in tqdm(range(mask_matrix.shape[0]), desc=f"{progress_label} | dates"):
+        iterator = range(mask_matrix.shape[0])
+        if progress_bar is None:
+            iterator = _progress(iterator, desc=f"{progress_label} | dates")
+
+        if dynamic_exit_index is None:
+            dynamic_exit_index = np.full((1, 1), -1, dtype=np.int32)
+        use_dynamic_exit = dynamic_exit_index.shape == mask_matrix.shape
+
+        for i_local in iterator:
             i = self.start_idx + i_local
             _numba_accumulate_for_date(
                 self.prices,
                 mask_matrix[i_local],
                 i,
                 self.horizon_offsets,
+                exit_mask,
+                use_exit_mask,
+                dynamic_exit_index,
+                self.start_idx,
+                use_dynamic_exit,
                 stats.counts,
                 stats.sum_ret,
                 stats.sum_log,
@@ -1086,78 +1655,8 @@ class Backtest:
                 daily_rise,
                 write_daily,
             )
-
-    def _build_filtered_mask_matrix(
-        self,
-        mask_matrix: np.ndarray,
-        *,
-        min_marketcap: float | None,
-        marketcap_top_pct: float | None,
-        cohort_top_n: int | None,
-        top_n_type: str,
-        progress_label: str,
-    ) -> np.ndarray:
-        """
-        analyze 실행 필터를 반영한 [일자 x 종목] 마스크를 생성한다.
-        """
-
-        eval_len, _ = mask_matrix.shape
-        filtered = np.zeros_like(mask_matrix)
-        if eval_len == 0:
-            return filtered
-
-        marketcap_values = None
-        if min_marketcap is not None or marketcap_top_pct is not None:
-            marketcap_values = self._get_marketcap_matrix()
-
-        top_n_values = None
-        if cohort_top_n is not None:
-            top_n_values = self._resolve_top_n_values(top_n_type)
-
-        marketcap_top_threshold = None
-        if marketcap_top_pct is not None:
-            q = 1.0 - float(marketcap_top_pct)
-            marketcap_top_threshold = np.full(eval_len, np.nan, dtype=np.float64)
-            for i_local in range(eval_len):
-                i = self.start_idx + i_local
-                row = marketcap_values[i]
-                valid = row[np.isfinite(row)]
-                if valid.size > 0:
-                    marketcap_top_threshold[i_local] = float(np.quantile(valid, q))
-
-        for i_local in tqdm(range(eval_len), desc=f"{progress_label} | filter"):
-            i = self.start_idx + i_local
-            selected = np.flatnonzero(mask_matrix[i_local])
-            if selected.size == 0:
-                continue
-
-            if min_marketcap is not None:
-                mcap_row = marketcap_values[i, selected]
-                selected = selected[np.isfinite(mcap_row) & (mcap_row >= min_marketcap)]
-                if selected.size == 0:
-                    continue
-
-            if marketcap_top_threshold is not None:
-                threshold = marketcap_top_threshold[i_local]
-                if np.isfinite(threshold):
-                    mcap_row = marketcap_values[i, selected]
-                    selected = selected[np.isfinite(mcap_row) & (mcap_row >= threshold)]
-                else:
-                    selected = selected[:0]
-                if selected.size == 0:
-                    continue
-
-            if cohort_top_n is not None and selected.size > cohort_top_n:
-                ranking_row = top_n_values[i, selected]
-                ranking = np.where(np.isfinite(ranking_row), ranking_row, -np.inf)
-                order = np.argsort(ranking)[::-1]
-                selected = selected[order[:cohort_top_n]]
-                if selected.size == 0:
-                    continue
-
-            filtered[i_local, selected] = True
-
-        return filtered
+            if progress_bar is not None:
+                progress_bar.update(1)
 
     def _run_pattern_trim(
         self,
@@ -1171,8 +1670,11 @@ class Backtest:
         """
 
         stats = Stats.create_daily(self.dates, HORIZONS)
+        stats.eval_start_idx = self.start_idx
+        stats.eval_end_idx = self.end_idx
         eval_len = max(0, self.end_idx - self.start_idx)
         mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
+        exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
         if eval_len > 0:
             stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
                 mask_matrix,
@@ -1180,7 +1682,16 @@ class Backtest:
                 dtype=np.int64,
             )
         trim_mode = _trim_mode_from_method(trim_method)
-        self._accumulate_trim_dates(mask_matrix, trim_q, trim_mode, stats, progress_label)
+        self._accumulate_trim_dates(
+            mask_matrix,
+            exit_mask_matrix,
+            bool(pattern_fn.has_exit_rule()),
+            None,
+            trim_q,
+            trim_mode,
+            stats,
+            progress_label,
+        )
         return stats
 
     def _run_pattern_filtered(
@@ -1190,13 +1701,10 @@ class Backtest:
         trim_method: str,
         progress_label: str,
         aggregation_mode: str,
-        min_marketcap: float | None,
-        marketcap_top_pct: float | None,
-        cohort_top_n: int | None,
-        top_n_type: str,
+        filter_obj: Filter,
     ) -> Stats:
         """
-        실행 필터를 반영해 패턴 통계를 계산한다.
+        analyze(filter=...)를 반영해 패턴 통계를 계산한다.
         """
 
         agg_mode = _normalize_analyze_by(aggregation_mode)
@@ -1204,62 +1712,246 @@ class Backtest:
         trim_method_text = _normalize_trim_method(trim_method)
 
         eval_len = max(0, self.end_idx - self.start_idx)
-        raw_mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
-        mask_matrix = self._build_filtered_mask_matrix(
-            raw_mask_matrix,
-            min_marketcap=min_marketcap,
-            marketcap_top_pct=marketcap_top_pct,
-            cohort_top_n=cohort_top_n,
-            top_n_type=top_n_type,
-            progress_label=progress_label,
-        )
+        filter_mask = filter_obj.mask_matrix()
+        eval_filter_mask = None if filter_mask is None else filter_mask[self.start_idx:self.end_idx]
+        allowed_cols = None if eval_filter_mask is None else np.any(eval_filter_mask, axis=0)
+        exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
+        use_exit_mask = bool(pattern_fn.has_exit_rule())
+        progress_bar = None
+        if eval_len > 0:
+            progress_bar = _progress(total=eval_len + 1, desc=f"{progress_label} | prepare")
+        try:
+            raw_mask_matrix = self._build_mask_matrix(
+                pattern_fn,
+                eval_len,
+                allowed_cols=allowed_cols,
+                prefilter_mask=eval_filter_mask,
+            )
+            if progress_bar is not None:
+                progress_bar.update(1)
+                progress_bar.set_description_str(progress_label)
+            mask_matrix = raw_mask_matrix
 
-        if agg_mode == AGG_MODE_DAY:
-            stats = Stats.create_daily(self.dates, HORIZONS)
+            if agg_mode == AGG_MODE_DAY:
+                stats = Stats.create_daily(self.dates, HORIZONS)
+                stats.eval_start_idx = self.start_idx
+                stats.eval_end_idx = self.end_idx
+                if eval_len > 0:
+                    stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
+                        mask_matrix,
+                        axis=1,
+                        dtype=np.int64,
+                    )
+                if trim_q is None or trim_q <= 0.0:
+                    self._accumulate_dates(
+                        mask_matrix,
+                        exit_mask_matrix,
+                        use_exit_mask,
+                        None,
+                        stats,
+                        progress_label,
+                        write_daily=True,
+                        progress_bar=progress_bar,
+                    )
+                    return stats
+
+                trim_mode = _trim_mode_from_method(trim_method_text)
+                self._accumulate_trim_dates(
+                    mask_matrix,
+                    exit_mask_matrix,
+                    use_exit_mask,
+                    None,
+                    trim_q,
+                    trim_mode,
+                    stats,
+                    progress_label,
+                    progress_bar=progress_bar,
+                )
+                return stats
+
+            stats = Stats.create(self.dates, HORIZONS)
+            stats.eval_start_idx = self.start_idx
+            stats.eval_end_idx = self.end_idx
             if eval_len > 0:
                 stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
                     mask_matrix,
                     axis=1,
                     dtype=np.int64,
                 )
+
             if trim_q is None or trim_q <= 0.0:
-                self._accumulate_dates(mask_matrix, stats, progress_label, write_daily=True)
+                self._accumulate_dates(
+                    mask_matrix,
+                    exit_mask_matrix,
+                    use_exit_mask,
+                    None,
+                    stats,
+                    progress_label,
+                    write_daily=False,
+                    progress_bar=progress_bar,
+                )
                 return stats
 
+            # event 모드에서도 trim 적용을 위해 외부 daily 버퍼를 임시 생성한다.
+            num_h = len(HORIZONS)
+            num_dates = len(self.dates)
+            tmp_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+            tmp_daily_geom = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+            tmp_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
             trim_mode = _trim_mode_from_method(trim_method_text)
-            self._accumulate_trim_dates(mask_matrix, trim_q, trim_mode, stats, progress_label)
-            return stats
-
-        stats = Stats.create(self.dates, HORIZONS)
-        if eval_len > 0:
-            stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
+            self._accumulate_trim_dates_with_buffers(
                 mask_matrix,
-                axis=1,
-                dtype=np.int64,
+                exit_mask_matrix,
+                use_exit_mask,
+                None,
+                trim_q,
+                trim_mode,
+                stats,
+                progress_label,
+                tmp_daily_arith,
+                tmp_daily_geom,
+                tmp_daily_rise,
+                progress_bar=progress_bar,
             )
-
-        if trim_q is None or trim_q <= 0.0:
-            self._accumulate_dates(mask_matrix, stats, progress_label, write_daily=False)
             return stats
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
-        # event 모드에서도 trim 적용을 위해 외부 daily 버퍼를 임시 생성한다.
-        num_h = len(HORIZONS)
-        num_dates = len(self.dates)
-        tmp_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
-        tmp_daily_geom = np.full((num_h, num_dates), np.nan, dtype=np.float64)
-        tmp_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
-        trim_mode = _trim_mode_from_method(trim_method_text)
-        self._accumulate_trim_dates_with_buffers(
-            mask_matrix,
-            trim_q,
-            trim_mode,
-            stats,
-            progress_label,
-            tmp_daily_arith,
-            tmp_daily_geom,
-            tmp_daily_rise,
-        )
-        return stats
+    def _run_pattern_dynamic(
+        self,
+        pattern_fn: Pattern,
+        trim_quantile: float | None,
+        trim_method: str,
+        progress_label: str,
+        aggregation_mode: str,
+        filter_obj: Filter | None,
+    ) -> Stats:
+        """
+        진입시점 의존형 청산 규칙(trailing stop 등)을 반영해 통계를 계산한다.
+        """
+
+        agg_mode = _normalize_analyze_by(aggregation_mode)
+        trim_q = _normalize_trim_quantile(trim_quantile)
+        trim_method_text = _normalize_trim_method(trim_method)
+
+        eval_len = max(0, self.end_idx - self.start_idx)
+        eval_filter_mask = None
+        allowed_cols = None
+        if filter_obj is not None and filter_obj.is_active:
+            filter_mask = filter_obj.mask_matrix()
+            eval_filter_mask = None if filter_mask is None else filter_mask[self.start_idx:self.end_idx]
+            allowed_cols = None if eval_filter_mask is None else np.any(eval_filter_mask, axis=0)
+
+        progress_bar = None
+        if eval_len > 0:
+            progress_bar = _progress(total=eval_len + 2, desc=f"{progress_label} | prepare")
+        try:
+            mask_matrix = self._build_mask_matrix(
+                pattern_fn,
+                eval_len,
+                allowed_cols=allowed_cols,
+                prefilter_mask=eval_filter_mask,
+            )
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+            exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
+            use_static_exit_mask = bool(np.any(exit_mask_matrix))
+            dynamic_exit_index = self._build_dynamic_exit_index_matrix(
+                pattern_fn,
+                mask_matrix,
+                self.start_idx,
+                int(np.max(self.horizon_offsets)),
+            )
+            if progress_bar is not None:
+                progress_bar.update(1)
+                progress_bar.set_description_str(progress_label)
+
+            if agg_mode == AGG_MODE_DAY:
+                stats = Stats.create_daily(self.dates, HORIZONS)
+                stats.eval_start_idx = self.start_idx
+                stats.eval_end_idx = self.end_idx
+                if eval_len > 0:
+                    stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
+                        mask_matrix,
+                        axis=1,
+                        dtype=np.int64,
+                    )
+                if trim_q is None or trim_q <= 0.0:
+                    self._accumulate_dates(
+                        mask_matrix,
+                        exit_mask_matrix,
+                        use_static_exit_mask,
+                        dynamic_exit_index,
+                        stats,
+                        progress_label,
+                        write_daily=True,
+                        progress_bar=progress_bar,
+                    )
+                    return stats
+
+                trim_mode = _trim_mode_from_method(trim_method_text)
+                self._accumulate_trim_dates(
+                    mask_matrix,
+                    exit_mask_matrix,
+                    use_static_exit_mask,
+                    dynamic_exit_index,
+                    trim_q,
+                    trim_mode,
+                    stats,
+                    progress_label,
+                    progress_bar=progress_bar,
+                )
+                return stats
+
+            stats = Stats.create(self.dates, HORIZONS)
+            stats.eval_start_idx = self.start_idx
+            stats.eval_end_idx = self.end_idx
+            if eval_len > 0:
+                stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
+                    mask_matrix,
+                    axis=1,
+                    dtype=np.int64,
+                )
+
+            if trim_q is None or trim_q <= 0.0:
+                self._accumulate_dates(
+                    mask_matrix,
+                    exit_mask_matrix,
+                    use_static_exit_mask,
+                    dynamic_exit_index,
+                    stats,
+                    progress_label,
+                    write_daily=False,
+                    progress_bar=progress_bar,
+                )
+                return stats
+
+            num_h = len(HORIZONS)
+            num_dates = len(self.dates)
+            tmp_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+            tmp_daily_geom = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+            tmp_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+            trim_mode = _trim_mode_from_method(trim_method_text)
+            self._accumulate_trim_dates_with_buffers(
+                mask_matrix,
+                exit_mask_matrix,
+                use_static_exit_mask,
+                dynamic_exit_index,
+                trim_q,
+                trim_mode,
+                stats,
+                progress_label,
+                tmp_daily_arith,
+                tmp_daily_geom,
+                tmp_daily_rise,
+                progress_bar=progress_bar,
+            )
+            return stats
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
     def _run_pattern(
         self,
@@ -1268,10 +1960,7 @@ class Backtest:
         trim_method: str = "remove",
         progress_label: str = "pattern",
         aggregation_mode: str = AGG_MODE_EVENT,
-        min_marketcap: float | None = None,
-        marketcap_top_pct: float | None = None,
-        cohort_top_n: int | None = None,
-        top_n_type: str = "marketcap",
+        filter_obj: Filter | None = None,
     ) -> Stats:
         """
         패턴 trim 설정에 따라 normal/trim 실행 경로를 선택한다.
@@ -1281,27 +1970,23 @@ class Backtest:
         agg_mode = _normalize_analyze_by(aggregation_mode)
         trim_q = _normalize_trim_quantile(trim_quantile)
         trim_method_text = _normalize_trim_method(trim_method)
-        min_marketcap_value = _normalize_min_marketcap_for_filter(min_marketcap)
-        marketcap_top_pct_value = _normalize_marketcap_top_pct_for_filter(marketcap_top_pct)
-        top_n_value = _normalize_cohort_top_n_for_filter(cohort_top_n)
-        top_n_type_value = _normalize_top_n_type_for_filter(top_n_type)
-
-        has_filter = (
-            min_marketcap_value is not None
-            or marketcap_top_pct_value is not None
-            or top_n_value is not None
-        )
-        if has_filter:
+        if pattern_fn.has_entry_dependent_exit():
+            return self._run_pattern_dynamic(
+                pattern_fn,
+                trim_quantile=trim_q,
+                trim_method=trim_method_text,
+                progress_label=progress_label,
+                aggregation_mode=agg_mode,
+                filter_obj=filter_obj,
+            )
+        if filter_obj is not None and filter_obj.is_active:
             return self._run_pattern_filtered(
                 pattern_fn,
                 trim_quantile=trim_q,
                 trim_method=trim_method_text,
                 progress_label=progress_label,
                 aggregation_mode=agg_mode,
-                min_marketcap=min_marketcap_value,
-                marketcap_top_pct=marketcap_top_pct_value,
-                cohort_top_n=top_n_value,
-                top_n_type=top_n_type_value,
+                filter_obj=filter_obj,
             )
 
         if agg_mode == AGG_MODE_EVENT:
@@ -1410,24 +2095,54 @@ class Backtest:
             names.append(text if text else code)
         return names
 
-    def _build_pattern_mask_matrix(self, pattern_name: str, pattern_fn: Pattern) -> np.ndarray:
+    def _prepare_filter(self, filter_obj: Filter | None, show_progress: bool) -> Filter | None:
+        """
+        analyze(filter=...)로 전달된 Filter를 현재 Backtest 축에 바인딩하고 준비한다.
+        """
+
+        if filter_obj is None:
+            return None
+        if not isinstance(filter_obj, Filter):
+            raise TypeError("filter는 Filter 객체여야 합니다.")
+        if not filter_obj.is_active:
+            return None
+        filter_obj.bind(
+            dates=self.dates,
+            codes=self.codes,
+            prices=self.prices,
+            db_mode=self.db_mode,
+            univ=self.univ,
+        )
+        filter_obj.prepare(show_progress=show_progress)
+        return filter_obj
+
+    def _build_pattern_mask_matrix(
+        self,
+        pattern_name: str,
+        pattern_fn: Pattern,
+        filter_obj: Filter | None = None,
+    ) -> np.ndarray:
         """
         전체 기간 패턴 마스크를 생성/캐시한다.
         """
 
-        if pattern_name in self._pattern_mask_cache:
-            return self._pattern_mask_cache[pattern_name]
+        cache_key = (pattern_name, bool(filter_obj is not None and filter_obj.is_active))
+        if cache_key in self._pattern_mask_cache:
+            return self._pattern_mask_cache[cache_key]
 
         self._prepare_market_sources(pattern_fn)
-        num_dates, num_codes = self.prices.shape
-        mask_matrix = np.zeros((num_dates, num_codes), dtype=np.bool_)
-        for col_idx, code in enumerate(tqdm(self.codes, desc=f"{pattern_name} | mask")):
-            values = self.prices[:, col_idx]
-            mask = self._compute_mask(pattern_fn, values, code)
-            if mask is None:
-                continue
-            mask_matrix[:, col_idx] = mask
-        self._pattern_mask_cache[pattern_name] = mask_matrix
+        full_filter_mask = None
+        allowed_cols = None
+        if filter_obj is not None and filter_obj.is_active:
+            full_filter_mask = filter_obj.mask_matrix()
+            allowed_cols = None if full_filter_mask is None else np.any(full_filter_mask, axis=0)
+        mask_matrix = self._build_mask_matrix(
+            pattern_fn,
+            eval_len=len(self.dates),
+            allowed_cols=allowed_cols,
+            prefilter_mask=full_filter_mask,
+        )
+        self._pattern_mask_cache[cache_key] = mask_matrix
         return mask_matrix
 
     def _all_stock_history_metrics(
@@ -1533,35 +2248,6 @@ class Backtest:
         self._all_stock_geom_cache[cache_key] = geom_asof
         return geom_asof
 
-    def _get_marketcap_matrix(self) -> np.ndarray:
-        """
-        시가총액 wide 테이블을 백테스트 날짜/종목 축에 맞춰 정렬해 반환한다.
-        """
-
-        if self._marketcap_matrix is None:
-            mcap_df = _load_stock_field_table("marketcap", self.db_mode)
-            aligned = mcap_df.reindex(
-                index=pd.DatetimeIndex(self.dates),
-                columns=pd.Index(self.codes, dtype="object"),
-            )
-            self._marketcap_matrix = aligned.to_numpy(dtype=np.float64, copy=True)
-        return self._marketcap_matrix
-
-    def _get_liquidity_matrix(self, window: int = 20) -> np.ndarray:
-        """
-        거래대금 기준 유동성(ADV) 매트릭스를 날짜/종목 축으로 반환한다.
-        """
-
-        if self._liquidity_matrix is None:
-            amount_df = _load_stock_field_table("amount", self.db_mode)
-            aligned = amount_df.reindex(
-                index=pd.DatetimeIndex(self.dates),
-                columns=pd.Index(self.codes, dtype="object"),
-            )
-            adv = aligned.rolling(window=int(window), min_periods=1).mean()
-            self._liquidity_matrix = adv.to_numpy(dtype=np.float64, copy=True)
-        return self._liquidity_matrix
-
     def _get_vwap_matrix(self) -> np.ndarray:
         """
         매매 체결/평가용 VWAP(= (open+high+low+close)/4) 매트릭스를 반환한다.
@@ -1571,10 +2257,10 @@ class Backtest:
             idx = pd.DatetimeIndex(self.dates)
             cols = pd.Index(self.codes, dtype="object")
 
-            open_df = _load_stock_field_table("open", self.db_mode).reindex(index=idx, columns=cols)
-            high_df = _load_stock_field_table("high", self.db_mode).reindex(index=idx, columns=cols)
-            low_df = _load_stock_field_table("low", self.db_mode).reindex(index=idx, columns=cols)
-            close_df = _load_stock_field_table("close", self.db_mode).reindex(index=idx, columns=cols)
+            open_df = _load_stock_field_table("open", self.db_mode, self.univ).reindex(index=idx, columns=cols)
+            high_df = _load_stock_field_table("high", self.db_mode, self.univ).reindex(index=idx, columns=cols)
+            low_df = _load_stock_field_table("low", self.db_mode, self.univ).reindex(index=idx, columns=cols)
+            close_df = _load_stock_field_table("close", self.db_mode, self.univ).reindex(index=idx, columns=cols)
             vwap_df = (open_df + high_df + low_df + close_df) / 4.0
             self._vwap_matrix = vwap_df.to_numpy(dtype=np.float64, copy=True)
         return self._vwap_matrix
@@ -1593,39 +2279,6 @@ class Backtest:
             return self._get_vwap_matrix(), 1, "next_vwap"
         raise ValueError("trade_price_mode은 '당일종가'/'익일종가'/'익일VWAP' 중 하나여야 합니다.")
 
-    def _resolve_top_n_values(self, top_n_type: str) -> np.ndarray:
-        """
-        top_n_type에 해당하는 단면 랭킹 매트릭스를 반환한다.
-        """
-
-        key = str(top_n_type).strip().lower()
-        if key == "marketcap":
-            return self._get_marketcap_matrix()
-        if key == "liquidity":
-            return self._get_liquidity_matrix(window=20)
-        if key == "marketcap+liquidity":
-            mcap = self._get_marketcap_matrix()
-            liquidity = self._get_liquidity_matrix(window=20)
-
-            mcap_rank = pd.DataFrame(mcap).rank(
-                axis=1,
-                method="average",
-                ascending=False,
-                na_option="keep",
-            )
-            liquidity_rank = pd.DataFrame(liquidity).rank(
-                axis=1,
-                method="average",
-                ascending=False,
-                na_option="keep",
-            )
-            # 랭크 숫자가 작을수록 우수하므로 음수로 뒤집어 점수화한다.
-            score = -0.5 * mcap_rank.to_numpy(dtype=np.float64) - 0.5 * liquidity_rank.to_numpy(
-                dtype=np.float64
-            )
-            return score
-        raise ValueError("top_n_type은 'marketcap', 'liquidity', 'marketcap+liquidity'만 지원합니다.")
-
     def screen(
         self,
         date,
@@ -1640,14 +2293,23 @@ class Backtest:
         pattern_name, pattern_fn, cache_allowed = self._resolve_screen_pattern(pattern)
 
         row_mask = np.zeros(len(self.codes), dtype=np.bool_)
+        filter_obj = self._analyzed_filters.get(pattern_name) if cache_allowed else None
+        filter_row = None if filter_obj is None else filter_obj.mask_matrix()[date_idx]
         use_cache_now = bool(use_cache and cache_allowed)
         if use_cache_now:
-            mask_matrix = self._build_pattern_mask_matrix(pattern_name, pattern_fn)
+            mask_matrix = self._build_pattern_mask_matrix(
+                pattern_name,
+                pattern_fn,
+                filter_obj=filter_obj,
+            )
             row_mask = np.asarray(mask_matrix[date_idx], dtype=np.bool_)
         else:
             self._prepare_market_sources(pattern_fn)
             for col_idx, code in enumerate(self.codes):
+                if filter_row is not None and not filter_row[col_idx]:
+                    continue
                 values = self.prices[:, col_idx]
+                self._prepare_stock_sources(pattern_fn, col_idx)
                 mask = self._compute_mask(pattern_fn, values, code)
                 if mask is None:
                     continue
@@ -1665,46 +2327,12 @@ class Backtest:
             index=pd.Index(selected_codes, name="code"),
         )
 
-    def _resolve_effective_run_filters(
-        self,
-        pattern: str,
-        min_marketcap: float | None,
-        marketcap_top_pct: float | None,
-        cohort_top_n: int | None,
-        top_n_type: str | None,
-    ) -> tuple[float | None, float | None, int | None, str]:
+    def _pattern_filter(self, pattern: str) -> Filter | None:
         """
-        run/diagnose 공통: analyze 설정 상속을 반영한 실행 필터를 정규화한다.
+        analyze 결과 패턴명에 연결된 Filter를 반환한다.
         """
 
-        analyzed_filter_config = self._analyzed_filter_configs.get(
-            pattern,
-            AnalyzeFilterConfig(
-                min_marketcap=None,
-                marketcap_top_pct=None,
-                cohort_top_n=None,
-                top_n_type="marketcap",
-            ),
-        )
-        effective_min_marketcap = (
-            analyzed_filter_config.min_marketcap if min_marketcap is None else min_marketcap
-        )
-        effective_marketcap_top_pct = (
-            analyzed_filter_config.marketcap_top_pct
-            if marketcap_top_pct is None
-            else marketcap_top_pct
-        )
-        effective_cohort_top_n = (
-            analyzed_filter_config.cohort_top_n if cohort_top_n is None else cohort_top_n
-        )
-        effective_top_n_type = (
-            analyzed_filter_config.top_n_type if top_n_type is None else top_n_type
-        )
-        min_marketcap_value = _normalize_min_marketcap_for_filter(effective_min_marketcap)
-        marketcap_top_pct_value = _normalize_marketcap_top_pct_for_filter(effective_marketcap_top_pct)
-        top_n_value = _normalize_cohort_top_n_for_filter(effective_cohort_top_n)
-        top_n_type_value = _normalize_top_n_type_for_filter(effective_top_n_type)
-        return min_marketcap_value, marketcap_top_pct_value, top_n_value, top_n_type_value
+        return self._analyzed_filters.get(pattern)
 
     @staticmethod
     def _gate_full_cohort(
@@ -1857,7 +2485,7 @@ class Backtest:
         end=None,
         pattern: str = "",
         target_horizon: str | int = "1M",
-        aggregate_lookback: int | str = 252,
+        aggregate_lookback: int | str = TRADING_DAYS_PER_YEAR,
         trade_price_mode: str = "익일VWAP",
         fallback_exposure: float = 0.5,
         gate_geom_min: float = 0.0,
@@ -1873,7 +2501,6 @@ class Backtest:
     ) -> Simulator:
         """
         분석된 패턴 통계를 기반으로 포트폴리오 시뮬레이션을 실행한다.
-        실행 필터는 analyze() 시점의 동일 패턴 필터 설정을 자동 상속한다.
         """
         # 1) 입력 파라미터를 내부 인덱스/거래일 단위로 정규화
         if pattern not in self._analyzed_patterns or pattern not in self._analyzed_stats:
@@ -1882,24 +2509,6 @@ class Backtest:
                 f"analyze() 결과에서 pattern '{pattern}'을 찾을 수 없습니다. "
                 f"사용 가능: {available}"
             )
-        if pattern not in self._analyzed_filter_configs:
-            raise ValueError(
-                "run()은 analyze() 실행 이후 호출해야 합니다. "
-                "해당 pattern의 analyze 필터 설정을 찾을 수 없습니다."
-            )
-
-        (
-            min_marketcap_value,
-            marketcap_top_pct_value,
-            top_n,
-            top_n_type_value,
-        ) = self._resolve_effective_run_filters(
-            pattern,
-            min_marketcap=None,
-            marketcap_top_pct=None,
-            cohort_top_n=None,
-            top_n_type=None,
-        )
 
         horizon_label, horizon_days = self._resolve_horizon(target_horizon)
         lookback_window = _parse_lookback_window(aggregate_lookback)
@@ -1918,7 +2527,21 @@ class Backtest:
         # 2) 패턴/시장 통계 시계열 준비
         pattern_fn = self._analyzed_patterns[pattern]
         pattern_stats = self._analyzed_stats[pattern]
-        pattern_mask = self._build_pattern_mask_matrix(pattern, pattern_fn)
+        pattern_filter = self._pattern_filter(pattern)
+        pattern_mask = self._build_pattern_mask_matrix(
+            pattern,
+            pattern_fn,
+            filter_obj=pattern_filter,
+        )
+        pattern_exit_mask = self._build_pattern_exit_mask_matrix(pattern, pattern_fn)
+        pattern_dynamic_exit_index = None
+        if pattern_fn.has_entry_dependent_exit():
+            pattern_dynamic_exit_index = self._build_pattern_dynamic_exit_index_matrix(
+                pattern,
+                pattern_fn,
+                pattern_mask,
+                horizon_days,
+            )
 
         pattern_hist = pattern_stats.to_frame_history(
             horizon=horizon_label,
@@ -1942,12 +2565,6 @@ class Backtest:
             all_stock_geom_series,
             all_stock_rise_series,
         ) = self._all_stock_history_metrics(horizon_days, lookback_window)
-        top_n_values = self._resolve_top_n_values(top_n_type_value) if top_n is not None else None
-        marketcap_values = (
-            self._get_marketcap_matrix()
-            if (min_marketcap_value is not None or marketcap_top_pct_value is not None)
-            else None
-        )
         if self.code_names:
             code_names = dict(self.code_names)
         else:
@@ -1976,6 +2593,8 @@ class Backtest:
             target_horizon_days=horizon_days,
             aggregate_lookback=aggregate_lookback,
             pattern_mask=pattern_mask,
+            pattern_exit_mask=pattern_exit_mask,
+            pattern_dynamic_exit_index=pattern_dynamic_exit_index,
             pattern_arith_series=pattern_arith_series,
             pattern_geom_series=pattern_geom_series,
             pattern_rise_series=pattern_rise_series,
@@ -1991,12 +2610,6 @@ class Backtest:
             gate_use_rise=gate_use_rise,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
-            marketcap_values=marketcap_values,
-            min_marketcap=min_marketcap_value,
-            marketcap_top_pct=marketcap_top_pct_value,
-            top_n_values=top_n_values,
-            cohort_top_n=top_n,
-            top_n_type=top_n_type_value,
             execution_lag_days=execution_lag_days,
             execution_price_mode=execution_price_mode,
             allow_reentry=allow_reentry,
@@ -2010,7 +2623,7 @@ class Backtest:
         start=None,
         end=None,
         target_horizon: str | int = "1M",
-        aggregate_lookback: int | str = 252,
+        aggregate_lookback: int | str = TRADING_DAYS_PER_YEAR,
         trade_price_mode: str = "익일VWAP",
         gate_geom_min: float = 0.0,
         gate_arith_min: float = 0.0,
@@ -2030,19 +2643,6 @@ class Backtest:
                 f"analyze() 결과에서 pattern '{pattern}'을 찾을 수 없습니다. "
                 f"사용 가능: {available}"
             )
-
-        (
-            min_marketcap_value,
-            marketcap_top_pct_value,
-            top_n,
-            top_n_type_value,
-        ) = self._resolve_effective_run_filters(
-            pattern,
-            min_marketcap=None,
-            marketcap_top_pct=None,
-            cohort_top_n=None,
-            top_n_type=None,
-        )
         min_cohort_size_value = int(min_cohort_size)
         if min_cohort_size_value <= 0:
             raise ValueError("min_cohort_size는 1 이상의 정수여야 합니다.")
@@ -2081,7 +2681,12 @@ class Backtest:
 
         pattern_fn = self._analyzed_patterns[pattern]
         pattern_stats = self._analyzed_stats[pattern]
-        pattern_mask = self._build_pattern_mask_matrix(pattern, pattern_fn)
+        pattern_filter = self._pattern_filter(pattern)
+        pattern_mask = self._build_pattern_mask_matrix(
+            pattern,
+            pattern_fn,
+            filter_obj=pattern_filter,
+        )
         trade_prices, lag_days, _ = self._resolve_trade_price_mode(trade_price_mode)
 
         pattern_hist = pattern_stats.to_frame_history(
@@ -2107,22 +2712,6 @@ class Backtest:
             all_stock_rise_series,
         ) = self._all_stock_history_metrics(horizon_days, lookback_window)
 
-        top_n_values = self._resolve_top_n_values(top_n_type_value) if top_n is not None else None
-        marketcap_values = (
-            self._get_marketcap_matrix()
-            if (min_marketcap_value is not None or marketcap_top_pct_value is not None)
-            else None
-        )
-        marketcap_top_threshold = None
-        if marketcap_top_pct_value is not None:
-            q = 1.0 - marketcap_top_pct_value
-            marketcap_top_threshold = np.full(len(self.dates), np.nan, dtype=np.float64)
-            for i in range(len(self.dates)):
-                row = marketcap_values[i]
-                valid = row[np.isfinite(row)]
-                if valid.size > 0:
-                    marketcap_top_threshold[i] = float(np.quantile(valid, q))
-
         rows: list[dict[str, object]] = []
         for t in range(start_idx, end_idx - 1):
             signal_idx = t if lag_days == 1 else (t + 1)
@@ -2135,25 +2724,6 @@ class Backtest:
                 continue
 
             selected = np.where(pattern_mask[signal_idx])[0]
-            if min_marketcap_value is not None and selected.size > 0:
-                if marketcap_values is None:
-                    raise ValueError("min_marketcap 사용 시 marketcap_values 배열이 필요합니다.")
-                mcap_row = marketcap_values[signal_idx, selected]
-                selected = selected[np.isfinite(mcap_row) & (mcap_row >= min_marketcap_value)]
-            if marketcap_top_threshold is not None and selected.size > 0:
-                threshold = marketcap_top_threshold[signal_idx]
-                if np.isfinite(threshold):
-                    mcap_row = marketcap_values[signal_idx, selected]
-                    selected = selected[np.isfinite(mcap_row) & (mcap_row >= threshold)]
-                else:
-                    selected = selected[:0]
-            if top_n is not None and selected.size > top_n:
-                if top_n_values is None:
-                    raise ValueError("cohort_top_n 사용 시 top_n_values 배열이 필요합니다.")
-                ranking_row = top_n_values[signal_idx, selected]
-                ranking = np.where(np.isfinite(ranking_row), ranking_row, -np.inf)
-                order = np.argsort(ranking)[::-1]
-                selected = selected[order[:top_n]]
             if selected.size < min_cohort_size_value:
                 continue
 
@@ -2306,91 +2876,20 @@ class Backtest:
         self,
         *patterns: Pattern,
         include_base: bool = True,
-        by: str = AGG_MODE_DAY,
-        min_marketcap: float | None = None,
-        marketcap_top_pct: float | None = None,
-        cohort_top_n: int | None = None,
-        top_n_type: str = "marketcap",
+        filter: Filter | None = None,
     ) -> StatsCollection:
         """
         패턴들을 평가해 StatsCollection 결과를 생성한다.
         """
 
-        aggregation_mode = _normalize_analyze_by(by)
-        min_marketcap_value = _normalize_min_marketcap_for_filter(min_marketcap)
-        marketcap_top_pct_value = _normalize_marketcap_top_pct_for_filter(marketcap_top_pct)
-        cohort_top_n_value = _normalize_cohort_top_n_for_filter(cohort_top_n)
-        top_n_type_value = _normalize_top_n_type_for_filter(top_n_type)
-        has_filter = (
-            min_marketcap_value is not None
-            or marketcap_top_pct_value is not None
-            or cohort_top_n_value is not None
-        )
-        benchmark_filter_enabled = bool(has_filter)
-        analyze_filter_config = AnalyzeFilterConfig(
-            min_marketcap=min_marketcap_value,
-            marketcap_top_pct=marketcap_top_pct_value,
-            cohort_top_n=cohort_top_n_value,
-            top_n_type=top_n_type_value,
-        )
-
-        if not patterns and include_base and self.benchmark is not None:
-            if aggregation_mode == AGG_MODE_EVENT and not benchmark_filter_enabled:
-                base_stats_map = dict(self._base_stats)
-            else:
-                base_name = _infer_pattern_label(self.benchmark, 0)
-                base_trim_q, base_trim_method = _infer_pattern_trim_config(self.benchmark)
-                base_stats = self._run_pattern(
-                    self.benchmark,
-                    trim_quantile=base_trim_q,
-                    trim_method=base_trim_method,
-                    progress_label=base_name,
-                    aggregation_mode=aggregation_mode,
-                    min_marketcap=min_marketcap_value if benchmark_filter_enabled else None,
-                    marketcap_top_pct=marketcap_top_pct_value if benchmark_filter_enabled else None,
-                    cohort_top_n=cohort_top_n_value if benchmark_filter_enabled else None,
-                    top_n_type=top_n_type_value,
-                )
-                base_stats_map = {base_name: base_stats}
-                self._analyzed_patterns[base_name] = self.benchmark
-                self._analyzed_stats[base_name] = base_stats
-
-            result = StatsCollection(
-                base_stats_map,
-                benchmark_names=set(base_stats_map.keys()),
-            )
-            for base_name in base_stats_map:
-                self._analyzed_filter_configs[base_name] = analyze_filter_config
-            self._last_stats_collection = result
-            return result
+        aggregation_mode = self.by
+        analyze_filter = self._prepare_filter(filter, show_progress=True)
 
         stats_map: Dict[str, Stats] = {}
         benchmark_names: set[str] = set()
         if include_base and self.benchmark is not None:
-            if aggregation_mode == AGG_MODE_EVENT and not benchmark_filter_enabled:
-                stats_map.update(self._base_stats)
-                benchmark_names = set(self._base_stats.keys())
-                for base_name in benchmark_names:
-                    self._analyzed_filter_configs[base_name] = analyze_filter_config
-            else:
-                base_name = _infer_pattern_label(self.benchmark, 0)
-                base_trim_q, base_trim_method = _infer_pattern_trim_config(self.benchmark)
-                base_stats = self._run_pattern(
-                    self.benchmark,
-                    trim_quantile=base_trim_q,
-                    trim_method=base_trim_method,
-                    progress_label=base_name,
-                    aggregation_mode=aggregation_mode,
-                    min_marketcap=min_marketcap_value if benchmark_filter_enabled else None,
-                    marketcap_top_pct=marketcap_top_pct_value if benchmark_filter_enabled else None,
-                    cohort_top_n=cohort_top_n_value if benchmark_filter_enabled else None,
-                    top_n_type=top_n_type_value,
-                )
-                stats_map[base_name] = base_stats
-                benchmark_names = {base_name}
-                self._analyzed_patterns[base_name] = self.benchmark
-                self._analyzed_stats[base_name] = base_stats
-                self._analyzed_filter_configs[base_name] = analyze_filter_config
+            stats_map.update(self._base_stats)
+            benchmark_names.update(self._base_stats.keys())
 
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
             if not isinstance(pattern_fn, Pattern):
@@ -2403,10 +2902,7 @@ class Backtest:
                 trim_method=trim_method,
                 progress_label=base_name,
                 aggregation_mode=aggregation_mode,
-                min_marketcap=min_marketcap_value,
-                marketcap_top_pct=marketcap_top_pct_value,
-                cohort_top_n=cohort_top_n_value,
-                top_n_type=top_n_type_value,
+                filter_obj=analyze_filter,
             )
             name = base_name
             suffix = 2
@@ -2416,8 +2912,13 @@ class Backtest:
             stats_map[name] = stats
             self._analyzed_patterns[name] = pattern_fn
             self._analyzed_stats[name] = stats
-            self._analyzed_filter_configs[name] = analyze_filter_config
-            self._pattern_mask_cache.pop(name, None)
+            self._analyzed_filters[name] = analyze_filter
+            self._pattern_mask_cache.pop((name, False), None)
+            self._pattern_mask_cache.pop((name, True), None)
+            self._pattern_exit_mask_cache.pop(name, None)
+            for cache_key in list(self._pattern_exit_index_cache):
+                if cache_key[0] == name:
+                    self._pattern_exit_index_cache.pop(cache_key, None)
 
         if not stats_map:
             raise ValueError("실행된 패턴이 없습니다.")

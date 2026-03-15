@@ -128,6 +128,178 @@ def rolling_mean(values: np.ndarray, window: int):
 
 
 @njit(cache=True)
+def money_flow_index(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    window: int,
+):
+    """
+    Money Flow Index(MFI)를 계산한다.
+
+    - Typical Price = (High + Low + Close) / 3
+    - Raw Money Flow = Typical Price * Volume
+    - window 구간의 Positive / Negative Money Flow 합으로 MFI를 만든다.
+    """
+    n = close.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    valid_end = np.zeros(n, dtype=np.bool_)
+    out[:] = np.nan
+    if window <= 0 or n == 0:
+        return out, valid_end
+
+    typical = np.empty(n, dtype=np.float64)
+    typical[:] = np.nan
+    raw_flow = np.zeros(n, dtype=np.float64)
+    valid_bar = np.zeros(n, dtype=np.bool_)
+    for i in range(n):
+        h = high[i]
+        l = low[i]
+        c = close[i]
+        v = volume[i]
+        if (
+            np.isfinite(h) and h > 0.0
+            and np.isfinite(l) and l > 0.0
+            and np.isfinite(c) and c > 0.0
+            and np.isfinite(v) and v >= 0.0
+        ):
+            typical[i] = (h + l + c) / 3.0
+            raw_flow[i] = typical[i] * v
+            valid_bar[i] = True
+
+    pos_flow = np.zeros(n, dtype=np.float64)
+    neg_flow = np.zeros(n, dtype=np.float64)
+    valid_cmp = np.zeros(n, dtype=np.bool_)
+    for i in range(1, n):
+        if not (valid_bar[i] and valid_bar[i - 1]):
+            continue
+        valid_cmp[i] = True
+        if typical[i] > typical[i - 1]:
+            pos_flow[i] = raw_flow[i]
+        elif typical[i] < typical[i - 1]:
+            neg_flow[i] = raw_flow[i]
+
+    pos_sum = 0.0
+    neg_sum = 0.0
+    valid_count = 0
+    for i in range(1, n):
+        if valid_cmp[i]:
+            pos_sum += pos_flow[i]
+            neg_sum += neg_flow[i]
+            valid_count += 1
+
+        old = i - window
+        if old >= 1 and valid_cmp[old]:
+            pos_sum -= pos_flow[old]
+            neg_sum -= neg_flow[old]
+            valid_count -= 1
+
+        if i >= window and valid_count == window:
+            valid_end[i] = True
+            if neg_sum <= 0.0:
+                if pos_sum <= 0.0:
+                    out[i] = 50.0
+                else:
+                    out[i] = 100.0
+            else:
+                money_ratio = pos_sum / neg_sum
+                out[i] = 100.0 - (100.0 / (1.0 + money_ratio))
+
+    return out, valid_end
+
+
+@njit(cache=True)
+def average_true_range(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    window: int,
+):
+    """
+    Average True Range(ATR)를 계산한다.
+    """
+    n = close.shape[0]
+    out = np.empty(n, dtype=np.float64)
+    valid_end = np.zeros(n, dtype=np.bool_)
+    out[:] = np.nan
+    if window <= 0 or n <= 1:
+        return out, valid_end
+
+    tr = np.empty(n, dtype=np.float64)
+    tr[:] = np.nan
+    tr_valid = np.zeros(n, dtype=np.bool_)
+    for i in range(1, n):
+        h = high[i]
+        l = low[i]
+        prev_close = close[i - 1]
+        if (
+            np.isfinite(h) and h > 0.0
+            and np.isfinite(l) and l > 0.0
+            and np.isfinite(prev_close) and prev_close > 0.0
+        ):
+            tr1 = h - l
+            tr2 = abs(h - prev_close)
+            tr3 = abs(l - prev_close)
+            tr[i] = max(tr1, tr2, tr3)
+            tr_valid[i] = True
+
+    sum_tr = 0.0
+    count = 0
+    for i in range(1, n):
+        if tr_valid[i]:
+            sum_tr += tr[i]
+            count += 1
+
+        old = i - window
+        if old >= 1 and tr_valid[old]:
+            sum_tr -= tr[old]
+            count -= 1
+
+        if i >= window and count == window:
+            out[i] = sum_tr / window
+            valid_end[i] = True
+
+    return out, valid_end
+
+
+@njit(cache=True)
+def trailing_stop_first_exit_index(
+    close: np.ndarray,
+    atr: np.ndarray,
+    atr_valid_end: np.ndarray,
+    entry_idx: int,
+    last_idx: int,
+    atr_mult: float,
+) -> int:
+    """
+    진입 이후 최고 종가 - n*ATR 기준 trailing stop의 첫 청산 시점을 찾는다.
+    """
+    n = close.shape[0]
+    if entry_idx < 0 or entry_idx >= n - 1:
+        return -1
+    if last_idx >= n:
+        last_idx = n - 1
+    if last_idx <= entry_idx:
+        return -1
+
+    peak_close = close[entry_idx]
+    if not (np.isfinite(peak_close) and peak_close > 0.0):
+        return -1
+
+    for i in range(entry_idx + 1, last_idx + 1):
+        c = close[i]
+        if not (np.isfinite(c) and c > 0.0):
+            continue
+        if c > peak_close:
+            peak_close = c
+        if atr_valid_end[i] and np.isfinite(atr[i]) and atr[i] > 0.0:
+            if c < (peak_close - atr_mult * atr[i]):
+                return i
+    return -1
+
+
+@njit(cache=True)
 def rolling_percentile(values: np.ndarray, window: int, percentile: float) -> np.ndarray:
     """
     정확 rolling percentile 계산(윈도우 정렬 기반).

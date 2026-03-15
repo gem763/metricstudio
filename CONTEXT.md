@@ -20,11 +20,10 @@
 
 ### analyze
 - 시그니처:
-  - `Backtest.analyze(*patterns, include_base=True, by='day', min_marketcap=None, marketcap_top_pct=None, cohort_top_n=None, top_n_type='marketcap')`
-- `by`는 `'event'` 또는 `'day'`.
-- 기본값은 `by='day'`.
-- analyze에서 사용한 필터 설정은 pattern별로 저장되고, run/diagnose_gate에서 자동 상속됨.
-- 현재 구조상 analyze 옵션은 패턴/벤치마크(모든주식)에 동일하게 적용됨.
+  - `Backtest.analyze(*patterns, include_base=True, filter=None)`
+- `by`는 `Backtest(..., by='event'|'day')`에서 미리 결정.
+- `filter`는 `Filter(...)` 객체를 넣고, 벤치마크에는 적용되지 않음.
+- analyze에서 사용한 filter는 pattern별로 저장되고, run/diagnose_gate/screen에서 자동 상속됨.
 
 ### run
 - 시그니처:
@@ -34,7 +33,7 @@
   - `pattern_arith > max(gate_arith_min, market_arith)`
   - `pattern_rise  > max(gate_rise_min, market_rise)`
 - `gate_use_geom/gate_use_arith/gate_use_rise` 기본값은 모두 `False`.
-- 단, 3개가 모두 `False`면 `ValueError` 발생(최소 1개는 True 필요).
+- 3개가 모두 `False`면 게이트 없이 항상 풀 코호트 진입.
 
 ### diagnose_gate
 - 시그니처도 run과 동일한 gate 파라미터 구조.
@@ -46,7 +45,7 @@
   - DQS (return/win/class/quality/total)
 
 ### Simulator.plot
-- 좌측 패널: 게이트 지표 spread 3개(산술/기하/상승확률).
+- 좌측 패널: 포트폴리오 노출도(exposure).
 - 승률/손익비는 현재 코호트 기준 집계.
 
 ## 5) 최근 게이트 스윕 결과 (볼린저돌파+52주고가)
@@ -54,10 +53,10 @@
 ### 공통 설정
 - 패턴:
   - `bb = Bollinger(name='볼린저돌파').on(trigger='breakout_up', breakout_cooldown_days=3, bandwidth_max=0.05)`
-  - `high52w = High(name='52주 고가').on(window=252, threshold=0.90, stay_days=1)`
+  - `high52w = High(name='52주 고가').on(window=240, threshold=0.90, stay_days=1)`
   - `pat = bb + high52w`
 - analyze:
-  - `by='day', marketcap_top_pct=0.7, cohort_top_n=10, top_n_type='liquidity'`
+  - `by='day', Filter(market_cap=[8, 9, 10], liquidity=[1, 2, 3], order=['market_cap', 'liquidity'])`
 - diagnose:
   - `trade_price_mode='당일종가'`
   - `gate_geom_min=0.0, gate_arith_min=0.0, gate_rise_min=0.5`
@@ -89,23 +88,19 @@
 
 ## 6) 바로 실행 템플릿
 ```python
-from src.backtest import Backtest
+from src.backtest import Backtest, Filter, Univ
 from src.pattern import Pattern, Bollinger, High
 
 bm = Pattern(name='모든주식')
-bt = Backtest('2000-01-01', '2025-12-31', benchmark=bm)
+univ = Univ(market=['KOSPI', 'KOSDAQ'])
+flt = Filter(market_cap=[8, 9, 10], liquidity=[1, 2, 3], order=['market_cap', 'liquidity'])
+bt = Backtest('2000-01-01', '2025-12-31', benchmark=bm, by='day', univ=univ)
 
 bb = Bollinger(name='볼린저돌파').on(trigger='breakout_up', breakout_cooldown_days=3, bandwidth_max=0.05)
-high52w = High(name='52주 고가').on(window=252, threshold=0.90, stay_days=1)
+high52w = High(name='52주 고가').on(window=240, threshold=0.90, stay_days=1)
 pat = bb + high52w
 
-stats = bt.analyze(
-    bb, pat,
-    by='day',
-    marketcap_top_pct=0.7,
-    cohort_top_n=10,
-    top_n_type='liquidity',
-)
+stats = bt.analyze(bb, pat, filter=flt)
 
 diag = bt.diagnose_gate(
     pattern='볼린저돌파 + 52주 고가',

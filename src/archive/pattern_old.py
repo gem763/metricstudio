@@ -51,7 +51,7 @@ def _rolling_high(code: str) -> pd.Series:
         high = pd.Series(dtype=float)
     else:
         prices = prices.astype(float)
-        high = prices.rolling(window=252, min_periods=252).max()
+        high = prices.rolling(window=240, min_periods=240).max()
     _HIGH_CACHE[code] = high
     return high
 
