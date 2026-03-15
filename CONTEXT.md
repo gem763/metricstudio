@@ -89,7 +89,7 @@
 ## 6) 바로 실행 템플릿
 ```python
 from src.backtest import Backtest, Filter, Univ
-from src.pattern import Pattern, Bollinger, High
+from src.pattern import Pattern, Bollinger, High, Regime, SizeBucket
 
 bm = Pattern(name='모든주식')
 univ = Univ(market=['KOSPI', 'KOSDAQ'])
@@ -98,9 +98,20 @@ bt = Backtest('2000-01-01', '2025-12-31', benchmark=bm, by='day', univ=univ)
 
 bb = Bollinger(name='볼린저돌파').on(trigger='breakout_up', breakout_cooldown_days=3, bandwidth_max=0.05)
 high52w = High(name='52주 고가').on(window=240, threshold=0.90, stay_days=1)
-pat = bb + high52w
+regime = Regime(name='강세장').on(kind='broad_bull_breakout', market='kospi')
+pat = (bb + high52w).when(regime)
 
 stats = bt.analyze(bb, pat, filter=flt)
+
+large = SizeBucket(name='대형주').on(bucket='large')
+quiet = Regime(name='스퀴즈장').on(kind='quiet_squeeze_expansion', market='kospi')
+narrow = Regime(name='대형주장').on(kind='narrow_leadership', market='kospi')
+bb_squeeze = Bollinger(name='좁은폭돌파').on(
+    trigger='breakout_up',
+    bandwidth_type='percentile',
+    bandwidth_max=0.15,
+)
+branch_pat = pat | bb_squeeze.when(quiet) | (bb + large).when(narrow)
 
 diag = bt.diagnose_gate(
     pattern='볼린저돌파 + 52주 고가',

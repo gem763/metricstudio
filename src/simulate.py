@@ -61,6 +61,7 @@ class Simulator:
     run_years: float | None = field(default=None, init=False)
     total_return: float | None = field(default=None, init=False)
     cagr: float | None = field(default=None, init=False)
+    max_drawdown: float | None = field(default=None, init=False)
     cohort_win_rate: float | None = field(default=None, init=False)
     cohort_payoff_ratio: float | None = field(default=None, init=False)
     active_day_ratio: float | None = field(default=None, init=False)
@@ -311,6 +312,9 @@ class Simulator:
             "run_years": float(self.run_years),
             "total_return": float(self.total_return),
             "cagr": float(self.cagr),
+            "max_drawdown": float(self.max_drawdown)
+            if self.max_drawdown is not None
+            else float("nan"),
             "win_rate": float(self.cohort_win_rate)
             if self.cohort_win_rate is not None
             else float("nan"),
@@ -344,6 +348,8 @@ class Simulator:
         meta = self.summary()
         cagr = float(meta["cagr"])
         cagr_text = f"{cagr * 100.0:.2f}%" if np.isfinite(cagr) else "nan"
+        max_drawdown = float(meta.get("max_drawdown", np.nan))
+        max_drawdown_text = f"{max_drawdown * 100.0:.2f}%" if np.isfinite(max_drawdown) else "nan"
         wealth_vals = out["wealth"].to_numpy(dtype=float)
         daily_ret = wealth_vals[1:] / wealth_vals[:-1] - 1.0
         daily_ret = daily_ret[np.isfinite(daily_ret)]
@@ -415,8 +421,9 @@ class Simulator:
         axes[2].text(
             0.02,
             0.98,
-            "CAGR: {cagr}\n연변동성: {vol}\nIR: {ir}\n평균 노출도: {exposure}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
+            "CAGR: {cagr}\nMDD: {mdd}\n연변동성: {vol}\nIR: {ir}\n평균 노출도: {exposure}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
                 cagr=cagr_text,
+                mdd=max_drawdown_text,
                 vol=ann_vol_text,
                 ir=ir_text,
                 exposure=mean_exposure_text,
@@ -861,7 +868,16 @@ class Simulator:
         ):
             cagr = (1.0 + total_return) ** (1.0 / years) - 1.0
 
+        max_drawdown = float("nan")
+        wealth_values = out["wealth"].to_numpy(dtype=np.float64)
+        wealth_valid = np.isfinite(wealth_values) & (wealth_values > 0.0)
+        if np.any(wealth_valid):
+            running_peak = np.maximum.accumulate(wealth_values[wealth_valid])
+            drawdown = wealth_values[wealth_valid] / running_peak - 1.0
+            max_drawdown = float(np.min(drawdown))
+
         out.attrs["cagr"] = cagr
+        out.attrs["max_drawdown"] = max_drawdown
         out.attrs["total_return"] = total_return
         out.attrs["run_years"] = years
         out.attrs["win_rate"] = win_rate_value
@@ -918,6 +934,7 @@ class Simulator:
         self.run_years = years
         self.total_return = total_return
         self.cagr = cagr
+        self.max_drawdown = max_drawdown
         self.cohort_win_rate = win_rate_value
         self.cohort_payoff_ratio = payoff_ratio_value
         self.active_day_ratio = active_day_ratio_value

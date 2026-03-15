@@ -6,6 +6,7 @@ from typing import Callable, Literal
 
 import numpy as np
 
+from src.regime import Regime
 from src import util as u
 
 
@@ -29,6 +30,7 @@ class Pattern:
         self._cached_exit_mask_value: np.ndarray | None = None
         self.params: SimpleNamespace | None = None
         self._post_mask_fn: Callable[[np.ndarray], np.ndarray] = self._post_mask_base
+        self._regimes: list[Regime] = []
 
     @staticmethod
     def _normalize_loss_cut(loss_cut: str | None) -> str | None:
@@ -116,6 +118,11 @@ class Pattern:
         self._post_mask_fn = _composed
         return self
 
+    def when(self, regime: Regime):
+        if not isinstance(regime, Regime):
+            raise TypeError("when(...)은 Regime 객체만 지원합니다.")
+        return RegimePattern(self, regime)
+
     def __call__(self, values: np.ndarray) -> np.ndarray:
         source_values = values
         if self.market_name is not None:
@@ -141,6 +148,11 @@ class Pattern:
         if not isinstance(other, Pattern):
             return NotImplemented
         return CombinedPattern(self, other)
+
+    def __or__(self, other: "Pattern"):
+        if not isinstance(other, Pattern):
+            return NotImplemented
+        return UnionPattern(self, other)
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -274,6 +286,145 @@ class CombinedPattern(Pattern):
         if right_idx < 0:
             return left_idx
         return min(left_idx, right_idx)
+
+
+class RegimePattern(Pattern):
+    def __init__(
+        self,
+        pattern: Pattern,
+        regime: Regime,
+        name: str | None = None,
+    ):
+        self.pattern = pattern
+        self.regime = regime
+        resolved_name = name or pattern.name
+        super().__init__(name=resolved_name)
+        self._regimes.append(regime)
+        if pattern.trim_quantile is not None:
+            self.trim(pattern.trim_quantile, method=pattern.trim_method)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        base_mask = np.asarray(self.pattern(values), dtype=np.bool_)
+        regime_mask = np.asarray(self.regime.mask(base_mask.shape[0]), dtype=np.bool_)
+        if base_mask.shape != regime_mask.shape:
+            raise ValueError("Regime mask shape이 패턴 시계열과 일치하지 않습니다.")
+        return base_mask & regime_mask
+
+    def _exit_mask(self, values: np.ndarray) -> np.ndarray:
+        return np.asarray(self.pattern.exit_mask(values), dtype=np.bool_)
+
+    def has_exit_rule(self) -> bool:
+        return self.pattern.has_exit_rule()
+
+    def has_entry_dependent_exit(self) -> bool:
+        return self.pattern.has_entry_dependent_exit()
+
+    def first_exit_index(
+        self,
+        values: np.ndarray,
+        entry_idx: int,
+        last_idx: int,
+    ) -> int:
+        return self.pattern.first_exit_index(values, entry_idx, last_idx)
+
+
+class UnionPattern(Pattern):
+    def __init__(
+        self,
+        left: Pattern,
+        right: Pattern,
+        name: str | None = None,
+    ):
+        self.left = left
+        self.right = right
+        trim_quantile, trim_method = CombinedPattern._resolve_trim(
+            left.trim_quantile,
+            left.trim_method,
+            right.trim_quantile,
+            right.trim_method,
+        )
+        left_name = left.name if isinstance(left.name, str) and left.name else "left_pattern"
+        right_name = right.name if isinstance(right.name, str) and right.name else "right_pattern"
+        resolved_name = name or f"{left_name} | {right_name}"
+        super().__init__(name=resolved_name)
+        if trim_quantile is not None:
+            self.trim(trim_quantile, method=trim_method)
+        self._cached_child_mask_key: tuple[object, ...] | None = None
+        self._cached_left_mask: np.ndarray | None = None
+        self._cached_right_mask: np.ndarray | None = None
+
+    def _get_cached_child_masks(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        prices = np.asarray(values, dtype=np.float64)
+        cache_key = (id(prices),)
+        if self._cached_child_mask_key != cache_key:
+            self._cached_left_mask = np.asarray(self.left(values), dtype=np.bool_)
+            self._cached_right_mask = np.asarray(self.right(values), dtype=np.bool_)
+            self._cached_child_mask_key = cache_key
+        return self._cached_left_mask, self._cached_right_mask
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        left_mask, right_mask = self._get_cached_child_masks(values)
+        if left_mask.shape != right_mask.shape:
+            raise ValueError("분기 패턴의 mask shape이 일치하지 않습니다.")
+        return left_mask | right_mask
+
+    def _exit_mask(self, values: np.ndarray) -> np.ndarray:
+        left_exit = np.asarray(self.left.exit_mask(values), dtype=np.bool_)
+        right_exit = np.asarray(self.right.exit_mask(values), dtype=np.bool_)
+        if left_exit.shape != right_exit.shape:
+            raise ValueError("분기 패턴의 exit mask shape이 일치하지 않습니다.")
+        return left_exit | right_exit
+
+    def has_exit_rule(self) -> bool:
+        return self.left.has_exit_rule() or self.right.has_exit_rule()
+
+    def has_entry_dependent_exit(self) -> bool:
+        return self.has_exit_rule()
+
+    def first_exit_index(
+        self,
+        values: np.ndarray,
+        entry_idx: int,
+        last_idx: int,
+    ) -> int:
+        left_mask, right_mask = self._get_cached_child_masks(values)
+        candidates: list[int] = []
+        if 0 <= entry_idx < len(left_mask) and bool(left_mask[entry_idx]):
+            left_idx = self.left.first_exit_index(values, entry_idx, last_idx)
+            if left_idx >= 0:
+                candidates.append(int(left_idx))
+        if 0 <= entry_idx < len(right_mask) and bool(right_mask[entry_idx]):
+            right_idx = self.right.first_exit_index(values, entry_idx, last_idx)
+            if right_idx >= 0:
+                candidates.append(int(right_idx))
+        if not candidates:
+            return -1
+        return min(candidates)
+
+
+class SizeBucket(Pattern):
+    def on(
+        self,
+        bucket: Literal["large", "mid", "small"],
+    ):
+        key = str(bucket or "").strip().lower()
+        if key not in {"large", "mid", "small"}:
+            raise ValueError("bucket은 'large', 'mid', 'small' 중 하나여야 합니다.")
+        self.params = SimpleNamespace(bucket=key)
+        return self
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        if self.params is None:
+            return ()
+        return (f"size_bucket_{self.params.bucket}",)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("SizeBucket은 사용 전에 on(...)으로 설정해야 합니다.")
+        mask_values = self._get_stock_values(f"size_bucket_{self.params.bucket}")
+        if mask_values.shape != np.asarray(values).shape:
+            raise ValueError("SizeBucket mask shape이 가격 시계열과 일치하지 않습니다.")
+        return np.asarray(mask_values, dtype=np.bool_)
 
 
 class High(Pattern):
@@ -824,9 +975,11 @@ class Bollinger(Pattern):
 
 __all__ = [
     "Pattern",
+    "Regime",
     "High",
     "Disparity",
     "MFI",
+    "SizeBucket",
     "Trending",
     "GoldenCross",
     "Bollinger",

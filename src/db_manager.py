@@ -8,7 +8,7 @@ import duckdb
 import pandas as pd
 
 
-DEFAULT_MARKETS: tuple[str, ...] = ("KOSPI", "KOSDAQ", "KODEX")
+DEFAULT_MARKETS: tuple[str, ...] = ("KOSPI", "KOSDAQ", "KONEX")
 DEFAULT_DEPT_EXCLUDES: tuple[str, ...] = ("SPAC", "관리종목", "투자주의환기종목", "외국기업")
 
 _INDEX_NAME_MAP: dict[str, str] = {

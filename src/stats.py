@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import textwrap
 from typing import Dict, Iterable, List, Tuple
 import warnings
 
@@ -116,6 +117,31 @@ def _nan_geomean_from_returns(values: np.ndarray) -> float:
     if np.any(clean <= -1.0):
         return float("nan")
     return float(np.exp(np.mean(np.log1p(clean))) - 1.0)
+
+
+def _display_label(name: str, width: int = 24, max_lines: int = 2) -> str:
+    """
+    플롯 범례용 패턴명을 줄바꿈/축약해 레이아웃 붕괴를 줄인다.
+    """
+
+    text = str(name).strip()
+    if not text:
+        return text
+    wrapped = textwrap.wrap(
+        text,
+        width=max(8, int(width)),
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    if not wrapped:
+        return text
+    if len(wrapped) > max_lines:
+        wrapped = wrapped[:max_lines]
+        last = wrapped[-1]
+        if len(last) >= width - 3:
+            last = last[: max(1, width - 3)].rstrip()
+        wrapped[-1] = f"{last}..."
+    return "\n".join(wrapped)
 
 
 def _annualize_returns(values: np.ndarray, horizon_days: np.ndarray, mode: str) -> np.ndarray:
@@ -757,7 +783,11 @@ class StatsCollection:
         return [*benchmarks, *non_benchmarks]
 
     @staticmethod
-    def _apply_legend_order(ax, names: Iterable[str]) -> None:
+    def _display_label_map(names: Iterable[str]) -> Dict[str, str]:
+        return {name: _display_label(name) for name in names}
+
+    @staticmethod
+    def _apply_legend_order(ax, names: Iterable[str], display_map: Dict[str, str] | None = None) -> None:
         """
         범례 순서를 지정한 패턴 순서로 맞춘다.
         """
@@ -768,7 +798,14 @@ class StatsCollection:
         if not ordered_labels:
             return
         ordered_handles = [handle_by_label[label] for label in ordered_labels]
-        ax.legend(ordered_handles, ordered_labels)
+        legend_labels = [display_map.get(label, label) for label in ordered_labels] if display_map else ordered_labels
+        ax.legend(
+            ordered_handles,
+            legend_labels,
+            loc="upper left",
+            fontsize=9,
+            frameon=True,
+        )
 
     def _pattern_colors(self, names: Iterable[str]) -> Dict[str, str]:
         """
@@ -941,6 +978,7 @@ class StatsCollection:
             raise ValueError("cost=True는 annualized=True일 때만 사용할 수 있습니다.")
 
         color_map = self._pattern_colors(names)
+        display_map = self._display_label_map(names)
         frames = []
         horizon_day_map = {label: int(days) for label, days in next(iter(self.stats_map.values())).horizons}
         for name in names:
@@ -1003,7 +1041,7 @@ class StatsCollection:
             ax.set_ylabel(ylabel)
 
         axes[2].set_ylabel("")
-        self._apply_legend_order(axes[0], names)
+        self._apply_legend_order(axes[0], names, display_map)
 
         arith_vals = combined["arith_mean"].to_numpy(dtype=float) * 100.0
         geom_vals = combined["geom_mean"].to_numpy(dtype=float) * 100.0
@@ -1108,6 +1146,7 @@ class StatsCollection:
             raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
 
         color_map = self._pattern_colors(names)
+        display_map = self._display_label_map(names)
         fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
 
         first_dates = None
@@ -1151,7 +1190,7 @@ class StatsCollection:
         else:
             ax.set_title(f"Pattern Occurrence (Rolling {int(ma_window)}D Mean)")
         ax.set_ylabel("Daily Occurrence Count")
-        self._apply_legend_order(ax, names)
+        self._apply_legend_order(ax, names, display_map)
         if ylim is not None:
             ax.set_ylim(float(ylim[0]), float(ylim[1]))
 
@@ -1191,6 +1230,7 @@ class StatsCollection:
             raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
 
         color_map = self._pattern_colors(names)
+        display_map = self._display_label_map(names)
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True, sharex=True)
 
         first_dates = None
@@ -1234,7 +1274,7 @@ class StatsCollection:
         axes[1].set_title(f"{title_prefix} Geometric Mean")
         axes[2].set_title(f"{title_prefix} Rise Probability")
 
-        self._apply_legend_order(axes[0], names)
+        self._apply_legend_order(axes[0], names, display_map)
 
         return_ylim_pct = _normalize_ylim_percent(return_ylim)
         if return_ylim_pct is not None:

@@ -19,6 +19,7 @@ from src.db_manager import (
 )
 from src.db_manager_archive import DB as ArchiveDBManager
 from src.pattern import Pattern
+from src.regime import Regime, build_market_cap_bucket_masks, build_regime_frame
 from src.simulate import Simulator
 from src.stats import Stats, StatsCollection
 
@@ -1175,6 +1176,7 @@ class Backtest:
         self._all_stock_geom_cache: Dict[tuple[int, int], np.ndarray] = {}
         self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._stock_field_matrix_cache: Dict[str, np.ndarray] = {}
+        self._regime_frame_cache: Dict[str, pd.DataFrame] = {}
         self._vwap_matrix: np.ndarray | None = None
         if benchmark is not None:
             base_name = _infer_pattern_label(benchmark, 0)
@@ -1259,10 +1261,75 @@ class Backtest:
 
             left = getattr(node, "left", None)
             right = getattr(node, "right", None)
+            pattern = getattr(node, "pattern", None)
             if isinstance(left, Pattern):
                 stack.append(left)
             if isinstance(right, Pattern):
                 stack.append(right)
+            if isinstance(pattern, Pattern):
+                stack.append(pattern)
+
+    def _iter_attached_regimes(self, pattern_fn: Pattern):
+        """
+        패턴 트리에 연결된 Regime 객체를 중복 없이 순회한다.
+        """
+
+        seen: set[int] = set()
+        for node in self._iter_pattern_nodes(pattern_fn):
+            for regime in getattr(node, "_regimes", ()):
+                if not isinstance(regime, Regime):
+                    continue
+                regime_id = id(regime)
+                if regime_id in seen:
+                    continue
+                seen.add(regime_id)
+                yield regime
+
+    def _resolve_regime_breadth_univ(self) -> Univ:
+        """
+        레짐 breadth 계산에 쓸 유니버스를 정한다.
+        """
+        return self.univ
+
+    def _get_regime_frame(self, regime: Regime) -> pd.DataFrame:
+        """
+        Regime 계산에 필요한 일별 메트릭/라벨 테이블을 생성/캐시한다.
+        """
+
+        market_key = regime.market
+        if market_key in self._regime_frame_cache:
+            return self._regime_frame_cache[market_key]
+
+        idx = pd.DatetimeIndex(self.dates)
+        breadth_univ = self._resolve_regime_breadth_univ()
+        stock_tables = _load_stock_field_tables(["close", "amount", "marketcap"], self.db_mode, breadth_univ)
+        close_df = stock_tables["close"].reindex(index=idx)
+        amount_df = stock_tables["amount"].reindex(index=idx, columns=close_df.columns)
+        marketcap_df = stock_tables["marketcap"].reindex(index=idx, columns=close_df.columns)
+        market_df = _load_market_table(market_key, self.db_mode)
+        if "close" not in market_df.columns:
+            raise ValueError(f"market='{market_key}' 데이터에 'close' 컬럼이 없습니다.")
+        market_close = pd.to_numeric(market_df["close"], errors="coerce").reindex(idx)
+
+        frame = build_regime_frame(
+            market_close=market_close,
+            close_df=close_df,
+            amount_df=amount_df,
+            market_cap_df=marketcap_df,
+            percentile_window=TRADING_DAYS_PER_YEAR,
+        )
+        self._regime_frame_cache[market_key] = frame
+        return frame
+
+    def _prepare_regime_sources(self, pattern_fn: Pattern) -> None:
+        """
+        패턴에 연결된 Regime 객체에 날짜별 허용 마스크를 주입한다.
+        """
+
+        for regime in self._iter_attached_regimes(pattern_fn):
+            frame = self._get_regime_frame(regime)
+            mask_values = frame["label"].eq(regime.kind).to_numpy(dtype=np.bool_, copy=True)
+            regime._bind(self.dates, mask_values, frame)
 
     def _prepare_market_sources(self, pattern_fn: Pattern) -> None:
         """
@@ -1286,6 +1353,8 @@ class Backtest:
         key = str(field).strip().lower()
         if not key:
             raise ValueError("field는 비어 있을 수 없습니다.")
+        if key in {"size_bucket_large", "size_bucket_mid", "size_bucket_small"}:
+            self._ensure_size_bucket_matrices()
         if key not in self._stock_field_matrix_cache:
             df = _load_stock_field_table(key, self.db_mode, self.univ)
             aligned = df.reindex(
@@ -1294,6 +1363,20 @@ class Backtest:
             )
             self._stock_field_matrix_cache[key] = aligned.to_numpy(dtype=np.float64, copy=True)
         return self._stock_field_matrix_cache[key]
+
+    def _ensure_size_bucket_matrices(self) -> None:
+        cache = self._stock_field_matrix_cache
+        needed = ("size_bucket_large", "size_bucket_mid", "size_bucket_small")
+        if all(key in cache for key in needed):
+            return
+
+        idx = pd.DatetimeIndex(self.dates)
+        cols = pd.Index(self.codes, dtype="object")
+        marketcap_df = _load_stock_field_table("marketcap", self.db_mode, self.univ).reindex(index=idx, columns=cols)
+        size_masks = build_market_cap_bucket_masks(marketcap_df)
+        cache["size_bucket_large"] = size_masks["large"].to_numpy(dtype=np.bool_, copy=True)
+        cache["size_bucket_mid"] = size_masks["mid"].to_numpy(dtype=np.bool_, copy=True)
+        cache["size_bucket_small"] = size_masks["small"].to_numpy(dtype=np.bool_, copy=True)
 
     def _prepare_stock_sources(self, pattern_fn: Pattern, col_idx: int) -> None:
         """
@@ -1966,6 +2049,7 @@ class Backtest:
         패턴 trim 설정에 따라 normal/trim 실행 경로를 선택한다.
         """
 
+        self._prepare_regime_sources(pattern_fn)
         self._prepare_market_sources(pattern_fn)
         agg_mode = _normalize_analyze_by(aggregation_mode)
         trim_q = _normalize_trim_quantile(trim_quantile)
@@ -2304,6 +2388,7 @@ class Backtest:
             )
             row_mask = np.asarray(mask_matrix[date_idx], dtype=np.bool_)
         else:
+            self._prepare_regime_sources(pattern_fn)
             self._prepare_market_sources(pattern_fn)
             for col_idx, code in enumerate(self.codes):
                 if filter_row is not None and not filter_row[col_idx]:
