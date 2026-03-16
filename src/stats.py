@@ -202,7 +202,7 @@ def _normalize_ylim_percent(ylim):
 
 def _apply_y_ticks(axes):
     """
-    수익률/상승확률 축의 눈금 포맷을 정수형으로 맞춘다.
+    수익률/상승확률/빈도 축의 눈금 포맷을 맞춘다.
     """
 
     _, _, MaxNLocator, StrMethodFormatter = _plot_modules()
@@ -231,6 +231,11 @@ def _apply_y_ticks(axes):
 
         rise_ax.yaxis.set_major_locator(MaxNLocator(nbins=8, integer=True, min_n_ticks=3))
         rise_ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
+
+    if len(axes) >= 4:
+        freq_ax = axes[3]
+        freq_ax.yaxis.set_major_locator(MaxNLocator(nbins=8, integer=True, min_n_ticks=3))
+        freq_ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
 
 
 def _share_return_y_axis(axes):
@@ -954,7 +959,7 @@ class StatsCollection:
         patterns: Iterable[str] | None = None,
         start=None,
         end=None,
-        figsize=(12, 4),
+        figsize=(16, 4),
         annualized: bool = False,
         cost: bool | None = None,
         rise_ylim=None,
@@ -962,7 +967,7 @@ class StatsCollection:
         return_handles: bool = False,
     ):
         """
-        horizon별 산술/기하/상승확률 비교 차트를 그린다.
+        horizon별 산술/기하/상승확률/빈도 비교 차트를 그린다.
         """
 
         _configure_plot_font()
@@ -986,6 +991,31 @@ class StatsCollection:
             df["pattern"] = name
             frames.append(df)
         combined = pd.concat(frames, ignore_index=True)
+        benchmark_name = next((name for name in names if name in self.benchmark_names), None)
+        if benchmark_name is None:
+            benchmark_name = next((name for name in self.stats_map if name in self.benchmark_names), None)
+        if benchmark_name is not None:
+            benchmark_counts = (
+                self.get(benchmark_name)
+                .to_frame(start, end)
+                .reset_index()[["period", "scope", "count"]]
+                .rename(columns={"count": "benchmark_count"})
+            )
+            combined = combined.merge(benchmark_counts, on=["period", "scope"], how="left")
+            benchmark_count = combined["benchmark_count"].to_numpy(dtype=float)
+            pattern_count = combined["count"].to_numpy(dtype=float)
+            is_non_benchmark = ~combined["pattern"].isin(self.benchmark_names).to_numpy(dtype=bool)
+            valid_ratio = (
+                is_non_benchmark
+                & np.isfinite(pattern_count)
+                & np.isfinite(benchmark_count)
+                & (benchmark_count > 0.0)
+            )
+            count_ratio = np.full(len(combined), np.nan, dtype=np.float64)
+            count_ratio[valid_ratio] = pattern_count[valid_ratio] / benchmark_count[valid_ratio]
+            combined["count_ratio"] = count_ratio
+        else:
+            combined["count_ratio"] = np.nan
         combined["horizon_days"] = combined["period"].map(horizon_day_map).astype(float)
         if cost_enabled:
             combined["arith_mean"] = _apply_roundtrip_cost(
@@ -1010,7 +1040,7 @@ class StatsCollection:
         x = np.arange(len(periods))
         period_index = {label: idx for idx, label in enumerate(periods)}
 
-        fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+        fig, axes = plt.subplots(1, 4, figsize=figsize, constrained_layout=True)
 
         for name in names:
             group = combined.loc[combined["pattern"] == name]
@@ -1023,6 +1053,9 @@ class StatsCollection:
                 xs, group["geom_mean"] * 100.0, marker="o", linestyle="-", color=color, label=name
             )
             axes[2].plot(xs, group["rise_prob"] * 100.0, marker="o", color=color, label=name)
+            if name in self.benchmark_names:
+                continue
+            axes[3].plot(xs, group["count_ratio"] * 100.0, marker="o", color=color, label=name)
 
         return_title_prefix = "Annualized " if annualized else ""
         if cost_enabled:
@@ -1032,6 +1065,7 @@ class StatsCollection:
             (axes[0], f"{return_title_prefix}Arithmetic Mean", return_ylabel, True),
             (axes[1], f"{return_title_prefix}Geometric Mean", return_ylabel, True),
             (axes[2], "Rise Probability (%)", "Rise Probability (%)", False),
+            (axes[3], "Pattern Frequency (%)", "Pattern Frequency (%)", False),
         ]:
             if draw_zero:
                 ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
@@ -1041,6 +1075,7 @@ class StatsCollection:
             ax.set_ylabel(ylabel)
 
         axes[2].set_ylabel("")
+        axes[3].set_ylabel("")
         self._apply_legend_order(axes[0], names, display_map)
 
         arith_vals = combined["arith_mean"].to_numpy(dtype=float) * 100.0
@@ -1065,6 +1100,8 @@ class StatsCollection:
             axes[2].set_ylim(*rise_ylim_pct)
         _draw_hline_if_in_view(axes[2], 50.0, color="gray", linewidth=0.8, linestyle="--")
 
+        axes[3].set_ylim(0.0, 100.0)
+
         _share_return_y_axis(axes)
         _apply_y_ticks(axes)
 
@@ -1078,7 +1115,7 @@ class StatsCollection:
         short: str = "1Y",
         long: str = "3Y",
         patterns: Iterable[str] | None = None,
-        figsize=(12, 4),
+        figsize=(16, 4),
         rise_ylim=None,
         return_ylim=None,
         return_handles: bool = False,
