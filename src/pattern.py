@@ -507,6 +507,136 @@ class Disparity(Pattern):
         return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
 
 
+class RelativeStrength(Pattern):
+    def on(
+        self,
+        window: int = 60,
+        threshold: float = 0.0,
+        stay_days: int = 1,
+        cooldown_days: int = 0,
+        market: str | None = None,
+    ):
+        window_value = int(window)
+        if window_value <= 0:
+            raise ValueError("window는 1 이상이어야 합니다.")
+        threshold_value = float(threshold)
+        if not np.isfinite(threshold_value):
+            raise ValueError("threshold는 유한한 숫자여야 합니다.")
+        if market is not None:
+            self.market(market, field="close")
+        if self.market_name is None:
+            raise ValueError("RelativeStrength는 market을 지정해야 합니다.")
+
+        self.params = SimpleNamespace(
+            window=window_value,
+            threshold=threshold_value,
+            stay_days=int(max(1, stay_days)),
+            cooldown_days=int(max(0, cooldown_days)),
+        )
+        return self
+
+    def __call__(self, values: np.ndarray) -> np.ndarray:
+        prices = np.asarray(values, dtype=np.float64)
+        base_mask = np.asarray(self._base_mask(prices), dtype=np.bool_)
+        if base_mask.shape != prices.shape:
+            raise ValueError(f"패턴 '{self.name}'의 mask shape이 일치하지 않습니다.")
+        post_mask = np.asarray(self._post_mask_fn(prices), dtype=np.bool_)
+        if post_mask.shape != prices.shape:
+            raise ValueError(f"패턴 '{self.name}'의 후처리 mask shape이 일치하지 않습니다.")
+        return base_mask & post_mask
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("RelativeStrength는 사용 전에 on(...)으로 설정해야 합니다.")
+        if self.market_name is None or self._market_values is None:
+            raise ValueError("RelativeStrength의 market 데이터가 준비되지 않았습니다.")
+
+        prices = np.asarray(values, dtype=np.float64)
+        market = np.asarray(self._market_values, dtype=np.float64)
+        if market.shape != prices.shape:
+            raise ValueError("RelativeStrength market shape이 가격 시계열과 일치하지 않습니다.")
+
+        n = prices.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        window = int(self.params.window)
+        if n <= window:
+            return out
+
+        stock_prev = prices[:-window]
+        stock_curr = prices[window:]
+        market_prev = market[:-window]
+        market_curr = market[window:]
+        valid = (
+            np.isfinite(stock_prev)
+            & (stock_prev > 0.0)
+            & np.isfinite(stock_curr)
+            & (stock_curr > 0.0)
+            & np.isfinite(market_prev)
+            & (market_prev > 0.0)
+            & np.isfinite(market_curr)
+            & (market_curr > 0.0)
+        )
+        stock_ret = np.zeros(n - window, dtype=np.float64)
+        market_ret = np.zeros(n - window, dtype=np.float64)
+        stock_ret[valid] = stock_curr[valid] / stock_prev[valid] - 1.0
+        market_ret[valid] = market_curr[valid] / market_prev[valid] - 1.0
+        rel = stock_ret - market_ret
+
+        cond = np.zeros(n, dtype=np.bool_)
+        cond[window:] = valid & np.isfinite(rel) & (rel >= float(self.params.threshold))
+        return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
+
+
+class AmountSurge(Pattern):
+    def on(
+        self,
+        window: int = 20,
+        threshold: float = 2.0,
+        stay_days: int = 1,
+        cooldown_days: int = 0,
+    ):
+        window_value = int(window)
+        if window_value <= 0:
+            raise ValueError("window는 1 이상이어야 합니다.")
+        threshold_value = float(threshold)
+        if not np.isfinite(threshold_value) or threshold_value <= 0.0:
+            raise ValueError("threshold는 0보다 큰 유한한 숫자여야 합니다.")
+
+        self.params = SimpleNamespace(
+            window=window_value,
+            threshold=threshold_value,
+            stay_days=int(max(1, stay_days)),
+            cooldown_days=int(max(0, cooldown_days)),
+        )
+        return self
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        return ("amount",)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("AmountSurge는 사용 전에 on(...)으로 설정해야 합니다.")
+
+        amount = self._get_stock_values("amount")
+        n = amount.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        if n < self.params.window:
+            return out
+
+        mean_amount, valid_end = u.rolling_mean(amount, self.params.window)
+        valid = (
+            valid_end
+            & np.isfinite(amount)
+            & (amount > 0.0)
+            & np.isfinite(mean_amount)
+            & (mean_amount > 0.0)
+        )
+        ratio = np.zeros(n, dtype=np.float64)
+        ratio[valid] = amount[valid] / mean_amount[valid]
+        cond = valid & np.isfinite(ratio) & (ratio >= self.params.threshold)
+        return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
+
+
 class MFI(Pattern):
     def __init__(
         self,
@@ -978,6 +1108,8 @@ __all__ = [
     "Regime",
     "High",
     "Disparity",
+    "RelativeStrength",
+    "AmountSurge",
     "MFI",
     "SizeBucket",
     "Trending",

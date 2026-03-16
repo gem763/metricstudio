@@ -19,7 +19,7 @@ from src.db_manager import (
 )
 from src.db_manager_archive import DB as ArchiveDBManager
 from src.pattern import Pattern
-from src.regime import Regime, build_market_cap_bucket_masks, build_regime_frame
+from src.regime import Regime, build_market_cap_bucket_masks, build_regime_frame, regime_mask_from_frame
 from src.simulate import Simulator
 from src.stats import Stats, StatsCollection
 
@@ -1328,7 +1328,7 @@ class Backtest:
 
         for regime in self._iter_attached_regimes(pattern_fn):
             frame = self._get_regime_frame(regime)
-            mask_values = frame["label"].eq(regime.kind).to_numpy(dtype=np.bool_, copy=True)
+            mask_values = regime_mask_from_frame(frame, regime.kind)
             regime._bind(self.dates, mask_values, frame)
 
     def _prepare_market_sources(self, pattern_fn: Pattern) -> None:

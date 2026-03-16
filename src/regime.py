@@ -8,7 +8,13 @@ import pandas as pd
 
 TRADING_DAYS_PER_YEAR = 240
 
+REGIME_TREND = "trend_friendly"
+REGIME_CONTRARIAN = "contrarian_friendly"
 REGIME_PANIC = "panic_rebound_risk"
+REGIME_NEUTRAL = "neutral"
+REGIME_QUIET_TAG = "quiet_tag"
+REGIME_NARROW_TAG = "narrow_tag"
+
 REGIME_QUIET = "quiet_squeeze_expansion"
 REGIME_BROAD_BULL = "broad_bull_breakout"
 REGIME_NARROW = "narrow_leadership"
@@ -19,8 +25,20 @@ REGIME_UNAVAILABLE = "unavailable"
 def _normalize_regime_kind(kind: str) -> str:
     key = str(kind or "").strip().lower()
     alias_map = {
+        "trend": REGIME_TREND,
+        "trend_friendly": REGIME_TREND,
+        "trend_follower": REGIME_TREND,
+        "contrarian": REGIME_CONTRARIAN,
+        "contrarian_friendly": REGIME_CONTRARIAN,
+        "mean_reversion": REGIME_CONTRARIAN,
+        "mean_reversion_friendly": REGIME_CONTRARIAN,
         "panic": REGIME_PANIC,
         "panic_rebound_risk": REGIME_PANIC,
+        "neutral": REGIME_NEUTRAL,
+        "quiet_tag": REGIME_QUIET_TAG,
+        "quiettag": REGIME_QUIET_TAG,
+        "narrow_tag": REGIME_NARROW_TAG,
+        "narrowtag": REGIME_NARROW_TAG,
         "quiet": REGIME_QUIET,
         "quiet_squeeze_expansion": REGIME_QUIET,
         "quiet_squeeze": REGIME_QUIET,
@@ -31,15 +49,30 @@ def _normalize_regime_kind(kind: str) -> str:
         "narrow_leadership": REGIME_NARROW,
         "sideways": REGIME_SIDEWAYS,
         "sideways_choppy": REGIME_SIDEWAYS,
-        "other": REGIME_SIDEWAYS,
+        "other": REGIME_NEUTRAL,
     }
     if key not in alias_map:
         raise ValueError(
             "kind는 "
-            "{'panic_rebound_risk', 'quiet_squeeze_expansion', 'broad_bull_breakout', "
+            "{'trend_friendly', 'contrarian_friendly', 'panic_rebound_risk', 'neutral', "
+            "'quiet_tag', 'narrow_tag', 'quiet_squeeze_expansion', 'broad_bull_breakout', "
             "'narrow_leadership', 'sideways_choppy'} 중 하나여야 합니다."
         )
     return alias_map[key]
+
+
+def regime_mask_from_frame(frame: pd.DataFrame, kind: str) -> np.ndarray:
+    """
+    build_regime_frame() 결과에서 kind에 대응하는 bool 마스크를 추출한다.
+    """
+
+    key = _normalize_regime_kind(kind)
+    if key in frame.columns:
+        values = frame[key]
+        return values.fillna(False).to_numpy(dtype=np.bool_, copy=True)
+    if "label" in frame.columns:
+        return frame["label"].eq(key).to_numpy(dtype=np.bool_, copy=True)
+    raise KeyError(f"regime frame에서 '{key}' 컬럼을 찾을 수 없습니다.")
 
 
 def _rolling_last_percentile_rank(
@@ -216,33 +249,95 @@ def build_regime_frame(
         (out["rv20_pct240"] >= 0.85)
         | ((out["dd60"] <= -0.10) & (out["pct_above20_all"] < 0.35))
     )
-    quiet_mask = evaluable & (~panic_mask) & (
-        (out["trend_score"] >= 1.0)
-        & (out["bbw20_pct240"] <= 0.20)
+    quiet_tag = evaluable & (
+        (out["bbw20_pct240"] <= 0.20)
         & (out["rv20_pct240"] <= 0.40)
-        & (out["pct_above20_delta5"] >= 0.05)
     )
-    broad_mask = evaluable & (~panic_mask) & (~quiet_mask) & (
-        (out["trend_score"] >= 2.0)
-        & (out["pct_above60_all"] >= 0.55)
-        & (out["aar5"] >= 0.55)
-        & (out["rv20_pct240"] < 0.80)
-        & (out["dd60"] > -0.08)
-    )
-    narrow_mask = evaluable & (~panic_mask) & (~quiet_mask) & (~broad_mask) & (
+    narrow_tag = evaluable & (
         (out["trend_score"] >= 2.0)
         & (out["large_pct_above60"] >= 0.60)
         & (out["small_pct_above60"] <= 0.45)
         & (out["leadership_spread"] >= 0.15)
     )
 
+    trend_quiet_branch = evaluable & (~panic_mask) & (
+        (out["trend_score"] >= 2.0)
+        & (out["dd60"] > -0.08)
+        & (out["rv20_pct240"] < 0.80)
+        & (out["bbw20_pct240"] <= 0.20)
+        & (out["rv20_pct240"] <= 0.40)
+        & (out["pct_above20_delta5"] >= 0.05)
+        & (out["pct_above20_all"] >= 0.45)
+    )
+    trend_broad_branch = evaluable & (~panic_mask) & (
+        (out["trend_score"] >= 2.0)
+        & (out["pct_above60_all"] >= 0.55)
+        & (out["aar5"] >= 0.55)
+        & (out["rv20_pct240"] < 0.80)
+        & (out["dd60"] > -0.08)
+    )
+    trend_friendly = trend_quiet_branch | trend_broad_branch
+
+    contrarian_friendly = evaluable & (~panic_mask) & (~trend_friendly) & (
+        (
+            (out["dd60"] <= -0.05)
+            & (out["pct_above20_all"] <= 0.45)
+            & (out["pct_above20_delta5"] >= -0.03)
+        )
+        |
+        (
+            (out["rv20_pct240"] >= 0.55)
+            & (out["pct_above20_all"] >= 0.30)
+            & (out["pct_above20_all"] <= 0.50)
+            & (out["aar5"] >= 0.45)
+        )
+    )
+    neutral_mask = evaluable & (~panic_mask) & (~trend_friendly) & (~contrarian_friendly)
+
+    legacy_quiet_mask = evaluable & (~panic_mask) & (
+        (out["trend_score"] >= 1.0)
+        & (out["bbw20_pct240"] <= 0.20)
+        & (out["rv20_pct240"] <= 0.40)
+        & (out["pct_above20_delta5"] >= 0.05)
+    )
+    legacy_broad_mask = evaluable & (~panic_mask) & (~legacy_quiet_mask) & (
+        (out["trend_score"] >= 2.0)
+        & (out["pct_above60_all"] >= 0.55)
+        & (out["aar5"] >= 0.55)
+        & (out["rv20_pct240"] < 0.80)
+        & (out["dd60"] > -0.08)
+    )
+    legacy_narrow_mask = evaluable & (~panic_mask) & (~legacy_quiet_mask) & (~legacy_broad_mask) & narrow_tag
+    legacy_sideways_mask = evaluable & (
+        (~panic_mask) & (~legacy_quiet_mask) & (~legacy_broad_mask) & (~legacy_narrow_mask)
+    )
+
     labels = pd.Series(REGIME_UNAVAILABLE, index=out.index, dtype="object")
-    labels.loc[evaluable] = REGIME_SIDEWAYS
-    labels.loc[narrow_mask] = REGIME_NARROW
-    labels.loc[broad_mask] = REGIME_BROAD_BULL
-    labels.loc[quiet_mask] = REGIME_QUIET
+    labels.loc[neutral_mask] = REGIME_NEUTRAL
+    labels.loc[contrarian_friendly] = REGIME_CONTRARIAN
+    labels.loc[trend_friendly] = REGIME_TREND
     labels.loc[panic_mask] = REGIME_PANIC
+
+    legacy_labels = pd.Series(REGIME_UNAVAILABLE, index=out.index, dtype="object")
+    legacy_labels.loc[legacy_sideways_mask] = REGIME_SIDEWAYS
+    legacy_labels.loc[legacy_narrow_mask] = REGIME_NARROW
+    legacy_labels.loc[legacy_broad_mask] = REGIME_BROAD_BULL
+    legacy_labels.loc[legacy_quiet_mask] = REGIME_QUIET
+    legacy_labels.loc[panic_mask] = REGIME_PANIC
+
+    out[REGIME_TREND] = trend_friendly
+    out[REGIME_CONTRARIAN] = contrarian_friendly
+    out[REGIME_PANIC] = panic_mask
+    out[REGIME_NEUTRAL] = neutral_mask
+    out[REGIME_QUIET_TAG] = quiet_tag
+    out[REGIME_NARROW_TAG] = narrow_tag
+    out[REGIME_QUIET] = legacy_quiet_mask
+    out[REGIME_BROAD_BULL] = legacy_broad_mask
+    out[REGIME_NARROW] = legacy_narrow_mask
+    out[REGIME_SIDEWAYS] = legacy_sideways_mask
+    out[REGIME_UNAVAILABLE] = ~evaluable
     out["label"] = labels
+    out["legacy_label"] = legacy_labels
     return out
 
 
@@ -256,7 +351,7 @@ class Regime:
 
     def on(
         self,
-        kind: str = REGIME_BROAD_BULL,
+        kind: str = REGIME_TREND,
         market: str = "kospi",
     ):
         market_name = str(market or "").strip().lower()
@@ -303,7 +398,12 @@ class Regime:
 
 __all__ = [
     "Regime",
+    "REGIME_TREND",
+    "REGIME_CONTRARIAN",
     "REGIME_PANIC",
+    "REGIME_NEUTRAL",
+    "REGIME_QUIET_TAG",
+    "REGIME_NARROW_TAG",
     "REGIME_QUIET",
     "REGIME_BROAD_BULL",
     "REGIME_NARROW",
@@ -312,4 +412,5 @@ __all__ = [
     "TRADING_DAYS_PER_YEAR",
     "build_market_cap_bucket_masks",
     "build_regime_frame",
+    "regime_mask_from_frame",
 ]
