@@ -915,3 +915,444 @@ trend로 받아들이는 쪽으로 정리했다.
 
 1. 노트북에서 `trend_base`, `trend_amount1.5x` wealth / mean_exposure가 실제로 얼마나 개선되는지
 2. `panic_rebound_risk`를 off 정책으로 갈지 여부를 다시 이어서 정리할지
+
+---
+
+## 19) 2026-03-17 회사(WSL) 세션 상세 인계
+이번 세션은 회사 WSL 환경에서 진행했고,
+다음 세션은 집 맥북에서 이어질 가능성이 높다.
+
+즉 다음 에이전트는
+“WSL에서 하던 레짐 재설계 / 패턴 검증 / 노트북 정리 작업을
+맥북에서 자연스럽게 이어받는다”는 전제로 이해하면 된다.
+
+이번 턴에서 실제로 정리된 것은 크게 5가지다.
+
+1. `trend_friendly` 레짐 구조 재정리
+2. `trend`/`panic` 패턴 실험 결과 정리
+3. `stats.plot()` vs `wealth` 해석 기준 정리
+4. `Backtest` / `Simulator` UX 개선
+5. `레짐-패턴실험 2026.03.17.ipynb` 실행 구조 정리
+
+아래에 하나씩 남긴다.
+
+### 19.1 현재 가장 중요한 결론
+현재 기준으로는,
+`trend_friendly` 안에서 실전 주력 패턴은 여전히 아래 조합이다.
+
+- `Bollinger breakout`
+- `52주 고가`
+- `MA200 상향`
+- `MFI > 50`
+- `AmountSurge(20, 1.5x)`
+
+즉 shorthand로는
+`trend_amount1.5x`
+가 현재 대표 조합이다.
+
+반면 아래는 아직 주력으로 채택하지 않았다.
+
+- `RelativeStrength`
+- `RetestBreakout`
+- `PanicRebound`
+
+해석은 단순하다.
+
+- `AmountSurge(20, 1.5x)`는 trend breakout 계열의 quality filter로 유의미했다.
+- `RelativeStrength`는 아이디어는 맞지만, 현재 breakout 기준선 위에 올렸을 때 일관된 우위를 보이지 못했다.
+- `RetestBreakout`은 second-entry 아이디어로는 의미가 있었지만, 현재 정의로는 기준선을 넘지 못했다.
+- `panic_rebound_risk`에서는 새 custom 패턴보다 기본적으로 `off`가 더 자연스럽고, 예외 후보가 필요하면 `MFI oversold_rebound` 정도만 보수적으로 남겨두는 편이 맞다.
+
+### 19.2 `trend_friendly` 최종 코드 구조
+현재 `src/regime.py`에서 `trend_friendly`는
+`tag를 branch 내부에서 참조하는 구조`가 아니라,
+가독성을 위해 아래처럼 정리돼 있다.
+
+```python
+trend_common_gate = (
+    (trend_score >= 2.0)
+    & (dd60 > -0.08)
+    & (rv20_pct240 < 0.80)
+)
+
+trend_quiet_branch = trend_common_gate & (
+    (bbw20_pct240 <= 0.20)
+    & (rv20_pct240 <= 0.40)
+    & (pct_above20_delta5 >= 0.05)
+    & (pct_above20_all >= 0.45)
+)
+
+trend_broad_branch = trend_common_gate & (
+    (pct_above60_all >= 0.50)
+    & (aar5 >= 0.50)
+)
+
+trend_narrow_branch = trend_common_gate & (
+    (large_pct_above60 >= 0.60)
+    & (small_pct_above60 <= 0.45)
+    & (leadership_spread >= 0.15)
+    & (aar5 >= 0.45)
+)
+
+trend_friendly = (
+    trend_quiet_branch
+    | trend_broad_branch
+    | trend_narrow_branch
+)
+```
+
+의도는 아래와 같다.
+
+- `trend_common_gate`: 추세 레짐이 공통으로 요구하는 최소 절대 강도와 스트레스 상한
+- `trend_quiet_branch`: squeeze 성격의 추세
+- `trend_broad_branch`: breadth가 확인된 추세
+- `trend_narrow_branch`: raw `narrow_tag` 전체가 아니라, “안전한 narrow leadership”만 제한적으로 편입
+
+중요:
+
+- `quiet_tag`, `narrow_tag` 자체는 호환성과 설명용으로 남아 있다.
+- 그러나 현재 `trend_friendly` 계산식은 branch 안에서 `narrow_tag`를 직접 참조하지 않는다.
+- 즉 읽는 사람이 보기에 `common gate + branch OR` 구조가 바로 보이도록 정리한 상태다.
+
+### 19.3 coverage 숫자 해석 주의
+이번 세션에서 coverage 숫자는 두 종류가 섞여 나왔다.
+다음 에이전트가 헷갈릴 수 있으니 분리해서 남긴다.
+
+이전에 실험 메모에서 사용한 대표 숫자:
+
+- coverage `0.3144`
+
+이 숫자는 실험용 backtest slice / 기존 비교 맥락에서 사용한 값이다.
+
+이번 턴 말미에 raw regime frame 기준으로 다시 확인한 값:
+
+- `coverage_all_rows = 0.2872`
+- `coverage_evaluable_rows = 0.2971`
+- `rows = 7778`
+- `evaluable_rows = 7519`
+
+즉 다음 에이전트는
+coverage 숫자를 말할 때 반드시 분모를 구분해야 한다.
+
+- `all_rows`: raw frame 전체 날짜
+- `evaluable_rows`: warmup/unavailable 제외 후 계산 가능한 날짜
+- 실험용 backtest slice: 특정 시작/종료 구간 + 분석 맥락에서 본 coverage
+
+따라서 `31.4% vs 28.7%`가 곧바로 “코드가 바뀌었다”는 뜻은 아니다.
+분모와 slice 차이가 섞여 있을 가능성이 높다.
+
+다음 세션에서 이 부분이 중요해지면,
+반드시 “어떤 기간 / 어떤 분모”인지 함께 적을 것.
+
+### 19.4 `stats.plot()`과 `wealth` 차이 해석
+이번 세션에서 사용자와 가장 길게 맞춘 개념 중 하나가 이 부분이다.
+
+핵심 결론:
+
+- `stats.plot()`은 “신호가 나온 날의 코호트 품질”을 보여준다.
+- `wealth` / `run()`은 “그 신호가 실제로 얼마나 자주 발생해서 자본이 얼마나 오래 노출되었는지”를 포함한 실제 포트폴리오 결과다.
+
+중요한 해석 포인트:
+
+- 처음에는 `stats.plot()`에서 annualized 차이가 큰데 `wealth CAGR` 차이가 작아서 혼란이 있었다.
+- 결론적으로 핵심은 `20개 코호트 분할`보다 `평균 노출도(mean_exposure)`였다.
+- 즉 코호트 품질이 좋아도, 신호가 드물고 실제 자본 노출이 낮으면 `wealth CAGR` 차이는 작게 나온다.
+
+이 논의 이후,
+`Pattern Frequency` 차트는 잘못된 해석을 유도한다고 판단했고,
+이제 `StatsCollection.plot()`의 4번째 축은 `Pattern Exposure (%)`다.
+
+정의:
+
+- `by="day"`: `신호가 있었던 날짜 수 / 전체 날짜 수`
+- `by="event"`: `패턴 event 수 / 산출 가능한 전체 stock-date opportunity 수`
+
+즉 이제 4번째 축은 benchmark 대비 비율이 아니라
+absolute exposure다.
+
+### 19.5 `Backtest` / `Simulator` UX 변경점
+이번 세션 이전까지 누적된 UX 변경을,
+다음 에이전트가 한 번에 이어받기 쉽게 묶어 적는다.
+
+#### A. 기본 레짐 자동 부착
+`Backtest(..., regime=regime)`를 넣으면,
+`analyze()`에 넘긴 패턴들과 benchmark에 default regime가 자동 부착된다.
+
+즉 노트북에서는 아래처럼 쓸 수 있다.
+
+```python
+regime = Regime().on(kind="trend_friendly", market="kospi")
+bt = Backtest(start=start, end=end, by="day", benchmark=benchmark, univ=univ, regime=regime)
+```
+
+그리고 이후 패턴은 `.when(regime)`를 반복할 필요가 없다.
+
+#### B. `Pattern.named()`
+패턴 이름 지정은 이제
+`.named("...")`
+를 쓴다.
+
+예:
+
+```python
+base = (bb + high52w + uptrend + mfi_high).named("trend_base")
+```
+
+`name()` 체이닝은 속성과 충돌 위험 때문에 버렸다.
+
+#### C. `bt.plot_wealth_curves()`
+`Backtest.plot_wealth_curves()`는
+마지막 `analyze()` 결과 전체를 한 화면에 wealth 차트로 그리고,
+아래에 요약 테이블을 반환한다.
+
+요약 테이블에는 `final_wealth` 열이 포함되어 있다.
+
+즉:
+
+- `total_return`: 누적 수익률
+- `final_wealth = 1 + total_return`
+
+#### D. KOSPI 오버레이 옵션
+`wealth` 계열 차트에서
+KOSPI 정규화 기준선을 옵션으로 그릴 수 있게 했다.
+
+현재 시그니처:
+
+```python
+bt.plot_wealth_curves(..., show_kospi=True)
+simul.plot(show_kospi=True)
+```
+
+기본값은 `False`다.
+`KOSDAQ` 오버레이는 제거했다.
+
+#### E. 레짐 음영
+`Backtest(..., regime=...)`로 실행한 경우,
+`wealth` 차트 배경에 활성 레짐 구간을 silver 톤으로 음영 처리한다.
+
+동일하게 동작하는 곳:
+
+- `bt.plot_wealth_curves(...)`
+- `simul = bt.run(...); simul.plot(...)`
+
+### 19.6 `total_fee_paid` 해석
+사용자가 이 지표 의미를 물어봤고,
+다음 에이전트도 같은 질문을 받을 가능성이 높아서 남긴다.
+
+`total_fee_paid`는
+현재 wealth 기준 수수료가 아니라,
+전체 기간 동안 코호트 매수/매도 때 발생한 수수료를 전부 합친 누적치다.
+
+단위는 원화가 아니라
+`wealth`와 같은 정규화 단위다.
+즉 시작 자산을 `1.0`으로 놓고 돌린 기준이다.
+
+예:
+
+- `total_fee_paid = 17.3`
+
+이면
+
+- “초기자산의 17.3배를 누적 수수료로 냈다”
+- 또는 “초기자산 대비 1730% 수준의 누적 수수료가 돌았다”
+
+는 뜻이다.
+
+이 값이 큰 이유는
+같은 자본이 여러 코호트로 반복 회전하기 때문이다.
+
+### 19.7 `trend` 패턴 실험 상태
+#### A. 대표 패턴
+현재 대표 패턴은 아래 둘 비교로 본다.
+
+- `trend_base`
+- `trend_amount1.5x`
+
+정의:
+
+- `trend_base = Bollinger breakout + 52주 고가 + MA200 상향 + MFI > 50`
+- `trend_amount1.5x = trend_base + AmountSurge(20, 1.5x)`
+
+#### B. RelativeStrength
+현재까지는 아래 테스트를 했고,
+주력 필터로 채택하지 않았다.
+
+- `RS60 >= 0`
+- `RS60 >= 5%p`
+- `RS120 >= 0`
+
+이유:
+
+- 표본은 줄지만,
+  현재 breakout 기준선을 안정적으로 이기지 못했다.
+
+#### C. RetestBreakout
+`RetestBreakout`은 2차 정교화까지 했다.
+
+추가했던 것:
+
+- `max_retest_days`
+- 실제 retest/reclaim 조건
+- optional `breakout_amount_threshold`
+
+그러나 결론은 아직 동일하다.
+
+- benchmark 대비로는 완전한 실패는 아니었음
+- 하지만 `trend_base` 또는 `trend_amount1.5x`를 넘지 못함
+- 따라서 현 단계에서는 주력 채택이 아니라 “실험용 second-entry 후보” 정도
+
+### 19.8 `panic_rebound_risk` 패턴 실험 상태
+현재 결론은 거의 명확하다.
+
+- `panic_rebound_risk`는 기본적으로 `off`가 우선이다.
+- 예외 전략이 꼭 필요하면 `MFI oversold_rebound` 정도만 가장 덜 나쁜 후보로 남겨둔다.
+
+`PanicRebound` 1차 구현은 완료했고,
+volume spike 옵션까지 실험했지만
+전체기간 기준으로 음수 성과가 강하게 나왔다.
+
+즉 다음 에이전트는
+panic 영역에서 “새 custom pattern을 더 만드는 것”보다,
+정책 자체를 정리하는 쪽이 우선이다.
+
+추천 정책 후보:
+
+1. `panic_rebound_risk = 완전 off`
+2. `panic_rebound_risk = MFI oversold_rebound만 예외 허용`
+
+### 19.9 노트북 상태
+현재 작업 노트북은
+`레짐-패턴실험 2026.03.17.ipynb`
+이다.
+
+공통 설정 셀:
+
+- import / `start` / `end` / `univ` / `benchmark`
+- `benchmark = Pattern(name="benchmark")`
+
+레짐별 섹션 구조:
+
+- `trend_friendly`
+  - 바로 아래에 `regime` / `bt` 정의 셀
+  - 그 아래 `대표 패턴`
+  - 그 아래 `실험`
+- `panic_rebound_risk`
+  - 바로 아래에 `regime` / `bt` 정의 셀
+  - 그 아래 `대표 패턴`
+  - 그 아래 `실험`
+
+중요:
+
+- 이번 세션 중간에 노트북 JSON 편집 과정에서
+  `trend_friendly` 공통 셀의 `regime=regime`가 주석으로 빠진 적이 있었다.
+- 이건 이미 수정했다.
+- 즉 현재 on-disk 파일 기준으로는 `trend` / `panic` 둘 다 `Backtest(..., regime=regime)` 상태다.
+
+또 하나 중요:
+
+- VS Code 노트북 탭이 예전 cached 상태를 보여준 적이 있었다.
+- 즉 다음 세션에서 “분명 파일은 바뀌었는데 화면이 다르게 보인다”면
+  노트북 탭을 닫고 다시 열거나,
+  파일 리로드를 먼저 의심하는 편이 좋다.
+
+### 19.10 현재 노트북에서 바로 다시 확인할 것
+다음 에이전트가 집 맥북에서 이어받으면,
+우선 아래 순서로 확인하는 것이 가장 효율적일 가능성이 높다.
+
+1. `레짐-패턴실험 2026.03.17.ipynb`의 `trend_friendly` 공통 셀 재실행
+2. 대표 패턴 셀 실행
+3. `stats.plot()`의 `Pattern Exposure (%)`
+4. `bt.plot_wealth_curves(..., show_kospi=True)`에서
+   `trend_base` vs `trend_amount1.5x`의 `wealth`, `final_wealth`, `mean_exposure`
+5. 필요하면 AmountSurge / RS / Retest 실험 셀 순서대로 재확인
+
+### 19.11 실제 미해결 상태
+아직 끝나지 않은 질문은 아래다.
+
+#### A. `trend_friendly`를 hard gate로 계속 쓸지
+현재까지의 해석:
+
+- strict trend gate는 지나치게 희소했다.
+- 완화 후에는 훨씬 실전적이 됐지만,
+  여전히 “전체 구간에서 패턴을 돌린 결과”와 비교하면 absolute wealth 차이가 클 수 있다.
+
+즉 남은 핵심 질문은:
+
+- `trend_friendly`를 hard on/off gate로 계속 유지할 것인가
+- 아니면 `panic`만 확실히 빼고 나머지는 더 넓게 허용할 것인가
+
+이건 다음 세션에서 가장 중요한 판단 포인트 중 하나다.
+
+#### B. `contrarian_friendly` 섹션 실전성
+문서상으로는 정의돼 있지만,
+현재 노트북에서는 실전 후보가 충분히 정리되지 않았다.
+
+즉 지금 레짐 재설계는 사실상
+
+- `trend_friendly`
+- `panic_rebound_risk`
+
+두 축을 먼저 검증한 상태에 가깝다.
+
+`contrarian_friendly`는
+다음 단계에서 정말 독립 가치가 있는지,
+패턴이 충분한지부터 다시 점검해야 한다.
+
+#### C. coverage 숫자 재검산
+앞서 적었듯
+`trend_friendly` coverage는 분모와 구간에 따라 숫자가 달라 보일 수 있다.
+
+맥북에서 이어받는 에이전트는
+다음번에 coverage를 다시 언급할 때
+반드시 아래 셋을 같이 적는 편이 좋다.
+
+1. 기간
+2. 분모(`all rows` / `evaluable rows` / `backtest slice`)
+3. market / univ 기준
+
+### 19.12 현재 코드/문서 파일 중 우선 참고 순서
+다음 에이전트에게 추천하는 읽기 순서는 아래다.
+
+1. 이 `CONTEXT.md`
+2. `레짐분류_실용재설계안.md`
+3. `src/regime.py`
+4. `레짐-패턴실험 2026.03.17.ipynb`
+5. `src/backtest.py`
+6. `src/simulate.py`
+
+특히 `레짐분류_실용재설계안.md`는
+현재 `trend_common_gate + quiet/broad/narrow branch` 구조와
+`safe narrow leadership` 편입까지 반영돼 있다.
+
+### 19.13 이번 세션에서 실제로 확인한 검증
+무거운 전체 노트북 실행은 WSL 메모리/시간 때문에 일부러 피했다.
+대신 아래 수준까지는 확인했다.
+
+- `python -m py_compile src/regime.py`
+- `python -m py_compile src/backtest.py src/simulate.py tests/test_backtest_context.py`
+- `python -m unittest tests.test_backtest_context -v`
+- 노트북 코드 셀 AST 파싱
+- `trend_friendly` old/new mask 동일성 확인
+- KOSPI 오버레이 옵션 테스트
+
+즉 코드 구조와 단위 동작은 신뢰해도 되지만,
+맥북에서 이어받는 다음 에이전트는
+실제 notebook 셀을 다시 실행해 결과를 확인하는 단계가 꼭 필요하다.
+
+### 19.14 다음 에이전트에게 바로 줄 수 있는 시작 문장
+사용자가 집에서 다시 이렇게 말할 가능성이 높다.
+
+```text
+CONTEXT.md를 참고로 해서 후속작업 진행하자.
+```
+
+그 경우 다음 에이전트는
+우선 `19.10 현재 노트북에서 바로 다시 확인할 것`
+순서대로 움직이면 된다.
+
+현재 가장 자연스러운 다음 단계는 아래 둘 중 하나다.
+
+1. `trend_friendly` 완화 후 실제 wealth / mean_exposure 개선을 노트북에서 재확인하고,
+   hard gate 유지 여부를 판단
+2. `panic_rebound_risk`를 정책적으로 `off`로 고정할지,
+   `MFI oversold_rebound` 예외 허용으로 둘지 결정

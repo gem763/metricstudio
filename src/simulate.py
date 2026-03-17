@@ -363,7 +363,34 @@ class Simulator:
             right = index[end_idx + 1] if (end_idx + 1) < len(index) else index[end_idx]
             ax.axvspan(left, right, color=color, alpha=alpha, linewidth=0.0, zorder=0)
 
-    def plot(self, figsize=(12, 5), return_handles: bool = False):
+    @staticmethod
+    def _plot_kospi_reference_curve(
+        ax,
+        index: pd.Index,
+        kospi_curve,
+    ) -> None:
+        """
+        시작값=1.0으로 정규화된 KOSPI 기준선을 wealth 축에 함께 그린다.
+        """
+
+        if kospi_curve is None:
+            return
+
+        arr = np.asarray(kospi_curve, dtype=np.float64)
+        if arr.ndim != 1 or arr.shape[0] != len(index):
+            return
+        ax.plot(
+            index,
+            arr,
+            linewidth=1.4,
+            linestyle="--",
+            alpha=0.9,
+            color="#6C757D",
+            label="KOSPI",
+            zorder=1.0,
+        )
+
+    def plot(self, figsize=(12, 5), show_kospi: bool = False, return_handles: bool = False):
         """
         노출도/보유종목수/자산곡선을 3개 패널로 시각화한다.
         """
@@ -444,10 +471,19 @@ class Simulator:
         axes[1].set_title("Portfolio count")
         axes[1].grid(alpha=0.25, linestyle="--")
 
-        axes[2].plot(out.index, out["wealth"], color="#067BC2", linewidth=2.0)
+        portfolio_label = str(meta.get("pattern", "Portfolio"))
+        axes[2].plot(out.index, out["wealth"], color="#067BC2", linewidth=2.0, label=portfolio_label)
+        kospi_curve = out.attrs.get("kospi_reference_curve")
+        if kospi_curve is None:
+            market_curves = out.attrs.get("market_reference_curves")
+            if isinstance(market_curves, dict):
+                kospi_curve = market_curves.get("KOSPI")
+        if show_kospi:
+            self._plot_kospi_reference_curve(axes[2], out.index, kospi_curve)
         axes[2].set_yscale("log")
         axes[2].set_title("Wealth (Log Scale)")
         axes[2].grid(alpha=0.25, linestyle="--")
+        axes[2].legend(loc="lower right", fontsize=9, frameon=True)
         axes[2].text(
             0.02,
             0.98,

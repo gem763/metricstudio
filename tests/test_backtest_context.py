@@ -19,7 +19,13 @@ matplotlib.use("Agg")
 
 
 class _FakeSimulator:
-    def __init__(self, pattern: str, cagr: float, regime_mask: np.ndarray | None = None):
+    def __init__(
+        self,
+        pattern: str,
+        cagr: float,
+        regime_mask: np.ndarray | None = None,
+        kospi_curve: np.ndarray | None = None,
+    ):
         self.pattern = pattern
         self._frame = pd.DataFrame(
             {
@@ -30,6 +36,8 @@ class _FakeSimulator:
         )
         if regime_mask is not None:
             self._frame.attrs["regime_active_mask"] = np.asarray(regime_mask, dtype=np.bool_).copy()
+        if kospi_curve is not None:
+            self._frame.attrs["kospi_reference_curve"] = np.asarray(kospi_curve, dtype=np.float64).copy()
         self._summary = {
             "pattern": pattern,
             "total_return": 0.10,
@@ -188,6 +196,31 @@ class BacktestContextTests(unittest.TestCase):
         colors = [line.get_color() for line in ax.lines]
         self.assertEqual(colors, ["black", "#D56062", "#067BC2"])
 
+    def test_plot_wealth_curves_can_show_kospi_reference(self):
+        bt = Backtest.__new__(Backtest)
+        bt._last_stats_collection = SimpleNamespace(
+            stats_map={
+                "benchmark": object(),
+                "trend_base": object(),
+            }
+        )
+
+        def _fake_run(*, pattern: str, target_horizon, trade_price_mode, **kwargs):
+            return _FakeSimulator(
+                pattern=pattern,
+                cagr=0.1,
+                kospi_curve=np.asarray([1.0, 1.01, 1.02], dtype=np.float64),
+            )
+
+        bt.run = _fake_run
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            bt.plot_wealth_curves(target_horizon="1M", trade_price_mode="당일종가", show_kospi=True)
+
+        ax = plt.gcf().axes[0]
+        self.assertEqual([line.get_label() for line in ax.lines], ["benchmark", "trend_base", "KOSPI"])
+
     def test_stats_plot_uses_absolute_day_exposure(self):
         dates = pd.date_range("2025-01-01", periods=5, freq="B").to_numpy()
         horizons = [("1W", 5)]
@@ -259,6 +292,7 @@ class BacktestContextTests(unittest.TestCase):
             index=dates,
         )
         sim.data.attrs["regime_active_mask"] = np.asarray([True, False, True, True], dtype=np.bool_)
+        sim.data.attrs["kospi_reference_curve"] = np.asarray([1.0, 1.01, 1.02, 1.03], dtype=np.float64)
         sim.pattern = "demo"
         sim.target_horizon = "1M"
         sim.target_horizon_days = 20
@@ -277,10 +311,11 @@ class BacktestContextTests(unittest.TestCase):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            _, axes = sim.plot(return_handles=True)
+            _, axes = sim.plot(show_kospi=True, return_handles=True)
 
         self.assertGreaterEqual(len(axes[0].patches), 2)
         self.assertGreaterEqual(len(axes[2].patches), 2)
+        self.assertEqual([line.get_label() for line in axes[2].lines], ["demo", "KOSPI"])
 
     def test_plot_wealth_curves_shades_regime_spans_when_present(self):
         bt = Backtest.__new__(Backtest)
@@ -306,6 +341,7 @@ class BacktestContextTests(unittest.TestCase):
 
         ax = plt.gcf().axes[0]
         self.assertGreaterEqual(len(ax.patches), 2)
+        self.assertEqual([line.get_label() for line in ax.lines], ["benchmark", "trend_base"])
 
 
 if __name__ == "__main__":

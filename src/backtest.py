@@ -1251,6 +1251,30 @@ class Backtest:
             self._market_values_cache[key] = aligned
         return self._market_values_cache[key]
 
+    def _normalized_kospi_reference_curve(self, index: pd.Index | np.ndarray) -> np.ndarray | None:
+        """
+        주어진 날짜 구간에 맞춰 KOSPI 종가를 시작값=1.0으로 정규화해 반환한다.
+        """
+
+        ref_index = pd.DatetimeIndex(index)
+        date_index = pd.DatetimeIndex(self.dates)
+        close = pd.Series(
+            self._get_market_values("kospi", "close"),
+            index=date_index,
+            dtype="float64",
+        )
+        aligned = close.reindex(ref_index).to_numpy(dtype=np.float64, copy=True)
+        valid = np.isfinite(aligned)
+        if not valid.any():
+            return None
+        first_valid_idx = int(np.flatnonzero(valid)[0])
+        start_value = float(aligned[first_valid_idx])
+        if not np.isfinite(start_value) or start_value == 0.0:
+            return None
+        normalized = np.full(aligned.shape, np.nan, dtype=np.float64)
+        normalized[valid] = aligned[valid] / start_value
+        return normalized
+
     def _iter_pattern_nodes(self, pattern_fn: Pattern):
         """
         결합 패턴 트리를 순회하며 하위 Pattern 노드를 반환한다.
@@ -2858,6 +2882,10 @@ class Backtest:
                 regime_mask[start_idx:end_idx],
                 dtype=np.bool_,
             ).copy()
+        if result.data is not None:
+            kospi_curve = self._normalized_kospi_reference_curve(result.data.index)
+            if kospi_curve is not None:
+                result.data.attrs["kospi_reference_curve"] = kospi_curve
         return result
 
     def diagnose_gate(
@@ -3176,6 +3204,7 @@ class Backtest:
         patterns: list[str] | tuple[str, ...] | None = None,
         target_horizon: str | int = "1M",
         trade_price_mode: str = "당일종가",
+        show_kospi: bool = False,
         figsize=(10, 5),
         log_scale: bool = True,
     ) -> pd.DataFrame:
@@ -3204,6 +3233,8 @@ class Backtest:
             color_map = dict(stats_collection._pattern_colors(pattern_names))
         regime_mask_to_shade = None
         regime_index = None
+        plot_index = None
+        kospi_reference_curve = None
 
         for pattern_name in pattern_names:
             simul = self.run(
@@ -3213,11 +3244,20 @@ class Backtest:
             )
             frame = simul.to_frame(copy=False)
             wealth = frame["wealth"]
+            if plot_index is None:
+                plot_index = wealth.index
             if regime_mask_to_shade is None:
                 regime_mask = frame.attrs.get("regime_active_mask")
                 if regime_mask is not None:
                     regime_mask_to_shade = np.asarray(regime_mask, dtype=np.bool_).copy()
                     regime_index = wealth.index
+                kospi_curve = frame.attrs.get("kospi_reference_curve")
+                if kospi_curve is None:
+                    market_curves = frame.attrs.get("market_reference_curves")
+                    if isinstance(market_curves, dict):
+                        kospi_curve = market_curves.get("KOSPI")
+                if kospi_curve is not None:
+                    kospi_reference_curve = np.asarray(kospi_curve, dtype=np.float64).copy()
             ax.plot(
                 wealth.index,
                 wealth.to_numpy(dtype=float),
@@ -3255,6 +3295,8 @@ class Backtest:
 
         if regime_mask_to_shade is not None and regime_index is not None:
             Simulator._shade_regime_spans(ax, regime_index, regime_mask_to_shade)
+        if show_kospi and kospi_reference_curve is not None and plot_index is not None:
+            Simulator._plot_kospi_reference_curve(ax, plot_index, kospi_reference_curve)
         if log_scale:
             ax.set_yscale("log")
             ax.set_title(f"Wealth Curves (Log) | horizon={target_horizon}")
@@ -3263,7 +3305,10 @@ class Backtest:
         ax.set_ylabel("Wealth")
         ax.grid(alpha=0.25, linestyle="--")
         if stats_collection is not None and hasattr(stats_collection, "_apply_legend_order"):
-            stats_collection._apply_legend_order(ax, pattern_names)
+            legend_names = list(pattern_names)
+            if show_kospi and kospi_reference_curve is not None:
+                legend_names.append("KOSPI")
+            stats_collection._apply_legend_order(ax, legend_names)
         else:
             ax.legend(loc="best", fontsize=9)
         fig.tight_layout()
