@@ -879,11 +879,14 @@ threshold를 많이 건드리는 대신 설명 가능한 소수 후보만 비교
 
 최종 반영:
 
-- `trend_narrow_branch`를 추가
-- 조건:
-  - `narrow_tag`
+- `trend_common_gate`
+  - `trend_score >= 2.0`
   - `dd60 > -0.08`
   - `rv20_pct240 < 0.80`
+- `trend_narrow_branch`
+  - `large_pct_above60 >= 0.60`
+  - `small_pct_above60 <= 0.45`
+  - `leadership_spread >= 0.15`
   - `aar5 >= 0.45`
 
 즉 “좁은 리더십 장세이지만 시장 스트레스가 심하지 않고,
@@ -903,6 +906,9 @@ trend로 받아들이는 쪽으로 정리했다.
   여전히 inside가 outside보다 뚜렷하게 낫다.
 - 그래서 이 변경은 “추세 정의를 버린 확장”이 아니라,
   `safe narrow leadership`까지 포함한 실전형 trend 정의로 보는 편이 맞다.
+- 이후 구현 가독성을 위해 `trend_friendly`는
+  `trend_common_gate + quiet/broad/narrow branch` 구조로 정리했고,
+  branch 계산식 안에서 `narrow_tag`를 직접 참조하지 않도록 바꿨다.
 
 ### 18.6 다음 체크포인트
 다음 에이전트는 이 변경 후 바로 아래 두 가지를 다시 확인하는 것이 좋다.

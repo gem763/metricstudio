@@ -260,25 +260,25 @@ def build_regime_frame(
         & (out["leadership_spread"] >= 0.15)
     )
 
-    trend_quiet_branch = evaluable & (~panic_mask) & (
+    trend_common_gate = evaluable & (~panic_mask) & (
         (out["trend_score"] >= 2.0)
         & (out["dd60"] > -0.08)
         & (out["rv20_pct240"] < 0.80)
-        & (out["bbw20_pct240"] <= 0.20)
+    )
+    trend_quiet_branch = trend_common_gate & (
+        (out["bbw20_pct240"] <= 0.20)
         & (out["rv20_pct240"] <= 0.40)
         & (out["pct_above20_delta5"] >= 0.05)
         & (out["pct_above20_all"] >= 0.45)
     )
-    trend_broad_branch = evaluable & (~panic_mask) & (
-        (out["trend_score"] >= 2.0)
-        & (out["pct_above60_all"] >= 0.50)
+    trend_broad_branch = trend_common_gate & (
+        (out["pct_above60_all"] >= 0.50)
         & (out["aar5"] >= 0.50)
-        & (out["rv20_pct240"] < 0.80)
-        & (out["dd60"] > -0.08)
     )
-    trend_narrow_branch = evaluable & (~panic_mask) & narrow_tag & (
-        (out["dd60"] > -0.08)
-        & (out["rv20_pct240"] < 0.80)
+    trend_narrow_branch = trend_common_gate & (
+        (out["large_pct_above60"] >= 0.60)
+        & (out["small_pct_above60"] <= 0.45)
+        & (out["leadership_spread"] >= 0.15)
         & (out["aar5"] >= 0.45)
     )
     trend_friendly = trend_quiet_branch | trend_broad_branch | trend_narrow_branch
