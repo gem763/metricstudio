@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "/root/miniconda3/envs/metricstudio/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ],
+  "jupyter.notebookFileRoot": "${workspaceFolder}"
+}

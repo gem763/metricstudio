@@ -336,6 +336,33 @@ class Simulator:
             "total_fee_paid": float(self.total_fee_paid),
         }
 
+    @staticmethod
+    def _shade_regime_spans(
+        ax,
+        index: pd.Index,
+        regime_mask,
+        *,
+        color: str = "silver",
+        alpha: float = 0.18,
+    ) -> None:
+        """
+        bool regime 마스크의 연속 구간을 x축 배경 음영으로 표시한다.
+        """
+
+        if regime_mask is None or len(index) == 0:
+            return
+        mask = np.asarray(regime_mask, dtype=np.bool_)
+        if mask.ndim != 1 or mask.shape[0] != len(index):
+            return
+
+        padded = np.concatenate(([False], mask, [False]))
+        starts = np.flatnonzero(padded[1:] & ~padded[:-1])
+        ends = np.flatnonzero(padded[:-1] & ~padded[1:]) - 1
+        for start_idx, end_idx in zip(starts, ends):
+            left = index[start_idx]
+            right = index[end_idx + 1] if (end_idx + 1) < len(index) else index[end_idx]
+            ax.axvspan(left, right, color=color, alpha=alpha, linewidth=0.0, zorder=0)
+
     def plot(self, figsize=(12, 5), return_handles: bool = False):
         """
         노출도/보유종목수/자산곡선을 3개 패널로 시각화한다.
@@ -373,6 +400,9 @@ class Simulator:
         fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=False, sharex=True)
         for ax in axes:
             ax.set_box_aspect(1.0)
+        regime_mask = out.attrs.get("regime_active_mask")
+        for ax in axes:
+            self._shade_regime_spans(ax, out.index, regime_mask)
 
         axes[0].plot(
             out.index,

@@ -271,12 +271,17 @@ def build_regime_frame(
     )
     trend_broad_branch = evaluable & (~panic_mask) & (
         (out["trend_score"] >= 2.0)
-        & (out["pct_above60_all"] >= 0.55)
-        & (out["aar5"] >= 0.55)
+        & (out["pct_above60_all"] >= 0.50)
+        & (out["aar5"] >= 0.50)
         & (out["rv20_pct240"] < 0.80)
         & (out["dd60"] > -0.08)
     )
-    trend_friendly = trend_quiet_branch | trend_broad_branch
+    trend_narrow_branch = evaluable & (~panic_mask) & narrow_tag & (
+        (out["dd60"] > -0.08)
+        & (out["rv20_pct240"] < 0.80)
+        & (out["aar5"] >= 0.45)
+    )
+    trend_friendly = trend_quiet_branch | trend_broad_branch | trend_narrow_branch
 
     contrarian_friendly = evaluable & (~panic_mask) & (~trend_friendly) & (
         (

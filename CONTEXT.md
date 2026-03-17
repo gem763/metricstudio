@@ -288,8 +288,53 @@ RelativeStrength(name='상대강도').market('kospi').on(window=60, threshold=0.
 AmountSurge(name='거래대금급증').on(window=20, threshold=1.5)
 ```
 
-### 8.3 export
-둘 다 `__all__`에 반영했다.
+### 8.3 `RetestBreakout`
+위치:
+- `src/pattern.py`
+
+의미:
+- 최근 `breakout_window` 고점 돌파가 먼저 나온 뒤
+- 그 돌파 레벨 근처(`retest_tolerance`)로 눌림이 들어오고
+- 첫 양봉성 반등(`rebound_confirm='close_up'`)이 나올 때만 통과
+
+예:
+```python
+RetestBreakout(name='돌파후눌림').on(
+    breakout_window=20,
+    retest_tolerance=0.03,
+    rebound_confirm='close_up',
+)
+```
+
+주의:
+- 현재는 close only 기준의 1차 구현이다.
+- intraday 저점/거래대금 재확인까지는 아직 넣지 않았다.
+
+### 8.4 `PanicRebound`
+위치:
+- `src/pattern.py`
+
+의미:
+- 최근 `drawdown_window`일 기준 고점 대비 큰 낙폭(`drawdown_min`)이 먼저 나온 뒤
+- `rebound_days` 연속 반등이 나올 때만 통과
+- 선택적으로 신호일 거래량 급증(`volume_spike`)도 요구 가능
+
+예:
+```python
+PanicRebound(name='패닉반등').on(
+    drawdown_window=20,
+    drawdown_min=-0.18,
+    rebound_days=3,
+    volume_spike=True,
+)
+```
+
+주의:
+- 현재는 close/volume 기반의 1차 구현이다.
+- intraday 저점 반전이나 장중 reversal 캔들까지는 아직 반영하지 않았다.
+
+### 8.5 export
+넷 다 `__all__`에 반영했다.
 - `src/pattern.py:1106`
 
 ---
@@ -453,6 +498,128 @@ python scripts/validate_trend_filters.py
 - `geom_ann_gap_after_cost`
 를 출력한다.
 
+### 10.5 `RetestBreakout` 1차 구현 및 비교 결과
+이번 턴에서 `RetestBreakout` 1차 버전을 구현하고,
+별도 비교 스크립트로 아래 3가지를 같이 비교했다.
+
+- `base`
+- `base + AmountSurge(20, 1.5x)`
+- `retest = RetestBreakout + 52주고가 + MA200상향 + MFI>50`
+
+재현 스크립트:
+- `scripts/validate_retest_breakout.py`
+
+전체기간 결과(`trend_friendly`, benchmark 대비 `geom annualized gap after cost`):
+
+- `base`: `1M 0.3208`, `2M 0.2415`, `3M 0.1658`, `6M 0.1148`
+- `base+amount1.5x`: `1M 0.3811`, `2M 0.2931`, `3M 0.1947`, `6M 0.1208`
+- `retest`: `1M 0.1161`, `2M 0.1238`, `3M 0.0905`, `6M 0.0577`
+
+핵심 해석:
+- `RetestBreakout` 1차 버전도 benchmark보다는 양(+)의 gap을 냈다.
+- 하지만 현재 구현은 `count_ratio`가 거의 `1.0`이라 표본 압축력이 너무 약했다.
+- 결과적으로 현재 breakout 기준선이나 `AmountSurge(20, 1.5x)` 기준선보다 명확히 약했다.
+
+구간별 관찰:
+- `2000-2006`, `2007-2012`, `2013-2018`, `2019-2025` 전 구간에서
+  `retest`는 대체로 benchmark보다는 낫지만,
+  `base+amount1.5x`를 이기지는 못했다.
+
+실전 해석:
+- 아이디어 자체가 틀렸다고 보기보다,
+  현재 close only 정의가 너무 느슨해서 사실상 benchmark에 가까운 밀도로 신호를 낸다고 보는 편이 맞다.
+- 다음 단계는 `RetestBreakout`을 폐기하는 것보다,
+  시간 제한/재돌파 확인/추가 품질 확인을 넣어 더 타이트하게 재정의하는 쪽이 자연스럽다.
+
+### 10.6 `RetestBreakout` 2차 정교화 결과
+이후 바로 2차 정교화를 한 번 더 진행했다.
+
+추가한 내용:
+- `max_retest_days`
+- retest를 실제 breakout level 이하 구간으로 제한
+- rebound day는 breakout level을 다시 회복해야만 진입
+- 선택 옵션으로 `breakout_amount_threshold`를 추가해
+  거래대금이 붙은 breakout만 setup으로 인정 가능하게 함
+
+추가 비교:
+- `retest`
+- `retest + breakout_amount1.5x`
+
+전체기간 결과(`trend_friendly`, benchmark 대비 `geom annualized gap after cost`):
+
+- `retest`: `1M 0.1624`, `2M 0.1326`, `3M 0.0962`, `6M 0.0546`
+- `retest+breakout_amount1.5x`: `1M 0.1321`, `2M 0.1349`, `3M 0.1135`, `6M 0.0606`
+
+해석:
+- 거래대금 필터를 얹으면 `count_ratio`는 `0.979 -> 0.936` 수준으로 내려왔다.
+- `2M ~ 6M`은 약간 나아졌지만, `1M`은 오히려 약해졌다.
+- 무엇보다도 두 variant 모두 여전히 `base`와 `base+AmountSurge(20, 1.5x)`를 이기지 못했다.
+
+실전 결론:
+- `RetestBreakout`은 아이디어 검증 수준으로는 의미가 있지만,
+  지금 상태에서 주력 후보로 승격할 정도의 우위는 아직 없다.
+- 즉 이 패턴은 잠정 보류하고,
+  trend family의 주력은 여전히 `base + AmountSurge(20, 1.5x)`로 보는 것이 맞다.
+- 이후 다시 손댄다면, 단순 파라미터 조정보다
+  breakout day 품질이나 intraday retest 정보 같은 더 구조적인 조건이 필요해 보인다.
+
+### 10.7 `PanicRebound` 1차 구현 및 비교 결과
+이번 턴에서 `PanicRebound` 1차 버전을 구현하고,
+`panic_rebound_risk` 레짐 안에서 아래 패턴들을 같이 비교했다.
+
+- `Disparity(20, threshold=0.9)`
+- `MFI(trigger='oversold_rebound')`
+- `PanicRebound`
+- `PanicRebound(volume_spike=True, volume_threshold=1.5)`
+
+재현 스크립트:
+- `scripts/validate_panic_rebound.py`
+
+여기서 용어:
+- `benchmark`: 같은 `panic_rebound_risk` 레짐 안의 전체 종목
+- `count_ratio`: 패턴 count / benchmark count
+- `geom_ann_gap_after_cost`: 비용 반영 후 연율화 기하수익률의 benchmark 대비 초과성과
+
+전체기간 결과:
+
+`Disparity(20, 0.9)`:
+- `1M -0.0095`
+- `2M -0.0209`
+- `3M -0.0487`
+- `6M -0.0581`
+
+`MFI oversold_rebound`:
+- `1M 0.0319`
+- `2M 0.0258`
+- `3M 0.0120`
+- `6M 0.0041`
+
+`PanicRebound`:
+- `1M -0.2607`
+- `2M -0.1732`
+- `3M -0.1599`
+- `6M -0.1470`
+
+`PanicRebound + volume1.5x`:
+- `1M -0.4705`
+- `2M -0.3722`
+- `3M -0.3358`
+- `6M -0.2874`
+
+해석:
+- `PanicRebound` 1차 버전은 plain/volume 둘 다 benchmark를 크게 하회했다.
+- volume 필터를 붙이면 `count_ratio`는 `0.982 -> 0.909`로 줄었지만 성과는 더 나빠졌다.
+- 즉 현재 정의의 `PanicRebound`는 실전 후보로 보기 어렵다.
+
+추가 빠른 점검:
+- 같은 panic 레짐에서 `Bollinger(trigger='near_down') + MFI oversold_rebound`도 확인했지만
+  전체기간 `1M -0.0354 / 2M -0.0865 / 3M -0.0480 / 6M -0.0230`로 약했다.
+
+실전 결론:
+- panic 레짐에서는 새 custom 패턴보다 기존 `MFI oversold_rebound`가 least-bad baseline에 가깝다.
+- 현재 단계에서는 panic 구간을 기본적으로 꺼 두고,
+  예외전략이 꼭 필요하면 `MFI oversold_rebound` 정도만 아주 보수적으로 보는 쪽이 맞다.
+
 ---
 
 ## 11) 테스트 파일
@@ -472,6 +639,13 @@ python -m unittest tests.test_pattern_filters -v
 - `RelativeStrength`가 `.on(market=...)` 방식으로 동작하는지
 - `RelativeStrength`가 `.market(...).on(...)` 방식으로도 동작하는지
 - `AmountSurge`가 rolling mean 대비 스파이크를 제대로 감지하는지
+- `RetestBreakout`이 돌파 후 첫 반등만 잡는지
+- `RetestBreakout`이 허용폭 아래로 깨진 실패 retest는 무시하는지
+- `RetestBreakout`이 `max_retest_days`를 넘기면 setup을 폐기하는지
+- `RetestBreakout`이 breakout day 거래대금 급증을 선택적으로 요구할 수 있는지
+- `PanicRebound`가 급락 후 반등 구간을 잡는지
+- `PanicRebound`가 최근 panic drawdown이 없으면 신호를 내지 않는지
+- `PanicRebound`가 volume spike를 선택적으로 요구할 수 있는지
 
 참고:
 - `pytest`는 현재 환경에 없어서 실패했다 (`pytest: command not found`).
@@ -545,11 +719,25 @@ source ~/miniconda3/etc/profile.d/conda.sh && conda activate metricstudio
 python scripts/validate_trend_filters.py
 ```
 
+### retest 1차 검증 스크립트
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate metricstudio
+python scripts/validate_retest_breakout.py
+```
+
+### panic rebound 검증 스크립트
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate metricstudio
+python scripts/validate_panic_rebound.py
+```
+
 ### 문법 검사
 ```bash
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate metricstudio
 python -m py_compile src/regime.py src/backtest.py src/pattern.py src/stats.py \
-  scripts/validate_trend_filters.py tests/test_pattern_filters.py
+  scripts/validate_trend_filters.py scripts/validate_retest_breakout.py \
+  scripts/validate_panic_rebound.py \
+  tests/test_pattern_filters.py
 ```
 
 ---
@@ -558,7 +746,7 @@ python -m py_compile src/regime.py src/backtest.py src/pattern.py src/stats.py \
 
 ### 15.1 `src/pattern.py` diff가 과장돼 보일 수 있음
 이 파일은 CRLF라서 도구에 따라 diff가 비정상적으로 커질 수 있다.
-논리적으로는 이번에 `RelativeStrength`, `AmountSurge`, `__all__` 정도가 핵심 변경이다.
+논리적으로는 이번에 `RelativeStrength`, `AmountSurge`, `RetestBreakout`, `__all__` 정도가 핵심 변경이다.
 다음 에이전트는 줄바꿈까지 대대적으로 손대지 말 것.
 
 ### 15.2 저장소가 이미 dirty함
@@ -583,20 +771,21 @@ python -m py_compile src/regime.py src/backtest.py src/pattern.py src/stats.py \
 ---
 
 ## 16) 다음 에이전트에게 가장 중요한 추천 다음 단계
-다음 단계로 가장 자연스러운 작업은 `RetestBreakout` 구현이다.
+다음 단계로 가장 자연스러운 작업은 panic 예외전략을 더 만들기보다,
+`panic_rebound_risk`를 기본적으로 off로 둘지 정책을 정리하는 것이다.
 
 이유:
-- 현재는 "초기 돌파" 필터는 꽤 정리됐다.
-- `AmountSurge(20, 1.5x)`로 돌파 품질 확인 필터도 확보했다.
-- 다음 실전성 보강은 "돌파 후 눌림 재진입" 패턴을 추가해
-  trend family 안에서 second entry를 테스트하는 것이 ROI가 가장 높다.
+- `PanicRebound` 1차는 plain/volume 모두 매우 약했다.
+- panic 레짐 안의 기존 후보 중에서는 `MFI oversold_rebound`만 겨우 소폭 플러스였다.
+- 즉 panic은 “공격적으로 공략할 구간”이라기보다,
+  대부분 전략을 끄고 아주 제한적인 예외만 허용할지 결정하는 구간에 가깝다.
 
 즉 다음 Codex는
 
 1. `CONTEXT.md`를 먼저 읽고
-2. `레짐분류_실용재설계안.md`의 `RetestBreakout` 부분을 참고하고
-3. `src/pattern.py`에 최소한의 `RetestBreakout` 1차 버전을 구현하고
-4. `AmountSurge(20,1.5x)` 기준선과 비교 검증
+2. `scripts/validate_panic_rebound.py` 결과를 먼저 확인하고
+3. panic 구간에서 정말 켤 전략을 `없음` 또는 `MFI oversold_rebound`로 둘지 먼저 결정하고
+4. 그 다음에야 panic 레짐 경계 조정 또는 예외전략 고도화를 검토
 
 순서로 가는 것이 가장 좋다.
 
@@ -613,3 +802,110 @@ CONTEXT.md를 참고로 해서 후속작업을 진행하자.
 
 이 문서를 읽은 다음 에이전트는,
 별도 설명 없이도 현재 상태를 충분히 이어받을 수 있어야 한다.
+
+---
+
+## 18) `trend_friendly` 1차 완화
+이번 턴에서 사용자가 직접 문제제기한 것은
+`trend_friendly`가 너무 희소해서(`~14.3% coverage`)
+좋은 추세 패턴의 절대 성과를 지나치게 깎고 있다는 점이었다.
+
+### 18.1 확인한 사실
+기존 `trend_friendly`는 coverage가 `0.1431` 수준이었다.
+
+하지만 quality separation 자체는 맞았다.
+
+- `base` 1M `geom_mean`: inside `0.0371`, outside `0.0155`
+- `best` 1M `geom_mean`: inside `0.0405`, outside `0.0177`
+
+즉 방향이 틀린 레짐이라기보다,
+하드 on/off 게이트로 쓰기엔 너무 엄격한 레짐에 가까웠다.
+
+### 18.2 완화안 비교
+과최적화를 피하려고,
+threshold를 많이 건드리는 대신 설명 가능한 소수 후보만 비교했다.
+
+비교한 핵심 후보:
+
+- `narrow_tag`를 trend에 합치기
+- `trend_broad_branch` breadth threshold만 `0.55 -> 0.50`으로 완화
+- quiet/broad를 같이 조금 더 완화
+
+결론:
+- `narrow_tag`를 합치는 안은 coverage는 늘지만 quality 저하가 더 컸다.
+- quiet branch까지 여러 threshold를 같이 만지는 안은 coverage 추가 이득이 작고 임의성이 커졌다.
+- 가장 자연스러운 안은 `trend_broad_branch`만 완화하는 것이었다.
+
+### 18.3 최종 반영
+`src/regime.py`에서 아래 둘만 조정했다.
+
+- `pct_above60_all >= 0.55 -> 0.50`
+- `aar5 >= 0.55 -> 0.50`
+
+관련 위치:
+- `src/regime.py`의 `trend_broad_branch`
+
+### 18.4 반영 후 해석
+이 완화는 “추세인데 breadth가 아주 강하지는 않은 구간”까지 포용하려는 조정이다.
+즉 레짐 의미를 바꾸기보다,
+지나치게 강한 breadth 확인을 조금 완화한 것이다.
+
+내부 비교상 coverage는 대략 `14.3% -> 23.8%`로 늘었고,
+`inside > outside` 품질 차이도 여전히 유지됐다.
+
+대표값:
+
+- `base` inside/outside 1M `geom_mean`: `0.0326 / 0.0138`
+- `best` inside/outside 1M `geom_mean`: `0.0357 / 0.0158`
+
+즉 현재 판단은:
+
+- 기존 `trend_friendly`는 너무 엄격했다.
+- 하지만 레짐 방향 자체는 맞았다.
+- 그래서 이번 조정은 레짐 폐기가 아니라 “breadth 문턱의 보수적 완화”다.
+
+### 18.5 `30%+ coverage` 추가 조정
+이후 사용자가 trend coverage를 최소 `30%` 이상으로 올리고 싶다고 요청했다.
+
+여기서도 과최적화를 피하려고,
+무작정 threshold를 더 낮추는 대신
+`narrow leadership`을 제한적으로 trend 안에 편입할 수 있는지 비교했다.
+
+비교 결과:
+
+- `narrow_tag`를 그대로 합치면 coverage는 충분히 늘지만 품질 희석이 더 컸다.
+- `narrow_tag`에 안전장치(`dd60`, `rv20_pct240`, `aar5`)를 같이 걸면
+  coverage `30%+`를 넘기면서도 inside/outside 분리력이 유지됐다.
+
+최종 반영:
+
+- `trend_narrow_branch`를 추가
+- 조건:
+  - `narrow_tag`
+  - `dd60 > -0.08`
+  - `rv20_pct240 < 0.80`
+  - `aar5 >= 0.45`
+
+즉 “좁은 리더십 장세이지만 시장 스트레스가 심하지 않고,
+advancing amount도 완전히 죽지 않은 구간”만
+trend로 받아들이는 쪽으로 정리했다.
+
+반영 후 대표값:
+
+- coverage: `0.3144`
+- `base` inside/outside 1M `geom_mean`: `0.0287 / 0.0135`
+- `best` inside/outside 1M `geom_mean`: `0.0303 / 0.0164`
+
+해석:
+
+- coverage는 목표한 `30%+`를 넘겼다.
+- 품질은 이전 `23.8%` 버전보다 조금 희석됐지만,
+  여전히 inside가 outside보다 뚜렷하게 낫다.
+- 그래서 이 변경은 “추세 정의를 버린 확장”이 아니라,
+  `safe narrow leadership`까지 포함한 실전형 trend 정의로 보는 편이 맞다.
+
+### 18.6 다음 체크포인트
+다음 에이전트는 이 변경 후 바로 아래 두 가지를 다시 확인하는 것이 좋다.
+
+1. 노트북에서 `trend_base`, `trend_amount1.5x` wealth / mean_exposure가 실제로 얼마나 개선되는지
+2. `panic_rebound_risk`를 off 정책으로 갈지 여부를 다시 이어서 정리할지

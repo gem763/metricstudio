@@ -763,6 +763,7 @@ class StatsCollection:
 
     stats_map: Dict[str, Stats]
     benchmark_names: set[str] = field(default_factory=set)
+    exposure_opportunity_counts: np.ndarray | None = None
 
     def _ordered_pattern_names(self, patterns: Iterable[str] | None = None) -> List[str]:
         """
@@ -954,6 +955,37 @@ class StatsCollection:
             keys.append(name)
         return pd.concat(frames, keys=keys, names=["pattern"])
 
+    def _exposure_denominator_map(self, start=None, end=None) -> Dict[str, float]:
+        """
+        plot()의 Pattern Exposure 분모를 horizon별로 계산한다.
+        """
+
+        if not self.stats_map:
+            return {}
+
+        ref = next(iter(self.stats_map.values()))
+        start_idx, end_idx = ref._slice_indices(start, end)
+        if ref.aggregation_mode == "daily_mean":
+            denom = float(max(0, end_idx - start_idx))
+            return {label: denom for label, _ in ref.horizons}
+
+        exposure_opportunity_counts = getattr(self, "exposure_opportunity_counts", None)
+        if exposure_opportunity_counts is None:
+            return {label: float("nan") for label, _ in ref.horizons}
+
+        num_h, num_dates = exposure_opportunity_counts.shape
+        lo = max(0, min(start_idx, num_dates))
+        hi = max(lo, min(end_idx, num_dates))
+        out: Dict[str, float] = {}
+        for h_idx, (label, _) in enumerate(ref.horizons):
+            if h_idx >= num_h:
+                out[label] = float("nan")
+                continue
+            out[label] = float(
+                np.sum(exposure_opportunity_counts[h_idx, lo:hi], dtype=np.float64)
+            )
+        return out
+
     def plot(
         self,
         patterns: Iterable[str] | None = None,
@@ -991,31 +1023,22 @@ class StatsCollection:
             df["pattern"] = name
             frames.append(df)
         combined = pd.concat(frames, ignore_index=True)
-        benchmark_name = next((name for name in names if name in self.benchmark_names), None)
-        if benchmark_name is None:
-            benchmark_name = next((name for name in self.stats_map if name in self.benchmark_names), None)
-        if benchmark_name is not None:
-            benchmark_counts = (
-                self.get(benchmark_name)
-                .to_frame(start, end)
-                .reset_index()[["period", "scope", "count"]]
-                .rename(columns={"count": "benchmark_count"})
-            )
-            combined = combined.merge(benchmark_counts, on=["period", "scope"], how="left")
-            benchmark_count = combined["benchmark_count"].to_numpy(dtype=float)
-            pattern_count = combined["count"].to_numpy(dtype=float)
-            is_non_benchmark = ~combined["pattern"].isin(self.benchmark_names).to_numpy(dtype=bool)
-            valid_ratio = (
-                is_non_benchmark
-                & np.isfinite(pattern_count)
-                & np.isfinite(benchmark_count)
-                & (benchmark_count > 0.0)
-            )
-            count_ratio = np.full(len(combined), np.nan, dtype=np.float64)
-            count_ratio[valid_ratio] = pattern_count[valid_ratio] / benchmark_count[valid_ratio]
-            combined["count_ratio"] = count_ratio
-        else:
-            combined["count_ratio"] = np.nan
+        exposure_denominator_map = self._exposure_denominator_map(start, end)
+        combined["exposure_denominator"] = (
+            combined["period"].map(exposure_denominator_map).astype(float)
+        )
+        exposure_denominator = combined["exposure_denominator"].to_numpy(dtype=float)
+        pattern_count = combined["count"].to_numpy(dtype=float)
+        valid_exposure = (
+            np.isfinite(pattern_count)
+            & np.isfinite(exposure_denominator)
+            & (exposure_denominator > 0.0)
+        )
+        exposure_ratio = np.full(len(combined), np.nan, dtype=np.float64)
+        exposure_ratio[valid_exposure] = (
+            pattern_count[valid_exposure] / exposure_denominator[valid_exposure]
+        )
+        combined["exposure_ratio"] = exposure_ratio
         combined["horizon_days"] = combined["period"].map(horizon_day_map).astype(float)
         if cost_enabled:
             combined["arith_mean"] = _apply_roundtrip_cost(
@@ -1053,9 +1076,7 @@ class StatsCollection:
                 xs, group["geom_mean"] * 100.0, marker="o", linestyle="-", color=color, label=name
             )
             axes[2].plot(xs, group["rise_prob"] * 100.0, marker="o", color=color, label=name)
-            if name in self.benchmark_names:
-                continue
-            axes[3].plot(xs, group["count_ratio"] * 100.0, marker="o", color=color, label=name)
+            axes[3].plot(xs, group["exposure_ratio"] * 100.0, marker="o", color=color, label=name)
 
         return_title_prefix = "Annualized " if annualized else ""
         if cost_enabled:
@@ -1065,7 +1086,7 @@ class StatsCollection:
             (axes[0], f"{return_title_prefix}Arithmetic Mean", return_ylabel, True),
             (axes[1], f"{return_title_prefix}Geometric Mean", return_ylabel, True),
             (axes[2], "Rise Probability (%)", "Rise Probability (%)", False),
-            (axes[3], "Pattern Frequency (%)", "Pattern Frequency (%)", False),
+            (axes[3], "Pattern Exposure (%)", "Pattern Exposure (%)", False),
         ]:
             if draw_zero:
                 ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")

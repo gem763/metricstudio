@@ -19,7 +19,7 @@ class Pattern:
         self,
         name: str | None = None,
     ):
-        self.name = name or self.__class__.__name__.lower()
+        self.name = self._resolve_name(name)
         self.trim_quantile: float | None = None
         self.trim_method: str = "remove"
         self.market_name: str | None = None
@@ -31,6 +31,18 @@ class Pattern:
         self.params: SimpleNamespace | None = None
         self._post_mask_fn: Callable[[np.ndarray], np.ndarray] = self._post_mask_base
         self._regimes: list[Regime] = []
+
+    def _resolve_name(self, value: str | None) -> str:
+        if value is None:
+            return self.__class__.__name__.lower()
+        text = str(value).strip()
+        if not text:
+            raise ValueError("pattern name은 비어 있을 수 없습니다.")
+        return text
+
+    def named(self, value: str | None):
+        self.name = self._resolve_name(value)
+        return self
 
     @staticmethod
     def _normalize_loss_cut(loss_cut: str | None) -> str | None:
@@ -637,6 +649,273 @@ class AmountSurge(Pattern):
         return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
 
 
+class RetestBreakout(Pattern):
+    def on(
+        self,
+        breakout_window: int = 20,
+        retest_tolerance: float = 0.03,
+        max_retest_days: int = 10,
+        breakout_amount_threshold: float | None = None,
+        breakout_amount_window: int = 20,
+        rebound_confirm: Literal["close_up"] = "close_up",
+        stay_days: int = 1,
+        cooldown_days: int = 0,
+    ):
+        breakout_window_value = int(breakout_window)
+        if breakout_window_value <= 0:
+            raise ValueError("breakout_window은 1 이상이어야 합니다.")
+        retest_tolerance_value = float(retest_tolerance)
+        if (
+            not np.isfinite(retest_tolerance_value)
+            or retest_tolerance_value < 0.0
+            or retest_tolerance_value >= 1.0
+        ):
+            raise ValueError("retest_tolerance은 0 이상 1 미만의 유한한 숫자여야 합니다.")
+        max_retest_days_value = int(max_retest_days)
+        if max_retest_days_value <= 0:
+            raise ValueError("max_retest_days는 1 이상이어야 합니다.")
+        breakout_amount_window_value = int(breakout_amount_window)
+        if breakout_amount_window_value <= 0:
+            raise ValueError("breakout_amount_window는 1 이상이어야 합니다.")
+        breakout_amount_threshold_value = None
+        if breakout_amount_threshold is not None:
+            breakout_amount_threshold_value = float(breakout_amount_threshold)
+            if (
+                not np.isfinite(breakout_amount_threshold_value)
+                or breakout_amount_threshold_value <= 0.0
+            ):
+                raise ValueError("breakout_amount_threshold는 0보다 큰 유한한 숫자여야 합니다.")
+        rebound_confirm_text = str(rebound_confirm or "close_up").strip().lower()
+        if rebound_confirm_text != "close_up":
+            raise ValueError("rebound_confirm은 현재 'close_up'만 지원합니다.")
+
+        self.params = SimpleNamespace(
+            breakout_window=breakout_window_value,
+            retest_tolerance=retest_tolerance_value,
+            max_retest_days=max_retest_days_value,
+            breakout_amount_threshold=breakout_amount_threshold_value,
+            breakout_amount_window=breakout_amount_window_value,
+            rebound_confirm=rebound_confirm_text,
+            stay_days=int(max(1, stay_days)),
+            cooldown_days=int(max(0, cooldown_days)),
+        )
+        return self
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        if self.params is None:
+            return ()
+        if self.params.breakout_amount_threshold is None:
+            return ()
+        return ("amount",)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("RetestBreakout은 사용 전에 on(...)으로 설정해야 합니다.")
+
+        prices = np.asarray(values, dtype=np.float64)
+        n = prices.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        window = int(self.params.breakout_window)
+        if n <= window:
+            return out
+
+        rolling_high = u.rolling_high(prices, window)
+        amount_ratio = None
+        amount_ratio_valid = None
+        if self.params.breakout_amount_threshold is not None:
+            amount = self._get_stock_values("amount")
+            if amount.shape != prices.shape:
+                raise ValueError("RetestBreakout amount shape이 가격 시계열과 일치하지 않습니다.")
+            mean_amount, valid_end = u.rolling_mean(amount, int(self.params.breakout_amount_window))
+            amount_ratio_valid = (
+                valid_end
+                & np.isfinite(amount)
+                & (amount > 0.0)
+                & np.isfinite(mean_amount)
+                & (mean_amount > 0.0)
+            )
+            amount_ratio = np.zeros(n, dtype=np.float64)
+            amount_ratio[amount_ratio_valid] = amount[amount_ratio_valid] / mean_amount[amount_ratio_valid]
+
+        active_level = np.nan
+        breakout_idx = -1
+        retest_seen = False
+        lower_bound = np.nan
+
+        for i in range(1, n):
+            price = prices[i]
+            prev_price = prices[i - 1]
+            if not (np.isfinite(price) and price > 0.0):
+                continue
+
+            prior_high = rolling_high[i - 1]
+            if np.isfinite(prior_high) and prior_high > 0.0 and price > prior_high:
+                if self.params.breakout_amount_threshold is not None:
+                    if not bool(amount_ratio_valid[i]):
+                        continue
+                    if float(amount_ratio[i]) < float(self.params.breakout_amount_threshold):
+                        continue
+                active_level = prior_high
+                breakout_idx = i
+                lower_bound = active_level * (1.0 - float(self.params.retest_tolerance))
+                retest_seen = False
+                continue
+
+            if not np.isfinite(active_level):
+                continue
+
+            if breakout_idx >= 0 and (i - breakout_idx) > int(self.params.max_retest_days):
+                active_level = np.nan
+                breakout_idx = -1
+                lower_bound = np.nan
+                retest_seen = False
+                continue
+
+            if price < lower_bound:
+                active_level = np.nan
+                breakout_idx = -1
+                lower_bound = np.nan
+                retest_seen = False
+                continue
+
+            if not retest_seen:
+                in_retest_zone = price >= lower_bound and price <= active_level
+                if in_retest_zone and np.isfinite(prev_price) and prev_price > 0.0 and price <= prev_price:
+                    retest_seen = True
+                continue
+
+            if (
+                np.isfinite(prev_price)
+                and prev_price > 0.0
+                and price > prev_price
+                and price >= active_level
+            ):
+                out[i] = True
+                active_level = np.nan
+                breakout_idx = -1
+                lower_bound = np.nan
+                retest_seen = False
+
+        return u.stay_cooldown_mask(out, self.params.stay_days, self.params.cooldown_days)
+
+
+class PanicRebound(Pattern):
+    def on(
+        self,
+        drawdown_window: int = 20,
+        drawdown_min: float = -0.18,
+        rebound_days: int = 3,
+        volume_spike: bool = True,
+        volume_window: int = 20,
+        volume_threshold: float = 1.5,
+        stay_days: int = 1,
+        cooldown_days: int = 0,
+    ):
+        drawdown_window_value = int(drawdown_window)
+        if drawdown_window_value <= 0:
+            raise ValueError("drawdown_window은 1 이상이어야 합니다.")
+        drawdown_min_value = float(drawdown_min)
+        if not np.isfinite(drawdown_min_value) or drawdown_min_value >= 0.0:
+            raise ValueError("drawdown_min은 0보다 작은 유한한 숫자여야 합니다.")
+        rebound_days_value = int(rebound_days)
+        if rebound_days_value <= 0:
+            raise ValueError("rebound_days는 1 이상이어야 합니다.")
+        volume_window_value = int(volume_window)
+        if volume_window_value <= 0:
+            raise ValueError("volume_window는 1 이상이어야 합니다.")
+        volume_threshold_value = float(volume_threshold)
+        if not np.isfinite(volume_threshold_value) or volume_threshold_value <= 0.0:
+            raise ValueError("volume_threshold는 0보다 큰 유한한 숫자여야 합니다.")
+
+        self.params = SimpleNamespace(
+            drawdown_window=drawdown_window_value,
+            drawdown_min=drawdown_min_value,
+            rebound_days=rebound_days_value,
+            volume_spike=bool(volume_spike),
+            volume_window=volume_window_value,
+            volume_threshold=volume_threshold_value,
+            stay_days=int(max(1, stay_days)),
+            cooldown_days=int(max(0, cooldown_days)),
+        )
+        return self
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        if self.params is None:
+            return ()
+        if not bool(self.params.volume_spike):
+            return ()
+        return ("volume",)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("PanicRebound는 사용 전에 on(...)으로 설정해야 합니다.")
+
+        prices = np.asarray(values, dtype=np.float64)
+        n = prices.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        if n == 0:
+            return out
+
+        rolling_high = u.rolling_high(prices, int(self.params.drawdown_window))
+        panic_mask = np.zeros(n, dtype=np.bool_)
+        valid_price = np.isfinite(prices) & (prices > 0.0)
+        valid_high = np.isfinite(rolling_high) & (rolling_high > 0.0)
+        valid_drawdown = valid_price & valid_high
+        drawdown = np.zeros(n, dtype=np.float64)
+        drawdown[valid_drawdown] = prices[valid_drawdown] / rolling_high[valid_drawdown] - 1.0
+        panic_mask[valid_drawdown] = drawdown[valid_drawdown] <= float(self.params.drawdown_min)
+
+        volume_ratio = None
+        volume_ratio_valid = None
+        if bool(self.params.volume_spike):
+            volume = self._get_stock_values("volume")
+            if volume.shape != prices.shape:
+                raise ValueError("PanicRebound volume shape이 가격 시계열과 일치하지 않습니다.")
+            mean_volume, valid_end = u.rolling_mean(volume, int(self.params.volume_window))
+            volume_ratio_valid = (
+                valid_end
+                & np.isfinite(volume)
+                & (volume > 0.0)
+                & np.isfinite(mean_volume)
+                & (mean_volume > 0.0)
+            )
+            volume_ratio = np.zeros(n, dtype=np.float64)
+            volume_ratio[volume_ratio_valid] = volume[volume_ratio_valid] / mean_volume[volume_ratio_valid]
+
+        rebound_days = int(self.params.rebound_days)
+        for i in range(rebound_days, n):
+            if bool(self.params.volume_spike):
+                if not bool(volume_ratio_valid[i]):
+                    continue
+                if float(volume_ratio[i]) < float(self.params.volume_threshold):
+                    continue
+
+            rebound_ok = True
+            for j in range(i - rebound_days + 1, i + 1):
+                if j <= 0:
+                    rebound_ok = False
+                    break
+                prev_price = prices[j - 1]
+                curr_price = prices[j]
+                if not (
+                    np.isfinite(prev_price)
+                    and prev_price > 0.0
+                    and np.isfinite(curr_price)
+                    and curr_price > prev_price
+                ):
+                    rebound_ok = False
+                    break
+            if not rebound_ok:
+                continue
+
+            lo = max(0, i - rebound_days)
+            if not bool(np.any(panic_mask[lo : i + 1])):
+                continue
+            out[i] = True
+
+        return u.stay_cooldown_mask(out, self.params.stay_days, self.params.cooldown_days)
+
+
 class MFI(Pattern):
     def __init__(
         self,
@@ -1110,6 +1389,8 @@ __all__ = [
     "Disparity",
     "RelativeStrength",
     "AmountSurge",
+    "RetestBreakout",
+    "PanicRebound",
     "MFI",
     "SizeBucket",
     "Trending",

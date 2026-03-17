@@ -1137,6 +1137,7 @@ class Backtest:
         start,
         end,
         benchmark: Pattern | None = None,
+        regime: Regime | None = None,
         univ: Univ | None = None,
         by: str = AGG_MODE_DAY,
         db: int = 0,
@@ -1164,7 +1165,10 @@ class Backtest:
         self.end_idx = min(self.end_idx, len(self.dates))
         if benchmark is not None and not isinstance(benchmark, Pattern):
             raise TypeError("benchmark는 Pattern 객체여야 합니다.")
-        self.benchmark = benchmark
+        if regime is not None and not isinstance(regime, Regime):
+            raise TypeError("regime은 Regime 객체여야 합니다.")
+        self.regime = regime
+        self.benchmark = self._apply_default_regime(benchmark) if benchmark is not None else None
         self._base_stats = {}
         self._analyzed_patterns: Dict[str, Pattern] = {}
         self._analyzed_stats: Dict[str, Stats] = {}
@@ -1175,21 +1179,24 @@ class Backtest:
         self._pattern_exit_index_cache: Dict[tuple[str, int], np.ndarray] = {}
         self._all_stock_geom_cache: Dict[tuple[int, int], np.ndarray] = {}
         self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._all_opportunity_count_cache: np.ndarray | None = None
         self._stock_field_matrix_cache: Dict[str, np.ndarray] = {}
         self._regime_frame_cache: Dict[str, pd.DataFrame] = {}
         self._vwap_matrix: np.ndarray | None = None
-        if benchmark is not None:
-            base_name = _infer_pattern_label(benchmark, 0)
-            base_trim_q, base_trim_method = _infer_pattern_trim_config(benchmark)
+        if self.benchmark is not None:
+            base_name = _infer_pattern_label(self.benchmark, 0)
+            self._invalidate_runtime_cache(base_name)
+            base_trim_q, base_trim_method = _infer_pattern_trim_config(self.benchmark)
             self._base_stats[base_name] = self._run_pattern(
-                benchmark,
+                self.benchmark,
                 trim_quantile=base_trim_q,
                 trim_method=base_trim_method,
                 progress_label=base_name,
                 aggregation_mode=self.by,
                 filter_obj=None,
+                cache_name=base_name,
             )
-            self._analyzed_patterns[base_name] = benchmark
+            self._analyzed_patterns[base_name] = self.benchmark
             self._analyzed_stats[base_name] = self._base_stats[base_name]
             self._analyzed_filters[base_name] = None
 
@@ -1285,6 +1292,17 @@ class Backtest:
                 seen.add(regime_id)
                 yield regime
 
+    def _apply_default_regime(self, pattern_fn: Pattern) -> Pattern:
+        """
+        Backtest 기본 레짐이 있고 패턴에 별도 레짐이 없으면 자동으로 감싼다.
+        """
+
+        if self.regime is None:
+            return pattern_fn
+        if any(True for _ in self._iter_attached_regimes(pattern_fn)):
+            return pattern_fn
+        return pattern_fn.when(self.regime)
+
     def _resolve_regime_breadth_univ(self) -> Univ:
         """
         레짐 breadth 계산에 쓸 유니버스를 정한다.
@@ -1330,6 +1348,21 @@ class Backtest:
             frame = self._get_regime_frame(regime)
             mask_values = regime_mask_from_frame(frame, regime.kind)
             regime._bind(self.dates, mask_values, frame)
+
+    def _combined_regime_mask(self, pattern_fn: Pattern) -> np.ndarray | None:
+        """
+        패턴에 연결된 모든 regime의 공통 활성 구간 마스크를 반환한다.
+        """
+
+        regimes = list(self._iter_attached_regimes(pattern_fn))
+        if not regimes:
+            return None
+
+        self._prepare_regime_sources(pattern_fn)
+        combined = np.ones(len(self.dates), dtype=np.bool_)
+        for regime in regimes:
+            combined &= np.asarray(regime.mask(len(self.dates)), dtype=np.bool_)
+        return combined
 
     def _prepare_market_sources(self, pattern_fn: Pattern) -> None:
         """
@@ -1519,6 +1552,57 @@ class Backtest:
         exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
         self._pattern_exit_mask_cache[pattern_name] = exit_mask_matrix
         return exit_mask_matrix
+
+    def _invalidate_runtime_cache(self, pattern_name: str) -> None:
+        """
+        패턴명에 연결된 run용 캐시(mask/exit/exit_index)를 비운다.
+        """
+
+        for cache_key in list(self._pattern_mask_cache):
+            if cache_key[0] == pattern_name:
+                self._pattern_mask_cache.pop(cache_key, None)
+        self._pattern_exit_mask_cache.pop(pattern_name, None)
+        for cache_key in list(self._pattern_exit_index_cache):
+            if cache_key[0] == pattern_name:
+                self._pattern_exit_index_cache.pop(cache_key, None)
+
+    def _store_runtime_cache(
+        self,
+        pattern_name: str | None,
+        *,
+        filter_obj: Filter | None = None,
+        mask_matrix: np.ndarray | None = None,
+        exit_mask_matrix: np.ndarray | None = None,
+        dynamic_exit_index: np.ndarray | None = None,
+    ) -> None:
+        """
+        analyze 중 계산한 중간 결과를 run 캐시에 저장한다.
+        """
+
+        if not pattern_name:
+            return
+
+        active_filter = bool(filter_obj is not None and filter_obj.is_active)
+
+        if mask_matrix is not None:
+            mask_arr = np.asarray(mask_matrix, dtype=np.bool_)
+            if mask_arr.shape[0] == len(self.dates):
+                full_mask = mask_arr
+            else:
+                full_mask = np.zeros((len(self.dates), mask_arr.shape[1]), dtype=np.bool_)
+                full_mask[self.start_idx:self.end_idx] = mask_arr
+            self._pattern_mask_cache[(pattern_name, active_filter)] = full_mask
+
+        if exit_mask_matrix is not None:
+            exit_arr = np.asarray(exit_mask_matrix, dtype=np.bool_)
+            if exit_arr.shape[0] == len(self.dates):
+                self._pattern_exit_mask_cache[pattern_name] = exit_arr
+
+        if dynamic_exit_index is not None:
+            exit_idx_arr = np.asarray(dynamic_exit_index, dtype=np.int32)
+            if exit_idx_arr.shape[0] == len(self.dates):
+                max_horizon = int(np.max(self.horizon_offsets))
+                self._pattern_exit_index_cache[(pattern_name, max_horizon)] = exit_idx_arr
 
     def _build_dynamic_exit_index_matrix(
         self,
@@ -1747,6 +1831,7 @@ class Backtest:
         trim_q: float,
         trim_method: str,
         progress_label: str,
+        cache_name: str | None = None,
     ) -> Stats:
         """
         trim/winsorize를 적용한 daily-mean 통계를 계산한다.
@@ -1764,6 +1849,11 @@ class Backtest:
                 axis=1,
                 dtype=np.int64,
             )
+        self._store_runtime_cache(
+            cache_name,
+            mask_matrix=mask_matrix,
+            exit_mask_matrix=exit_mask_matrix,
+        )
         trim_mode = _trim_mode_from_method(trim_method)
         self._accumulate_trim_dates(
             mask_matrix,
@@ -1785,6 +1875,7 @@ class Backtest:
         progress_label: str,
         aggregation_mode: str,
         filter_obj: Filter,
+        cache_name: str | None = None,
     ) -> Stats:
         """
         analyze(filter=...)를 반영해 패턴 통계를 계산한다.
@@ -1814,6 +1905,12 @@ class Backtest:
                 progress_bar.update(1)
                 progress_bar.set_description_str(progress_label)
             mask_matrix = raw_mask_matrix
+            self._store_runtime_cache(
+                cache_name,
+                filter_obj=filter_obj,
+                mask_matrix=mask_matrix,
+                exit_mask_matrix=exit_mask_matrix,
+            )
 
             if agg_mode == AGG_MODE_DAY:
                 stats = Stats.create_daily(self.dates, HORIZONS)
@@ -1909,6 +2006,7 @@ class Backtest:
         progress_label: str,
         aggregation_mode: str,
         filter_obj: Filter | None,
+        cache_name: str | None = None,
     ) -> Stats:
         """
         진입시점 의존형 청산 규칙(trailing stop 등)을 반영해 통계를 계산한다.
@@ -1946,6 +2044,22 @@ class Backtest:
                 mask_matrix,
                 self.start_idx,
                 int(np.max(self.horizon_offsets)),
+            )
+            if dynamic_exit_index.shape[0] != len(self.dates):
+                full_dynamic_exit_index = np.full(
+                    (len(self.dates), dynamic_exit_index.shape[1]),
+                    -1,
+                    dtype=np.int32,
+                )
+                full_dynamic_exit_index[self.start_idx:self.end_idx] = dynamic_exit_index
+            else:
+                full_dynamic_exit_index = dynamic_exit_index
+            self._store_runtime_cache(
+                cache_name,
+                filter_obj=filter_obj,
+                mask_matrix=mask_matrix,
+                exit_mask_matrix=exit_mask_matrix,
+                dynamic_exit_index=full_dynamic_exit_index,
             )
             if progress_bar is not None:
                 progress_bar.update(1)
@@ -2044,6 +2158,7 @@ class Backtest:
         progress_label: str = "pattern",
         aggregation_mode: str = AGG_MODE_EVENT,
         filter_obj: Filter | None = None,
+        cache_name: str | None = None,
     ) -> Stats:
         """
         패턴 trim 설정에 따라 normal/trim 실행 경로를 선택한다.
@@ -2062,6 +2177,7 @@ class Backtest:
                 progress_label=progress_label,
                 aggregation_mode=agg_mode,
                 filter_obj=filter_obj,
+                cache_name=cache_name,
             )
         if filter_obj is not None and filter_obj.is_active:
             return self._run_pattern_filtered(
@@ -2071,16 +2187,29 @@ class Backtest:
                 progress_label=progress_label,
                 aggregation_mode=agg_mode,
                 filter_obj=filter_obj,
+                cache_name=cache_name,
             )
 
         if agg_mode == AGG_MODE_EVENT:
             if trim_q is None or trim_q <= 0.0:
                 return self._run_pattern_normal(pattern_fn, progress_label)
-            return self._run_pattern_trim(pattern_fn, trim_q, trim_method_text, progress_label)
+            return self._run_pattern_trim(
+                pattern_fn,
+                trim_q,
+                trim_method_text,
+                progress_label,
+                cache_name=cache_name,
+            )
 
         # day_mean 모드: trim 미설정(None)이어도 일자균등 평균을 계산한다.
         daily_trim_q = 0.0 if trim_q is None else float(trim_q)
-        return self._run_pattern_trim(pattern_fn, daily_trim_q, trim_method_text, progress_label)
+        return self._run_pattern_trim(
+            pattern_fn,
+            daily_trim_q,
+            trim_method_text,
+            progress_label,
+            cache_name=cache_name,
+        )
 
     @staticmethod
     def _resolve_horizon(h: str | int) -> tuple[str, int]:
@@ -2331,6 +2460,29 @@ class Backtest:
         _, geom_asof, _ = self._all_stock_history_metrics(horizon_days, lookback_window)
         self._all_stock_geom_cache[cache_key] = geom_asof
         return geom_asof
+
+    def _all_stock_opportunity_counts(self) -> np.ndarray:
+        """
+        horizon별 전체 종목의 유효 event 기회 수를 일자축으로 반환한다.
+        """
+
+        if self._all_opportunity_count_cache is not None:
+            return self._all_opportunity_count_cache
+
+        num_dates = self.prices.shape[0]
+        num_h = len(self.horizon_offsets)
+        counts = np.zeros((num_h, num_dates), dtype=np.int64)
+        for h_idx, step in enumerate(self.horizon_offsets):
+            step = int(step)
+            if step <= 0 or step >= num_dates:
+                continue
+            base = self.prices[:-step]
+            fwd = self.prices[step:]
+            valid = np.isfinite(base) & np.isfinite(fwd) & (base > 0.0) & (fwd > 0.0)
+            counts[h_idx, : num_dates - step] = np.count_nonzero(valid, axis=1)
+
+        self._all_opportunity_count_cache = counts
+        return counts
 
     def _get_vwap_matrix(self) -> np.ndarray:
         """
@@ -2670,7 +2822,7 @@ class Backtest:
             codes=self.codes,
             code_names=code_names,
         )
-        return simulator.run(
+        result = simulator.run(
             start_idx=start_idx,
             end_idx=end_idx,
             pattern=pattern,
@@ -2700,6 +2852,13 @@ class Backtest:
             allow_reentry=allow_reentry,
             min_cohort_size=min_cohort_size,
         )
+        regime_mask = self._combined_regime_mask(pattern_fn)
+        if regime_mask is not None and result.data is not None:
+            result.data.attrs["regime_active_mask"] = np.asarray(
+                regime_mask[start_idx:end_idx],
+                dtype=np.bool_,
+            ).copy()
+        return result
 
     def diagnose_gate(
         self,
@@ -2979,34 +3138,136 @@ class Backtest:
         for idx, pattern_fn in enumerate(patterns, start=len(stats_map) + 1):
             if not isinstance(pattern_fn, Pattern):
                 raise TypeError("analyze()에 전달한 모든 패턴은 Pattern 객체여야 합니다.")
+            pattern_fn = self._apply_default_regime(pattern_fn)
             base_name = _infer_pattern_label(pattern_fn, idx)
             trim_q, trim_method = _infer_pattern_trim_config(pattern_fn)
-            stats = self._run_pattern(
-                pattern_fn,
-                trim_quantile=trim_q,
-                trim_method=trim_method,
-                progress_label=base_name,
-                aggregation_mode=aggregation_mode,
-                filter_obj=analyze_filter,
-            )
             name = base_name
             suffix = 2
             while name in stats_map:
                 name = f"{base_name}_{suffix}"
                 suffix += 1
+            self._invalidate_runtime_cache(name)
+            stats = self._run_pattern(
+                pattern_fn,
+                trim_quantile=trim_q,
+                trim_method=trim_method,
+                progress_label=name,
+                aggregation_mode=aggregation_mode,
+                filter_obj=analyze_filter,
+                cache_name=name,
+            )
             stats_map[name] = stats
             self._analyzed_patterns[name] = pattern_fn
             self._analyzed_stats[name] = stats
             self._analyzed_filters[name] = analyze_filter
-            self._pattern_mask_cache.pop((name, False), None)
-            self._pattern_mask_cache.pop((name, True), None)
-            self._pattern_exit_mask_cache.pop(name, None)
-            for cache_key in list(self._pattern_exit_index_cache):
-                if cache_key[0] == name:
-                    self._pattern_exit_index_cache.pop(cache_key, None)
 
         if not stats_map:
             raise ValueError("실행된 패턴이 없습니다.")
-        result = StatsCollection(stats_map, benchmark_names=benchmark_names)
+        result = StatsCollection(
+            stats_map,
+            benchmark_names=benchmark_names,
+        )
+        result.exposure_opportunity_counts = self._all_stock_opportunity_counts()
         self._last_stats_collection = result
         return result
+
+    def plot_wealth_curves(
+        self,
+        patterns: list[str] | tuple[str, ...] | None = None,
+        target_horizon: str | int = "1M",
+        trade_price_mode: str = "당일종가",
+        figsize=(10, 5),
+        log_scale: bool = True,
+    ) -> pd.DataFrame:
+        """
+        마지막 analyze() 결과의 자산곡선을 한 화면에 그리고 성과 요약 테이블을 반환한다.
+        """
+
+        stats_collection = self._last_stats_collection
+        if patterns is None:
+            if stats_collection is None or not stats_collection.stats_map:
+                raise ValueError("plot_wealth_curves() 전에 analyze()를 먼저 실행해야 합니다.")
+            pattern_names = list(stats_collection.stats_map.keys())
+        else:
+            pattern_names = [str(name) for name in patterns]
+        if not pattern_names:
+            raise ValueError("플롯할 pattern이 없습니다.")
+        if stats_collection is not None and hasattr(stats_collection, "_ordered_pattern_names"):
+            pattern_names = list(stats_collection._ordered_pattern_names(pattern_names))
+
+        import matplotlib.pyplot as plt
+
+        rows: list[dict[str, float | str]] = []
+        fig, ax = plt.subplots(figsize=figsize)
+        color_map: dict[str, str] = {}
+        if stats_collection is not None and hasattr(stats_collection, "_pattern_colors"):
+            color_map = dict(stats_collection._pattern_colors(pattern_names))
+        regime_mask_to_shade = None
+        regime_index = None
+
+        for pattern_name in pattern_names:
+            simul = self.run(
+                pattern=pattern_name,
+                target_horizon=target_horizon,
+                trade_price_mode=trade_price_mode,
+            )
+            frame = simul.to_frame(copy=False)
+            wealth = frame["wealth"]
+            if regime_mask_to_shade is None:
+                regime_mask = frame.attrs.get("regime_active_mask")
+                if regime_mask is not None:
+                    regime_mask_to_shade = np.asarray(regime_mask, dtype=np.bool_).copy()
+                    regime_index = wealth.index
+            ax.plot(
+                wealth.index,
+                wealth.to_numpy(dtype=float),
+                linewidth=1.8,
+                color=color_map.get(pattern_name),
+                label=pattern_name,
+            )
+
+            meta = simul.summary()
+            wealth_values = wealth.to_numpy(dtype=float)
+            daily_ret = wealth_values[1:] / wealth_values[:-1] - 1.0
+            daily_ret = daily_ret[np.isfinite(daily_ret)]
+            ann_vol = (
+                float(np.std(daily_ret, ddof=1) * np.sqrt(float(TRADING_DAYS_PER_YEAR)))
+                if daily_ret.size >= 2
+                else float("nan")
+            )
+            cagr = float(meta["cagr"])
+            rows.append(
+                {
+                    "pattern": pattern_name,
+                    "total_return": float(meta["total_return"]),
+                    "final_wealth": 1.0 + float(meta["total_return"]),
+                    "cagr": cagr,
+                    "mdd": float(meta["max_drawdown"]),
+                    "ann_vol": ann_vol,
+                    "ir": cagr / ann_vol if np.isfinite(cagr) and np.isfinite(ann_vol) and ann_vol > 0.0 else float("nan"),
+                    "mean_exposure": float(np.nanmean(frame["exposure"].to_numpy(dtype=float))),
+                    "cohort_win_rate": float(meta["cohort_win_rate"]),
+                    "payoff_ratio": float(meta["cohort_payoff_ratio"]),
+                    "active_day_ratio": float(meta["active_day_ratio"]),
+                    "total_fee_paid": float(meta["total_fee_paid"]),
+                }
+            )
+
+        if regime_mask_to_shade is not None and regime_index is not None:
+            Simulator._shade_regime_spans(ax, regime_index, regime_mask_to_shade)
+        if log_scale:
+            ax.set_yscale("log")
+            ax.set_title(f"Wealth Curves (Log) | horizon={target_horizon}")
+        else:
+            ax.set_title(f"Wealth Curves | horizon={target_horizon}")
+        ax.set_ylabel("Wealth")
+        ax.grid(alpha=0.25, linestyle="--")
+        if stats_collection is not None and hasattr(stats_collection, "_apply_legend_order"):
+            stats_collection._apply_legend_order(ax, pattern_names)
+        else:
+            ax.legend(loc="best", fontsize=9)
+        fig.tight_layout()
+        plt.show()
+
+        summary = pd.DataFrame(rows).set_index("pattern")
+        return summary
