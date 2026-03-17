@@ -1356,3 +1356,1192 @@ CONTEXT.md를 참고로 해서 후속작업 진행하자.
    hard gate 유지 여부를 판단
 2. `panic_rebound_risk`를 정책적으로 `off`로 고정할지,
    `MFI oversold_rebound` 예외 허용으로 둘지 결정
+
+---
+
+## 20) 2026-03-17 집(맥북) 세션 추가 인계
+
+이번 세션에서는 WSL에서 정리한 가설을 맥북 환경에서 다시 확인하고,
+panic 정책을 더 실전적으로 다루기 위해
+`panic_entry_off`와 `panic_flatten`을 구분할 수 있게 최소 기능을 추가했다.
+
+### 20.1 맥 환경 확인
+- `metricstudio` conda env는 맥에서 `~/anaconda3/envs/metricstudio`에 있었다.
+- 아래 검증은 맥 환경에서 실제로 다시 통과했다.
+  - `python -m py_compile src/regime.py src/backtest.py src/pattern.py src/stats.py src/simulate.py ...`
+  - `python -m unittest tests.test_pattern_filters tests.test_backtest_context -v`
+
+참고:
+- macOS sandbox 때문에 `pyarrow`가 `sysctlbyname` 관련 warning을 출력했지만,
+  계산/테스트 자체를 막는 오류는 아니었다.
+
+### 20.2 `trend_friendly` hard gate 재확인 결론
+맥에서 다시 확인한 결과,
+`trend_friendly`는 코호트 품질 분리 자체는 맞지만
+현재 대표 패턴의 기본 hard gate로 두기에는 희소 비용이 너무 컸다.
+
+대표 비교(`1M`, `trade_price_mode='당일종가'`):
+
+- `amount_all`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mean_exposure 0.6388`
+- `amount_trend`
+  - `final_wealth 13.3157`
+  - `cagr 0.1048`
+  - `mean_exposure 0.2626`
+
+즉 현재 실전 기본값으로는
+`trend_friendly hard on`보다
+더 넓게 돌리되 panic 정책을 따로 두는 쪽이 자연스럽다.
+
+같은 세션에서 확인한 `trend_friendly` coverage:
+
+- `all_rows`: `0.2872`
+- `evaluable_rows`: `0.2971`
+
+### 20.3 Regime API 단순화
+이후 사용자가 지적한 대로,
+기존 `Regime().off(...)`, `Regime().flatten(...)`는
+entry gate와 exit policy를 한 객체에 섞어 API를 오히려 복잡하게 만들었다.
+
+그래서 현재 `Regime`는 다시
+“시장 날짜 집합을 표현하는 객체”로만 단순화했다.
+
+현재 지원 연산:
+
+- `a + b`: 교집합
+- `a - b`: 차집합
+- `a | b`: 합집합
+- `~a`: 여집합
+
+중요:
+
+- Python의 `not a`는 오버로딩할 수 없으므로 `~a`를 써야 한다.
+- 즉 `not_panic = ~panic` 형태가 현재 정식 문법이다.
+- `flatten`처럼 강제 청산을 의미하는 정책은 더 이상 `Regime` 안에 넣지 않는다.
+  그건 나중에 필요하면 별도 exit-policy 개념으로 다루는 편이 맞다.
+
+### 20.4 현재 사용 방법 가이드
+현재 권장 표기:
+
+```python
+from src.regime import Regime
+
+panic = Regime().on(kind="panic", market="kospi")
+trend_regime = Regime().on(kind="trend", market="kospi")
+contrarian_regime = Regime().on(kind="contrarian", market="kospi")
+
+not_panic = ~panic
+trend_only = trend_regime - panic
+contrarian_only = contrarian_regime - panic
+```
+
+예:
+
+```python
+trend = (bb + high52w + uptrend + mfi_high + amount15).named("trend_amount1.5x")
+trend_no_panic = trend.when(~panic).named("trend_no_panic")
+
+contra = MFI(name="contra_failure").on(
+    trigger="bullish_failure_swing",
+    lower=20,
+    stay_days=1,
+    cooldown_days=5,
+).when(contrarian_regime - panic)
+```
+
+### 20.5 핵심 프레임 정리
+사용자 지적대로
+`panic이 아니면 trend를 쓴다`는 식의 단순화는 맞지 않다.
+
+현재 더 자연스러운 프레임은 아래다.
+
+1. `panic`은 selector가 아니라 veto 집합
+2. `trend` / `contrarian`은 family 선택 집합
+3. 각 family branch는 자기 성과가 admission을 통과할 때만 켠다
+
+즉 실전 구조는 아래처럼 비대칭적일 수 있다.
+
+- `trend`는 패턴 자체가 이미 강한 추세 정보를 담고 있으면 굳이 hard gate로 다시 자르지 않는다.
+- `contrarian`은 `contrarian - panic`처럼 더 보수적으로 붙인다.
+
+이게 현재 검증 결과와도 가장 잘 맞았다.
+
+### 20.6 family router 재검증 결과
+재현 스크립트:
+
+- `scripts/validate_regime_router.py`
+
+실행:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate metricstudio
+python scripts/validate_regime_router.py
+```
+
+스크립트가 비교하는 것:
+
+- `trend_amount1.5x`
+- `trend_no_panic = trend.when(~panic)`
+- `blend_oversold = trend | contra_oversold.when(contrarian - panic)`
+- `blend_failure = trend | contra_failure.when(contrarian - panic)`
+
+현재 `1M`, `당일종가` 결과:
+
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+- `trend_no_panic`
+  - `final_wealth 67.0321`
+  - `cagr 0.1756`
+  - `mdd -0.1640`
+- `blend_oversold`
+  - `final_wealth 102.6062`
+  - `cagr 0.1951`
+  - `mdd -0.2407`
+- `blend_failure`
+  - `final_wealth 107.6417`
+  - `cagr 0.1973`
+  - `mdd -0.2440`
+
+해석:
+
+- `~panic`를 trend에 hard gate로 다는 것도 아직 성과를 깎는다.
+- `contrarian - panic` branch를 trend 위에 overlay하는 프레임 자체는 맞다.
+- 하지만 현재 구현된 contrarian 후보(`MFI oversold_rebound`, `bullish_failure_swing`)는
+  대표 추세 패턴보다 더 좋은 admission branch는 아직 아니다.
+
+### 20.7 이번 세션 기준 추천 운영 결론
+현재 기준으로 가장 실용적인 결론은 아래다.
+
+1. 기본 패턴은 여전히 `trend_amount1.5x`
+2. `Regime`는 now pure set algebra로만 사용
+3. `panic`은 veto 집합으로 이해하되, trend branch에 hard gate로 바로 넣지는 않음
+4. `contrarian`은 `contrarian - panic` 형태로 branch를 설계하되, 현재 후보는 아직 채택 전
+
+즉 다음 세션에서 가장 자연스러운 후속 작업은
+`contrarian_friendly` 안에서 실제로 `trend_amount1.5x`를 이길 수 있는
+새 contrarian branch 후보를 만드는 것이다.
+
+### 20.8 contrarian 후보 재탐색: `relative loser + oversold`
+이번 세션 후반에는
+기존 `MFI oversold_rebound` / `bullish_failure_swing`이 약했던 이유를
+`oversold 자체`보다 `최근 loser를 유동성 공급 관점에서 받는 구조`가 부족했기 때문이라고 보고,
+후보를 다시 만들었다.
+
+핵심 구현 변화:
+
+- `RelativeStrength`가 이제 `trigger='above' | 'below'`를 둘 다 지원한다.
+- 즉 상대강도 상방 돌파뿐 아니라
+  `시장 대비 최근 n일 상대낙폭` 같은 하방 조건도 같은 클래스로 표현할 수 있다.
+
+현재 권장 후보 예시는 아래다.
+
+```python
+from src.pattern import RelativeStrength, MFI
+
+contra_loser5_mfi35 = (
+    RelativeStrength(name="5D상대낙폭").on(
+        market="kospi",
+        window=5,
+        trigger="below",
+        threshold=-0.08,
+        cooldown_days=5,
+    )
+    + MFI(name="MFI<35").on(
+        trigger="below",
+        threshold=35,
+        stay_days=1,
+        cooldown_days=0,
+    )
+).named("loser5_mfi35")
+```
+
+의미:
+
+- 최근 5거래일 동안 시장 대비 `-8%` 이상 뒤처진 종목
+- 동시에 MFI가 `35` 아래로 눌려 있는 종목
+- 즉 `상대 loser + oversold` 조합
+
+검증 스크립트:
+
+- `scripts/validate_contrarian_candidates.py`
+
+실행:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate metricstudio
+python scripts/validate_contrarian_candidates.py
+```
+
+현재 `contrarian` 레짐 inside, `1M`, `당일종가` 기준 대표 결과:
+
+- `benchmark`
+  - `final_wealth 1.0562`
+  - `cagr 0.0021`
+  - `mdd -0.2089`
+- `mfi_oversold`
+  - `final_wealth 1.0837`
+  - `cagr 0.0031`
+  - `mdd -0.1932`
+- `mfi_failure`
+  - `final_wealth 1.1269`
+  - `cagr 0.0046`
+  - `mdd -0.2012`
+- `loser5_amt`
+  - `final_wealth 1.3970`
+  - `cagr 0.0129`
+  - `mdd -0.1709`
+- `loser5_mfi35`
+  - `final_wealth 1.4377`
+  - `cagr 0.0141`
+  - `mdd -0.1779`
+  - `cohort_win_rate 0.5605`
+
+`loser5_mfi35`의 benchmark 대비 연환산 기하평균 격차(after cost):
+
+- `1M +0.1000`
+- `2M +0.0509`
+- `3M +0.0196`
+- `6M -0.0414`
+
+window별 `1M` 격차도 전 구간 플러스였다.
+
+- `2000-2006 +0.0448`
+- `2007-2012 +0.1280`
+- `2013-2018 +0.2206`
+- `2019-2025 +0.0385`
+
+현재 해석:
+
+- contrarian 레짐에서 쓸 패턴 후보가 처음으로 꽤 선명하게 잡혔다.
+- 다만 edge는 `1M~3M` short-horizon에 집중되고 `6M`에서는 약해진다.
+- 따라서 이 branch를 실제로 쓰려면
+  contrarian 쪽은 기본적으로 `1M` 또는 길어도 `2M~3M` 성격으로 보는 편이 맞다.
+
+### 20.9 배타적 regime router 1차 체크
+새 contrarian 후보가 admission을 통과하는지 확인한 뒤,
+아주 단순한 배타적 router도 바로 찍어봤다.
+
+구조:
+
+```python
+trend_branch = trend_amount1.5x.when(Regime().on(kind="trend", market="kospi"))
+contra_branch = contra_loser5_mfi35.when(Regime().on(kind="contrarian", market="kospi"))
+router = (trend_branch | contra_branch).named("exclusive_router")
+```
+
+`1M`, `당일종가` 결과:
+
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+- `contra_loser5_mfi35`
+  - `final_wealth 1.4377`
+  - `cagr 0.0141`
+  - `mdd -0.1779`
+- `exclusive_router`
+  - `final_wealth 19.0641`
+  - `cagr 0.1201`
+  - `mdd -0.2092`
+
+해석:
+
+- `trend when trend` 단독보다는 개선되지만,
+  아직 전체 실전 기본값으로 `trend_amount1.5x`를 대체할 정도는 아니다.
+- 즉 이번 단계의 결론은
+  “contrarian branch 후보는 찾았지만,
+  양 family를 hard-exclusive router로 묶는 것은 아직 시기상조”에 가깝다.
+
+### 20.10 contrarian vs trend, horizon, router 추가 검증
+사용자 지적대로
+contrarian 후보를 평가할 때는
+단순 benchmark뿐 아니라
+`contrarian 레짐 inside에서 trend_amount1.5x보다 낫냐`도 같이 봐야 한다.
+
+또 contrarian은
+trend와 같은 `1M~6M` 홀드 감각보다
+더 짧은 horizon이나 더 빠른 exit에서 edge가 살아날 수 있으므로,
+`1W~3M`까지 직접 다시 비교했다.
+
+재현 스크립트:
+
+- `scripts/validate_contrarian_router.py`
+
+#### A. contrarian 레짐 inside 결과
+핵심 비교:
+
+- `trend_amount1.5x`
+- `loser5_mfi35`
+- `loser5_mfi35 + Bollinger(loss_cut='mid_stop')`
+- `loser5_mfi35 + Bollinger(loss_cut='trailing_stop')`
+
+대표 결과(`당일종가`):
+
+- `1W`
+  - `trend_amount1.5x`: `final_wealth 1.5084`, `mdd -0.1444`
+  - `loser5_mfi35`: `0.7923`, `mdd -0.2977`
+- `2W`
+  - `trend_amount1.5x`: `1.1397`
+  - `loser5_mfi35`: `0.9057`
+- `3W`
+  - `trend_amount1.5x`: `1.1492`
+  - `loser5_mfi35`: `1.2691`
+- `1M`
+  - `trend_amount1.5x`: `1.2381`, `cagr 0.0083`, `mdd -0.0993`
+  - `loser5_mfi35`: `1.4377`, `cagr 0.0141`, `mdd -0.1779`
+- `2M`
+  - `trend_amount1.5x`: `1.2701`, `cagr 0.0092`
+  - `loser5_mfi35`: `1.5890`, `cagr 0.0180`
+- `3M`
+  - `trend_amount1.5x`: `1.3224`
+  - `loser5_mfi35`: `1.3158`
+
+결론:
+
+- contrarian 후보는 `1W~2W`에서는 trend보다 약하다.
+- 하지만 `3W~2M`에서는 `trend_amount1.5x`보다 낫다.
+- `3M`부터는 우위가 거의 사라진다.
+
+즉 현재 후보의 자연스러운 성격은
+`초단기 반등(1W)`도 아니고 `장기 보유(3M+)`도 아니라,
+대략 `3W~2M` 구간의 short swing에 가깝다.
+
+추가로,
+이번 1차 실험에서는 `mid_stop`, `trailing_stop` 모두 성과를 개선하지 못했다.
+즉 현재 구현된 단순 Bollinger exit는
+이 contrarian 후보의 edge를 더 선명하게 만들지 못했다.
+
+#### B. 완화된 router 비교
+사용자 제안처럼
+너무 보수적인 `trend.when(trend) | contra.when(contrarian)` 대신
+더 넓은 switch도 같이 비교했다.
+
+비교 구조:
+
+```python
+exclusive_router = trend.when(trend) | contra.when(contrarian)
+switch_on_contrarian = trend.when((~panic) - contrarian) | contra.when(contrarian)
+switch_on_trend = trend.when(trend) | contra.when((~panic) - trend)
+```
+
+중요:
+
+- `switch_on_contrarian`의 날짜 커버리지는 사실상 `~panic`이다.
+- 왜냐하면 현재 정의에서 `contrarian`은 `~panic`의 부분집합이기 때문이다.
+- 따라서 이 router의 공정한 기준선은 `trend_amount1.5x` ungated가 아니라
+  `trend.when(~panic)`이다.
+
+결과(`당일종가`):
+
+- `1M`
+  - `trend_amount1.5x`: `final_wealth 116.3206`, `cagr 0.2008`
+  - `trend_no_panic`: `67.0321`, `0.1756`
+  - `trend_non_contra`: `54.8815`, `0.1666`
+  - `exclusive_router`: `19.0641`, `0.1201`
+  - `switch_on_contrarian`: `77.1105`, `0.1820`
+  - `switch_on_trend`: `17.2643`, `0.1158`
+- `2M`
+  - `trend_amount1.5x`: `61.5321`, `0.1718`
+  - `trend_no_panic`: `43.8927`, `0.1566`
+  - `trend_non_contra`: `35.2652`, `0.1469`
+  - `exclusive_router`: `15.7502`, `0.1119`
+  - `switch_on_contrarian`: `54.4666`, `0.1663`
+  - `switch_on_trend`: `20.9832`, `0.1243`
+ - `3M`
+  - `trend_no_panic`: `31.7993`, `0.1424`
+  - `trend_non_contra`: `24.8857`, `0.1317`
+  - `switch_on_contrarian`: `31.5604`, `0.1421`
+
+결론:
+
+- 세 router 중에서는 `switch_on_contrarian`이 가장 낫다.
+- 즉 현재 데이터에서는
+  `trend를 기본으로 깔고, contrarian 구간에서만 contra로 교체`
+  하는 쪽이
+  `trend를 trend 레짐에만 묶는 방식`보다 훨씬 자연스럽다.
+- 그리고 공정한 기준선인 `trend_no_panic`과 비교하면,
+  `switch_on_contrarian`은 `1M`, `2M`에서는 더 낫고 `3M`에서는 거의 비슷하다.
+- 다만 drawdown은 `trend_no_panic`보다 더 나쁘다.
+
+추가 확인:
+
+- `trend.when(panic)`도 따로 확인했는데,
+  `1M final_wealth 1.7575`, `2M 1.4310`, `3M 1.4155`로
+  panic 날짜 진입 cohort 자체가 완전히 나쁘지는 않았다.
+- 그래서 `ungated trend`가 `trend_no_panic`보다 강한 것은 실제로 맞다.
+
+주의:
+
+- 여기서 `trend.when(panic)`는 “panic 날짜에 신규 진입한 cohort”를 뜻한다.
+- `when(...)`은 진입만 제한하고 보유는 계속하므로,
+  “panic 구간 안에서만 보유한 성과”와는 다르다.
+
+현재 운영 결론은 이렇게 정리된다.
+
+1. contrarian 후보는 이제 admission을 통과했다.
+2. 하지만 그 edge는 `3W~2M`에 집중된다.
+3. 그리고 현재 엔진에서 family별 horizon을 다르게 줄 수 없으므로,
+   다음 단계는 `branch-specific horizon/exit`를 어떻게 표현할지 정하는 것이다.
+
+### 20.11 panic 제거 비교와 현재 운영 판단
+
+사용자가 노트북에서
+`panic`을 완전히 빼고 아래 3개를 직접 비교했다.
+
+- `benchmark`
+- `trend_amount1.5x`
+- `switch_without_panic`
+  - `trend.when(~contrarian) | contra.when(contrarian)`
+  - 이름은 과거 셀과의 연속성 때문에 `without_panic`이지만,
+    실제 의미는 `panic`을 전혀 쓰지 않는 full-period switch다.
+
+사용자 노트북 결과(`1M`, `당일종가`)는 다음과 같다.
+
+- `benchmark`
+  - `final_wealth 8.8713`
+  - `cagr 0.0876`
+  - `mdd -0.6290`
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+- `switch_without_panic`
+  - `final_wealth 133.2989`
+  - `cagr 0.2072`
+  - `mdd -0.2471`
+
+해석:
+
+- 현재 `panic`을 라우터 앞단 veto로 넣는 것은 성과 개선 근거가 약하다.
+- 이건 앞서 확인한
+  `trend.when(panic)`의 cohort가 완전히 나쁘지 않았다는 결과와도 일치한다.
+- 즉 현재 `panic` 정의는
+  “이 구간에서는 trend와 contrarian이 둘 다 안 먹힌다”는 실패영역을
+  잘 분리하지 못하고 있다.
+
+따라서 현 시점 운영 판단은 다음이 맞다.
+
+1. `panic`은 라우팅 규칙에서 제거한다.
+2. 기본 비교축은
+   `trend_amount1.5x` vs `switch_without_panic`
+   로 둔다.
+3. `panic`은 당분간 execution veto가 아니라
+   diagnostic tag로만 남긴다.
+
+`panic`을 다시 살리려면 기준이 더 엄격해야 한다.
+필요한 조건은 아래 둘 중 하나다.
+
+- `panic` inside에서 `trend`와 `contra`가 둘 다 구조적으로 약해야 한다.
+- 또는 `panic` inside에서 강한 risk-control 전술
+  (예: 신규진입 금지, 부분축소, 유동성 취약 종목만 축소 등)이
+  라우터 성과를 실제로 개선해야 한다.
+
+그 전까지는 `panic 재설계`보다
+`contrarian branch`와 `branch-specific horizon/exit` 고도화가 우선이다.
+
+### 20.12 branch별 horizon/익절/손절 지원 추가
+
+`switch_without_panic`의 높은 MDD를 줄이기 위해,
+이제 branch별로 서로 다른 실행정책을 줄 수 있게 최소 기능을 넣었다.
+
+사용 문법:
+
+```python
+trend = trend_pattern.trade(target_horizon="1M")
+contra = contra_pattern.trade(target_horizon="3W", stop_loss_pct=8)
+router = trend.when(~contrarian) | contra.when(contrarian)
+```
+
+의미:
+
+- `Pattern.trade(...)`는 entry rule이 아니라
+  해당 branch에서 발생한 진입의 보유정책을 지정한다.
+- `UnionPattern(|)` 안에서는 branch별 정책이 유지된다.
+- 현재 지원:
+  - `target_horizon`
+  - `stop_loss_pct`
+  - `take_profit_pct`
+
+현재 추가된 검증:
+
+- branch별 정책이 `UnionPattern`에서 유지되는지
+- 같은 날 여러 branch가 동시에 잡혀도 자금이 한쪽 branch에만 몰리지 않는지
+- branch별 `horizon`과 `stop_loss`가 실제 청산에 반영되는지
+
+관련 파일:
+
+- `src/pattern.py`
+- `src/backtest.py`
+- `src/simulate.py`
+- `tests/test_backtest_context.py`
+- `scripts/validate_branch_trade_policies.py`
+
+현재 바로 볼 실험축은 아래 3개다.
+
+1. `switch_without_panic`
+2. `switch_contra_3w`
+3. `switch_contra_3w_stop8`
+
+즉 먼저 `contra` branch를
+`1M 공통보유`에서 `3W` 또는 `3W + 8% stop`으로 바꿨을 때
+`CAGR` 대비 `MDD`가 얼마나 줄어드는지를 확인하는 것이
+지금 가장 자연스러운 다음 단계다.
+
+실제 1차 비교 결과(`2000-01-01`~`2025-12-31`, `당일종가`, 기본 run horizon=`1M`):
+
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+- `switch_without_panic`
+  - `final_wealth 133.2989`
+  - `cagr 0.2072`
+  - `mdd -0.2471`
+- `switch_contra_3w`
+  - `final_wealth 113.1369`
+  - `cagr 0.1996`
+  - `mdd -0.2711`
+- `switch_contra_3w_stop8`
+  - `final_wealth 94.7959`
+  - `cagr 0.1914`
+  - `mdd -0.2387`
+
+해석:
+
+- `contra` branch를 단순히 `3W`로 줄이는 것은 성과와 MDD 모두 악화됐다.
+- `3W + 8% stop`은 `3W` 단독보다는 MDD를 줄였지만,
+  여전히 `switch_without_panic`보다 CAGR이 낮고
+  `trend_amount1.5x`보다도 열위다.
+- 즉 branch별 실행정책 기능은 필요했고 구현도 됐지만,
+  현재 `contrarian` 후보에 대한 첫 번째 policy guess(`3W`, `8% stop`)는
+  문제를 해결하지 못했다.
+
+현재 자연스러운 다음 단계:
+
+1. `contra` branch의 보유기간을 줄이는 대신
+   `1M` 유지 + tighter stop / take-profit 조합을 탐색
+2. 또는 `contra` branch의 sizing 자체를 줄이는 방향 검토
+3. 그 전까지 실전 기본형은 여전히 `switch_without_panic`
+   또는 더 보수적으로는 `trend_amount1.5x`
+
+### 20.13 성능 조사 및 최적화 메모 (2026-03-18)
+
+사용자가 지적한 대로
+현재 코드/노트북 실험은 체감상 너무 오래 걸린다.
+그래서 먼저 `scripts/validate_branch_trade_policies.py`를 기준 workload로 잡고
+맥 `metricstudio` 환경에서 실제 `cProfile`로 병목을 확인했다.
+
+#### 20.13.1 기준 스크립트
+
+```bash
+conda run -n metricstudio python -m cProfile -o /tmp/branch.prof scripts/validate_branch_trade_policies.py
+```
+
+#### 20.13.2 프로파일 결과 요약
+
+같은 스크립트/같은 `cProfile` 기준 총 실행시간:
+
+- 1차 기준: `206.271s`
+- 1차 최적화 후: `143.478s`
+- 2차 최적화 후: `119.391s`
+
+즉 현재까지:
+
+- 1차 개선: `-30.4%`
+- 2차 추가 개선: `-16.8%`
+- 최초 기준 대비 총 개선: `-42.1%`
+
+#### 20.13.3 현재 남은 상위 병목
+
+2차 최적화 후 누적시간 상위:
+
+- `Backtest.analyze`: `84.152s`
+- `_run_pattern`: `82.739s`
+- `_run_pattern_trim`: `57.410s`
+- `_build_mask_matrix`: `56.633s`
+- `load_adjusted_stock_duckdb`: `40.427s`
+- `_prepare_stock_sources`: `31.665s`
+- `_prepare_regime_sources`: `25.321s`
+- `Backtest.run`: `24.394s`
+- `Pattern.__call__`: `24.267s`
+- `UnionPattern._base_mask`: `20.415s`
+
+내부시간 상위로 보면:
+
+- DuckDB dataframe materialize (`_duckdb.df`): `13.021s`
+- numpy array copy: `10.936s`
+- `Pattern.__call__`: `8.316s`
+- `Simulator.run`: `7.377s`
+
+결론:
+
+- 기존에도 `numba`는 충분히 들어가 있었다.
+  - 롤링 통계/누적수익/trim 집계는 이미 `numba` 경로를 탄다.
+- 현재 병목의 중심은 `Simulator.run`이 아니라
+  Python 쪽 패턴 평가/조합과 DuckDB 로딩이다.
+- 즉 지금 단계에서 `numba`를 더 붙여도
+  가장 큰 문제를 바로 해결하지는 못한다.
+
+#### 20.13.4 이번에 반영한 최적화
+
+1. `src/backtest.py`
+   - homogeneous pattern의 `policy_id_matrix`는
+     전체 패턴을 다시 per-column 재평가하지 않고
+     이미 만든 `pattern_mask`에서 바로 생성
+   - `Regime` frame을 `Backtest` 인스턴스 간에도 재사용하도록
+     global cache 추가
+
+2. `src/pattern.py`
+   - `Pattern.__call__` mask를
+     단순 `id(ndarray)`가 아니라
+     실제 메모리 토큰 기반으로 캐시
+   - `RelativeStrength.__call__`도 동일 방식 캐시
+   - `UnionPattern` child mask cache를
+     stock/market source 변경까지 반영하도록 보강
+   - `Bollinger` trailing ATR cache도 동일하게 보강
+   - `Trending(ma_trend_up/down)`의 Python loop를 벡터화
+
+3. 테스트
+   - 같은 underlying price series 재호출 시
+     mask를 재계산하지 않는지
+   - stock field가 바뀌면 캐시가 무효화되는지
+     테스트 추가
+
+#### 20.13.5 실무 해석
+
+- 지금 가장 큰 체감 개선은
+  `numba` 추가보다
+  “같은 mask를 다시 계산하지 않기”에서 나왔다.
+- 추가 `numba` 후보는
+  현재 구조 그대로 함수 몇 개만 감싸는 방식보다는,
+  pattern tree를 array kernel 단위로 재구성할 때 의미가 크다.
+- 즉 다음 성능작업 우선순위는:
+  1. DuckDB 로딩/materialize 줄이기
+  2. `_prepare_stock_sources` 호출량 줄이기
+  3. pattern tree 평가를 더 적은 pass로 합치기
+
+#### 20.13.6 주의: branch-policy 재실행 값 갱신
+
+최적화 이후 동일 스크립트를 다시 돌린 현재 값은 아래다
+(`2000-01-01`~`2025-12-31`, `당일종가`, 기본 run horizon=`1M`).
+
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+- `switch_without_panic`
+  - `final_wealth 133.2989`
+  - `cagr 0.2072`
+  - `mdd -0.2471`
+- `switch_contra_3w`
+  - `final_wealth 177.5332`
+  - `cagr 0.2205`
+  - `mdd -0.2980`
+- `switch_contra_3w_stop8`
+  - `final_wealth 122.9436`
+  - `cagr 0.2034`
+  - `mdd -0.2899`
+
+즉 현재는
+`contra=3W`가 수익 기준으로는 더 강하지만
+MDD는 더 나쁘다.
+다음에 branch policy를 논의할 때는
+이 최신 값 기준으로 다시 판단해야 한다.
+
+### 20.14 새 스레드용 종합 인계 (2026-03-18)
+
+이 섹션은 다음 세션 에이전트가
+이 파일만 읽고도 현재 상태를 빠르게 파악하도록 만든
+"최신 기준 handoff"다.
+
+중요:
+
+- 아래 내용이 현재 기준 최신 요약이다.
+- 같은 파일 안의 더 오래된 수치/결론과 충돌하면
+  이 섹션과 `20.11.6`의 최신 수치를 우선한다.
+- 특히 branch-policy 관련 예전 수치
+  (`switch_contra_3w`, `switch_contra_3w_stop8`)는
+  현재 최신 재실행 값으로 갱신되었으니
+  오래된 값을 다시 인용하지 말 것.
+
+#### 20.14.1 현재 문제의식
+
+이 프로젝트의 현재 핵심 과제는:
+
+1. `trend` 대표 패턴은 이미 충분히 강하다.
+2. `contrarian` 레짐 안에서만 선명하게 작동하는
+   별도 `contrarian` 패턴을 찾아야 한다.
+3. 그 패턴이 전체 구간의 기본 `trend`를 대체할 정도로 강하지 않더라도,
+   특정 레짐에서 배타적으로 스위칭할 가치가 있는지 판단해야 한다.
+4. 동시에 현재 실험/백테스트가 너무 느리므로,
+   연구 속도를 해치는 병목을 줄여야 한다.
+
+#### 20.14.2 현재 합의된 개념 프레임
+
+현재는 아래 해석을 기본 전제로 삼는다.
+
+- `Regime`는 pure set algebra 객체다.
+  - `a + b`: 교집합
+  - `a - b`: 차집합
+  - `a | b`: 합집합
+  - `~a`: 여집합
+- `panic`은 아직 실전 하드 veto로 채택하지 않는다.
+  - 현재 정의의 분별력이 약하다고 의심되고,
+    실제로 panic을 빼고 돌린 쪽이 더 좋게 나온 적이 많다.
+  - 따라서 지금은 `panic`을 diagnostic tag에 가깝게 본다.
+- 현재 실전 비교의 중심은
+  `trend_amount1.5x` vs `switch_without_panic`이다.
+- `switch_without_panic`의 의미는:
+  - `contrarian` 레짐이면 `contrarian` 패턴 사용
+  - 그 외 전부는 `trend` 패턴 사용
+  - 이름에 `without_panic`가 있지만,
+    실제로는 panic을 특별 취급하지 않는 router 이름으로 굳어졌다.
+
+#### 20.14.3 현재 대표 패턴 / 대표 레짐
+
+대표 trend 패턴:
+
+- `trend_amount1.5x`
+  - `Bollinger(breakout_up, bandwidth_max=0.05, breakout_cooldown_days=3)`
+  - `High(window=240, threshold=0.90, stay_days=1)`
+  - `Trending(trigger='ma_trend_up', window=200)`
+  - `MFI(trigger='above', threshold=50)`
+  - `AmountSurge(window=20, threshold=1.5)`
+
+현재 contrarian 후보:
+
+- `loser5_mfi35`
+  - `RelativeStrength(window=5, trigger='below', threshold=-0.08, market='kospi')`
+  - `MFI(trigger='below', threshold=35, stay_days=1, cooldown_days=0)`
+
+현재 기본 레짐 표현:
+
+```python
+panic = Regime().on(kind="panic", market="kospi")
+trend_regime = Regime().on(kind="trend", market="kospi")
+contrarian = Regime().on(kind="contrarian", market="kospi")
+```
+
+현재 가장 중요한 router:
+
+```python
+switch_without_panic = (
+    trend_amount1.5x.when(~contrarian)
+    | loser5_mfi35.when(contrarian)
+).named("switch_without_panic")
+```
+
+#### 20.14.4 현재까지의 실험 결론
+
+1. `trend_friendly` hard gate는 너무 보수적이었다.
+   - trend 패턴 inside 성능은 선명하지만,
+     coverage 희생이 너무 커서 기본 hard gate로 쓰기 어렵다.
+
+2. `contrarian` 레짐 inside에서는
+   `loser5_mfi35`가 benchmark보다 낫고,
+   어떤 horizon에서는 `trend_amount1.5x` inside 성과도 이긴다.
+   - 특히 `3W~2M` 정도에서 상대적으로 강했다.
+
+3. 하지만 전체 엔진 차원에서는
+   `contrarian` branch의 MDD가 아직 너무 높다.
+   - 즉 "패턴을 찾았다" 수준이지
+     "실전 기본형으로 채택했다" 수준은 아니다.
+
+4. `panic`은 현재 정의 그대로는
+   `trend`와 `contrarian`을 모두 막아야 할 독립 실패영역으로 보기 어렵다.
+   - 따라서 현재 우선순위는 panic 재설계보다
+     contrarian branch를 더 선명하게 만드는 쪽이다.
+
+#### 20.14.5 branch policy 기능 상태
+
+현재 코드베이스는 branch별 보유정책을 이미 지원한다.
+
+- `Pattern.trade(...)`
+  - `target_horizon`
+  - `stop_loss_pct`
+  - `take_profit_pct`
+- `UnionPattern(|)` 내부에서도 branch별 policy가 유지된다.
+
+예:
+
+```python
+trend_branch = trend_amount1.5x.trade(target_horizon="1M")
+contra_branch = loser5_mfi35.trade(target_horizon="3W", stop_loss_pct=8)
+router = trend_branch.when(~contrarian) | contra_branch.when(contrarian)
+```
+
+즉 현재 병목은 "이 기능이 없어서"가 아니라
+"어떤 contrarian branch policy가 좋은지 아직 못 찾았다"는 데 있다.
+
+#### 20.14.6 현재 최신 수치에서 봐야 할 비교축
+
+최신 재실행 기준(`20.13.6`, `2000-01-01`~`2025-12-31`, `당일종가`, 기본 horizon=`1M`):
+
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+- `switch_without_panic`
+  - `final_wealth 133.2989`
+  - `cagr 0.2072`
+  - `mdd -0.2471`
+- `switch_contra_3w`
+  - `final_wealth 177.5332`
+  - `cagr 0.2205`
+  - `mdd -0.2980`
+- `switch_contra_3w_stop8`
+  - `final_wealth 122.9436`
+  - `cagr 0.2034`
+  - `mdd -0.2899`
+
+현재 해석:
+
+- 수익 기준으로는 `switch_without_panic`, `switch_contra_3w`가
+  `trend_amount1.5x`보다 강하다.
+- 하지만 `MDD`는 훨씬 나쁘다.
+- 특히 `switch_contra_3w`는
+  수익을 더 올리는 대신 MDD가 너무 커진다.
+- `3W + 8% stop`은
+  pure `3W`보다는 MDD를 조금 줄이지만
+  여전히 drawdown 문제를 해결했다고 보긴 어렵다.
+
+즉 현재 연구 질문은
+"contrarian를 넣을 것인가"가 아니라
+"contrarian를 어떤 policy / sizing / timing으로 넣어야
+MDD를 통제하면서 가치가 있는가"다.
+
+#### 20.14.7 현재 부족한 점
+
+아직 부족한 것은 아래다.
+
+1. `contrarian` branch sizing 제어가 없다.
+   - 현재는 branch별 horizon/stop/take는 되지만,
+     branch별 비중 축소는 아직 없다.
+   - MDD를 줄이려면 이것이 중요할 가능성이 높다.
+
+2. `panic` 재설계가 안 끝났다.
+   - 현재 정의는 diagnostic 성격만 유지하는 편이 안전하다.
+   - 나중에 다시 본다면
+     "trend와 contrarian가 모두 안 먹히는 실패영역" 관점에서
+     다시 설계해야 한다.
+
+3. `contrarian` entry timing을 더 정교하게 다듬지 못했다.
+   - 예: 급락 후 n일 반등 확인,
+     유동성/거래대금 조건,
+     rebound confirm,
+     size bucket 분리 등
+
+4. 연구 속도를 해치는 성능 병목이 아직 남아 있다.
+   - 특히 DuckDB 로딩/materialize
+   - `_prepare_stock_sources`
+   - pattern tree 재평가
+
+#### 20.14.8 다음 세션에서 가장 자연스러운 작업 우선순위
+
+다음 세션 에이전트는 아래 순서로 판단하면 된다.
+
+1. `contrarian` branch의 MDD를 줄일 수 있는
+   가장 값싼 방법부터 검증
+   - `target_horizon`/`stop_loss_pct`/`take_profit_pct` 조합 재탐색
+   - 가능하면 branch-specific sizing 설계 검토
+
+2. `switch_without_panic` vs `trend_amount1.5x` 비교를
+   최신 코드 기준으로 다시 넓은 축에서 검증
+   - `1W, 2W, 3W, 1M, 2M, 3M, 6M`
+   - 필요하면 `익절/손절` 조합 포함
+
+3. `contrarian` branch 자체를 더 날카롭게 만들 새 후보를 탐색
+   - 단순히 현재 `pattern.py` 구현에 갇히지 말고,
+     새 패턴 조합 또는 레짐 정의 수정도 허용
+   - 다만 과최적화는 피할 것
+
+4. 성능작업은 2순위지만 계속 중요하다.
+   - `numba`보다 먼저 DuckDB/materialize와 source-prepare 병목을 줄이는 편이 유리
+
+#### 20.14.9 재현에 자주 쓰는 스크립트
+
+- `scripts/validate_contrarian_candidates.py`
+  - contrarian 레짐 inside 후보 비교
+- `scripts/validate_contrarian_router.py`
+  - router / horizon / benchmark 비교
+- `scripts/validate_branch_trade_policies.py`
+  - branch별 `trade(...)` policy 비교
+
+권장 환경:
+
+```bash
+conda run -n metricstudio python scripts/validate_branch_trade_policies.py
+```
+
+mac 환경에서는 `pyarrow`가 `sysctlbyname` warning을 낼 수 있는데,
+현재까지 계산/검증을 막는 오류는 아니었다.
+
+#### 20.14.10 다음 에이전트가 특히 주의할 점
+
+- panic을 현재 단계에서 hard veto로 복구하지 말 것.
+- `switch_without_panic`의 MDD 문제를
+  단순한 감으로 해석하지 말고,
+  branch policy / sizing / timing으로 분해해서 볼 것.
+- `CONTEXT.md` 안의 예전 수치와
+  최신 재실행 수치를 섞어 인용하지 말 것.
+- notebook에 바로 손대기 전에
+  스크립트로 재현 가능한 비교축부터 확보할 것.
+
+### 20.15 trend strength router 실험 메모 (2026-03-18)
+
+이번 턴에서는 `contrarian` 연구를 잠시 홀드하고,
+사용자 요청대로
+`trend_amount1.5x`를 전체 구간 기본 패턴으로 둔 뒤
+특정 레짐에서만 trend 계열 variation을 강화/완화하는 router를 점검했다.
+
+핵심 질문은 아래였다.
+
+1. `quiet / broad / narrow / panic` 내부에서
+   어떤 trend variation이 제일 잘 맞는가
+2. 그 variation을 전체 기간 router로 붙였을 때
+   baseline `trend_amount1.5x`보다 실전적으로 개선되는가
+
+#### 20.15.1 새 검증 스크립트
+
+추가한 스크립트:
+
+- `scripts/validate_trend_strength_router.py`
+
+이 스크립트는 두 단계를 한 번에 한다.
+
+1. 서브레짐 inside에서 아래 pattern들의 `1M/2M/3M` gap 비교
+   - `trend_base`
+   - `trend_amount1.3x`
+   - `trend_amount1.5x`
+   - `trend_amount2.0x`
+   - `trend_retest`
+   - `trend_retest_amt1.5x`
+
+2. 전체 기간 `1M` 실행으로 아래 router들 비교
+   - `router_broad_base`
+   - `router_broad_13`
+   - `router_quiet_retest`
+   - `router_quiet_retest_amt`
+   - `router_narrow_20`
+   - `router_panic_20`
+   - `router_panic_scale50`
+   - `router_broad_base_quiet_retest`
+   - `router_broad_base_narrow_20`
+   - `router_broad_base_quiet_retest_narrow_20`
+   - `router_broad_base_quiet_retest_narrow_20_panic_scale50`
+   - `router_broad_13_panic_20`
+   - `router_broad_13_narrow_20_panic_20`
+   - `router_narrow_20_panic_20`
+
+#### 20.15.2 서브레짐 inside 해석
+
+이번 결과는 꽤 선명했다.
+
+- `quiet`
+  - `trend_amount1.5x`가 여전히 최고였다.
+  - 대표 score:
+    - `trend_amount1.5x`: `0.2430`
+    - `trend_amount1.3x`: `0.2222`
+    - `trend_retest`: `0.0763`
+    - `trend_retest_amt1.5x`: `0.0349`
+  - 즉 `quiet -> retest` 가설은 실패에 가깝다.
+
+- `broad`
+  - `trend_amount1.5x`와 `trend_amount1.3x`가 비슷했고,
+    `1.3x` 완화가 소폭 유리한 구간이 있었다.
+  - 대표 score:
+    - `trend_amount1.5x`: `0.2797`
+    - `trend_amount1.3x`: `0.2724`
+    - `trend_base`: `0.2479`
+  - 해석:
+    `broad`에서는 완전한 base까지 풀기보다는
+    `1.5x -> 1.3x` 정도 완화가 가장 자연스럽다.
+
+- `narrow`
+  - `trend_amount2.0x`가 가장 좋았다.
+  - 대표 score:
+    - `trend_amount2.0x`: `0.1055`
+    - `trend_amount1.5x`: `0.0866`
+    - `trend_base`: `0.0873`
+  - 해석:
+    `narrow`는 breadth가 좁아 취약할 수 있으므로
+    더 강한 거래대금 확인이 낫다.
+
+- `panic`
+  - 절대적으로 강한 구간은 아니지만,
+    trend variation 중에서는 `trend_amount2.0x`가 제일 나았다.
+  - 대표 score:
+    - `trend_amount2.0x`: `0.0460`
+    - `trend_amount1.5x`: `0.0113`
+    - `trend_base`: `-0.0087`
+  - 해석:
+    현재 `panic` 정의를 hard veto로 쓰기보다,
+    `panic inside에서 신규 진입은 더 강하게 필터링`하는 쪽이 맞다.
+
+#### 20.15.3 전체 기간 router 비교 핵심 수치
+
+집중 재실행 기준(`2000-01-01`~`2025-12-31`, `당일종가`, 기본 horizon=`1M`):
+
+- `trend_amount1.5x`
+  - `final_wealth 116.3206`
+  - `cagr 0.2008`
+  - `mdd -0.1559`
+
+- `router_broad_13`
+  - `119.4215`
+  - `0.2021`
+  - `-0.1559`
+
+- `router_panic_20`
+  - `117.9777`
+  - `0.2015`
+  - `-0.1497`
+
+- `router_broad_13_panic_20`
+  - `121.1522`
+  - `0.2027`
+  - `-0.1497`
+
+- `router_broad_13_narrow_20_panic_20`
+  - `121.6882`
+  - `0.2029`
+  - `-0.1518`
+
+- `router_narrow_20_panic_20`
+  - `118.4971`
+  - `0.2017`
+  - `-0.1518`
+
+반면 아래 계열은 분명히 탈락이다.
+
+- `router_quiet_retest`
+  - `94.9176`
+  - `0.1915`
+  - `-0.1618`
+
+- `router_broad_base_quiet_retest`
+  - `94.8004`
+  - `0.1914`
+  - `-0.1622`
+
+- `router_panic_scale50`
+  - `88.7647`
+  - `0.1884`
+  - `-0.1507`
+
+즉 이번 단계 결론은 명확하다.
+
+1. `quiet -> retest`는 버린다.
+2. `broad -> amount1.3x`는 약하지만 일관된 개선 후보다.
+3. `panic -> amount2.0x`는
+   CAGR 소폭 개선 + MDD 개선이 같이 나온다.
+4. `narrow -> amount2.0x`도 추가 가치가 약간 있지만,
+   개선폭이 아주 작아서 분기 복잡도를 정당화할지는 별도 판단이 필요하다.
+5. `panic scale-down(0.5)`은
+   기대했던 것과 달리 CAGR 훼손이 더 컸다.
+
+#### 20.15.4 현재 운영 판단
+
+현재 시점에서 가장 실전적인 후보는 아래 둘이다.
+
+1. 단순형:
+   - `router_broad_13_panic_20`
+   - 의미:
+     - `broad`에서는 `amount1.3x`
+     - `panic`에서는 `amount2.0x`
+     - 나머지는 `trend_amount1.5x`
+   - 장점:
+     - 개선이 있고
+     - 설명이 단순하다
+     - drawdown도 baseline보다 줄었다
+
+2. 약간 더 공격적인 형:
+   - `router_broad_13_narrow_20_panic_20`
+   - 장점:
+     - 이번 세트에서 CAGR은 최고
+   - 단점:
+     - baseline 대비 개선폭이 매우 작고
+       branch 하나가 더 늘어난다
+
+현재 추천 우선순위는
+
+1. `router_broad_13_panic_20`
+2. `router_broad_13_narrow_20_panic_20`
+3. baseline `trend_amount1.5x`
+
+순이다.
+
+#### 20.15.5 외부 자료에서 가져온 해석 방향
+
+이번 아이디어는 로컬 코드만 본 것이 아니라,
+아래 취지의 외부 자료 해석도 반영했다.
+
+- trend-following은 long-run에서 broadly 유효하지만
+  state dependence가 있다
+- panic/rebound 국면은
+  momentum/trend가 평소처럼 단순하게 작동하지 않을 수 있다
+
+참고 링크:
+
+- Chicago Booth / AQR 요약:
+  `A Century of Evidence on Trend-Following Investing`
+- NBER:
+  `Momentum Crashes`
+
+다음 에이전트는 이걸 “논문 재현”으로 볼 필요는 없고,
+그냥 `broad는 완화`, `panic은 강화`가 왜 자연스러운지에 대한
+아이디어 출처 정도로만 보면 된다.
+
+#### 20.15.6 다음 에이전트에게 넘길 후속작업
+
+다음 세션 에이전트는 `CONTEXT.md`를 읽고,
+아래 우선순위로 이어서 진행하면 된다.
+
+1. `router_broad_13_panic_20`과
+   `router_broad_13_narrow_20_panic_20`
+   두 후보만 robustness 검증
+   - `1W, 2W, 3W, 1M, 2M, 3M, 6M`
+   - subperiod
+   - 비용 민감도
+   - 최근 구간 일관성
+
+2. 위 두 후보와 baseline의
+   turnover / fee / exposure 성격 비교
+   - 개선이 너무 미미하면
+     복잡도 대비 채택 가치가 있는지 따져야 한다
+
+3. 필요하면 `panic`과 `narrow`의 경계 조정보다 먼저
+   현재 router가 “정말 일관되게” baseline을 넘는지 확인
+   - 지금 단계에서는 레짐 재정의보다
+     robustness 확인이 우선이다
+
+4. `quiet` 쪽은 당분간 보지 않는다.
+   - `retest` 계열은 이번 실험에서 충분히 약했다
+
+#### 20.15.7 재현 명령
+
+```bash
+conda run -n metricstudio python scripts/validate_trend_strength_router.py
+```
+
+간단 검증:
+
+```bash
+conda run -n metricstudio python -m py_compile scripts/validate_trend_strength_router.py
+```
+
+#### 20.15.8 다음 에이전트가 특히 주의할 점
+
+- `quiet -> retest`를 다시 살리려는 시도는
+  우선순위를 낮게 둘 것
+- `panic`을 다시 hard veto로 바꾸지 말 것
+- 이번 단계의 핵심은
+  `trend_amount1.5x`를 버리는 것이 아니라
+  서브레짐에서 trend 강도를 약간 조절하는 것
+- 최신 수치 인용 시
+  반드시 `20.15`의 router 결과와
+  이전 `contrarian` 결과를 섞지 말 것

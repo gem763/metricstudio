@@ -56,9 +56,63 @@ class _FakeSimulator:
         return dict(self._summary)
 
 
+class _MaskPattern(Pattern):
+    def __init__(self, name: str, mask):
+        super().__init__(name=name)
+        self._mask = np.asarray(mask, dtype=np.bool_)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        return self._mask.copy()
+
+
 class BacktestContextTests(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
+
+    def _bind_regime(self, kind: str, values: list[bool]) -> Regime:
+        regime = Regime().on(kind=kind, market="kospi")
+        dates = pd.date_range("2025-01-01", periods=len(values), freq="B")
+        frame = pd.DataFrame(
+            {regime.kind: values},
+            index=dates,
+        )
+        regime._bind(
+            dates.to_numpy(),
+            np.asarray(values, dtype=np.bool_),
+            frame,
+        )
+        return regime
+
+    def test_regime_invert_expression_inverts_bound_mask(self):
+        panic = self._bind_regime("panic", [True, False, True])
+
+        self.assertEqual((~panic).mask().tolist(), [False, True, False])
+
+    def test_regime_set_operations_build_expected_masks(self):
+        trend = self._bind_regime("trend", [True, True, False, False])
+        contrarian = self._bind_regime("contrarian", [False, True, True, False])
+        panic = self._bind_regime("panic", [True, False, True, False])
+
+        self.assertEqual((trend + ~panic).mask().tolist(), [False, True, False, False])
+        self.assertEqual((contrarian - panic).mask().tolist(), [False, True, False, False])
+        self.assertEqual((trend | contrarian).mask().tolist(), [True, True, True, False])
+
+    def test_regime_bool_guides_use_invert_operator(self):
+        panic = self._bind_regime("panic", [True, False, True])
+
+        with self.assertRaises(TypeError):
+            not panic
+
+    def test_regime_pattern_accepts_composed_regime(self):
+        contrarian = self._bind_regime("contrarian", [False, True, True, False])
+        panic = self._bind_regime("panic", [False, False, True, False])
+        pattern = Pattern(name="base").when(contrarian - panic)
+        prices = np.asarray([10.0, 11.0, 12.0, 13.0], dtype=np.float64)
+
+        self.assertEqual(
+            pattern(prices).tolist(),
+            [False, True, False, False],
+        )
 
     def test_pattern_named_supports_chaining_call(self):
         pattern = MFI(name="before").on(trigger="above", threshold=50)
@@ -98,6 +152,8 @@ class BacktestContextTests(unittest.TestCase):
         bt.end_idx = 4
         bt.horizon_offsets = np.asarray([5, 10], dtype=np.int64)
         bt._pattern_mask_cache = {}
+        bt._pattern_policy_id_cache = {}
+        bt._pattern_trade_profile_cache = {}
         bt._pattern_exit_mask_cache = {}
         bt._pattern_exit_index_cache = {}
 
@@ -117,6 +173,63 @@ class BacktestContextTests(unittest.TestCase):
         self.assertEqual(full_mask[:1].sum(), 0)
         self.assertTrue(np.array_equal(full_mask[1:4], partial_mask))
         self.assertEqual(full_mask[4:].sum(), 0)
+
+    def test_build_pattern_policy_id_matrix_preserves_branch_trade_profiles(self):
+        bt = Backtest.__new__(Backtest)
+        bt.dates = pd.date_range("2025-01-01", periods=4, freq="B").to_numpy()
+        bt.prices = np.ones((4, 1), dtype=np.float64)
+        bt.codes = ["A"]
+        bt.start_idx = 0
+        bt.end_idx = 4
+        bt.regime = None
+        bt._pattern_mask_cache = {}
+        bt._pattern_policy_id_cache = {}
+        bt._pattern_trade_profile_cache = {}
+        bt._stock_field_matrix_cache = {}
+        bt._market_values_cache = {}
+        bt._regime_frame_cache = {}
+
+        trend = _MaskPattern("trend", [True, True, False, False]).trade(target_horizon="1M")
+        contra = _MaskPattern("contra", [False, False, True, False]).trade(
+            target_horizon="3W",
+            stop_loss_pct=8,
+            cohort_scale=0.5,
+        )
+        router = (trend | contra).named("router")
+
+        policy_ids, profiles = bt._build_pattern_policy_id_matrix("router", router)
+
+        self.assertEqual(policy_ids[:, 0].tolist(), [1, 1, 2, 0])
+        self.assertEqual(profiles[1], ("1M", None, None, None))
+        self.assertEqual(profiles[2], ("3W", 0.08, None, 0.5))
+
+    def test_build_pattern_policy_id_matrix_preserves_branch_profile_when_other_branch_is_default(self):
+        bt = Backtest.__new__(Backtest)
+        bt.dates = pd.date_range("2025-01-01", periods=4, freq="B").to_numpy()
+        bt.prices = np.ones((4, 1), dtype=np.float64)
+        bt.codes = ["A"]
+        bt.start_idx = 0
+        bt.end_idx = 4
+        bt.regime = None
+        bt._pattern_mask_cache = {}
+        bt._pattern_policy_id_cache = {}
+        bt._pattern_trade_profile_cache = {}
+        bt._stock_field_matrix_cache = {}
+        bt._market_values_cache = {}
+        bt._regime_frame_cache = {}
+
+        trend = _MaskPattern("trend", [True, True, False, False])
+        contra = _MaskPattern("contra", [False, False, True, False]).trade(
+            target_horizon="3W",
+            cohort_scale=0.35,
+        )
+        router = (trend | contra).named("router")
+
+        policy_ids, profiles = bt._build_pattern_policy_id_matrix("router", router)
+
+        self.assertEqual(policy_ids[:, 0].tolist(), [1, 1, 2, 0])
+        self.assertEqual(profiles[1], (None, None, None, None))
+        self.assertEqual(profiles[2], ("3W", None, None, 0.35))
 
     def test_plot_wealth_curves_uses_last_analyze_order_and_returns_summary(self):
         bt = Backtest.__new__(Backtest)
@@ -316,6 +429,175 @@ class BacktestContextTests(unittest.TestCase):
         self.assertGreaterEqual(len(axes[0].patches), 2)
         self.assertGreaterEqual(len(axes[2].patches), 2)
         self.assertEqual([line.get_label() for line in axes[2].lines], ["demo", "KOSPI"])
+
+    def test_simulator_respects_branch_specific_horizon_days(self):
+        dates = pd.date_range("2025-01-01", periods=5, freq="B")
+        prices = np.ones((5, 2), dtype=np.float64)
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A", "B"],
+        )
+
+        pattern_mask = np.zeros((5, 2), dtype=np.bool_)
+        pattern_mask[1] = [True, True]
+        pattern_policy_id_matrix = np.zeros((5, 2), dtype=np.int16)
+        pattern_policy_id_matrix[1] = [1, 2]
+
+        sim.run(
+            start_idx=0,
+            end_idx=5,
+            pattern="router",
+            target_horizon="1M",
+            target_horizon_days=3,
+            aggregate_lookback="1Y",
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=pattern_policy_id_matrix,
+            policy_horizon_days=np.asarray([3, 1, 3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan, np.nan, np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan, np.nan, np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0, 1.0, 1.0], dtype=np.float64),
+            pattern_exit_mask=np.zeros((5, 2), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            pattern_arith_series=np.zeros(5, dtype=np.float64),
+            pattern_geom_series=np.zeros(5, dtype=np.float64),
+            pattern_rise_series=np.ones(5, dtype=np.float64),
+            all_stock_arith_series=np.zeros(5, dtype=np.float64),
+            all_stock_geom_series=np.zeros(5, dtype=np.float64),
+            all_stock_rise_series=np.ones(5, dtype=np.float64),
+            fallback_exposure=0.5,
+            gate_geom_min=0.0,
+            gate_arith_min=0.0,
+            gate_rise_min=0.5,
+            gate_use_geom=False,
+            gate_use_arith=False,
+            gate_use_rise=False,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+        )
+
+        self.assertEqual(len(sim.port_at(dates[1])), 2)
+        self.assertEqual(len(sim.port_at(dates[2])), 1)
+
+    def test_simulator_respects_branch_specific_stop_loss(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        prices = np.asarray(
+            [
+                [1.0, 1.0],
+                [1.0, 1.0],
+                [0.84, 1.0],
+                [0.84, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A", "B"],
+        )
+
+        pattern_mask = np.zeros((4, 2), dtype=np.bool_)
+        pattern_mask[1] = [True, True]
+        pattern_policy_id_matrix = np.zeros((4, 2), dtype=np.int16)
+        pattern_policy_id_matrix[1] = [1, 2]
+
+        sim.run(
+            start_idx=0,
+            end_idx=4,
+            pattern="router",
+            target_horizon="1M",
+            target_horizon_days=3,
+            aggregate_lookback="1Y",
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=pattern_policy_id_matrix,
+            policy_horizon_days=np.asarray([3, 3, 3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan, 0.10, np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan, np.nan, np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0, 1.0, 1.0], dtype=np.float64),
+            pattern_exit_mask=np.zeros((4, 2), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            pattern_arith_series=np.zeros(4, dtype=np.float64),
+            pattern_geom_series=np.zeros(4, dtype=np.float64),
+            pattern_rise_series=np.ones(4, dtype=np.float64),
+            all_stock_arith_series=np.zeros(4, dtype=np.float64),
+            all_stock_geom_series=np.zeros(4, dtype=np.float64),
+            all_stock_rise_series=np.ones(4, dtype=np.float64),
+            fallback_exposure=0.5,
+            gate_geom_min=0.0,
+            gate_arith_min=0.0,
+            gate_rise_min=0.5,
+            gate_use_geom=False,
+            gate_use_arith=False,
+            gate_use_rise=False,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+        )
+
+        self.assertEqual(len(sim.port_at(dates[1])), 2)
+        self.assertEqual(len(sim.port_at(dates[2])), 1)
+
+    def test_simulator_respects_branch_specific_cohort_scale(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        prices = np.ones((4, 2), dtype=np.float64)
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A", "B"],
+        )
+
+        pattern_mask = np.zeros((4, 2), dtype=np.bool_)
+        pattern_mask[1] = [True, True]
+        pattern_policy_id_matrix = np.zeros((4, 2), dtype=np.int16)
+        pattern_policy_id_matrix[1] = [1, 2]
+
+        sim.run(
+            start_idx=0,
+            end_idx=4,
+            pattern="router",
+            target_horizon="1M",
+            target_horizon_days=3,
+            aggregate_lookback="1Y",
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=pattern_policy_id_matrix,
+            policy_horizon_days=np.asarray([3, 3, 3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan, np.nan, np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan, np.nan, np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0, 1.0, 0.5], dtype=np.float64),
+            pattern_exit_mask=np.zeros((4, 2), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            pattern_arith_series=np.zeros(4, dtype=np.float64),
+            pattern_geom_series=np.zeros(4, dtype=np.float64),
+            pattern_rise_series=np.ones(4, dtype=np.float64),
+            all_stock_arith_series=np.zeros(4, dtype=np.float64),
+            all_stock_geom_series=np.zeros(4, dtype=np.float64),
+            all_stock_rise_series=np.ones(4, dtype=np.float64),
+            fallback_exposure=0.5,
+            gate_geom_min=0.0,
+            gate_arith_min=0.0,
+            gate_rise_min=0.5,
+            gate_use_geom=False,
+            gate_use_arith=False,
+            gate_use_rise=False,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+        )
+
+        holdings = sim.port_at(dates[1]).reset_index()
+        cohort_values = holdings.groupby("cohort_id")["cohort_value"].first().sort_index()
+        self.assertEqual(cohort_values.index.tolist(), [1, 2])
+        self.assertTrue(np.isclose(cohort_values.iloc[0] / cohort_values.iloc[1], 2.0, atol=0.05))
 
     def test_plot_wealth_curves_shades_regime_spans_when_present(self):
         bt = Backtest.__new__(Backtest)

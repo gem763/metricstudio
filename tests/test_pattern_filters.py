@@ -3,10 +3,51 @@ from __future__ import annotations
 import numpy as np
 import unittest
 
-from src.pattern import AmountSurge, RelativeStrength, RetestBreakout, PanicRebound
+from src.pattern import AmountSurge, PanicRebound, Pattern, RelativeStrength, RetestBreakout
 
 
 class PatternFilterTests(unittest.TestCase):
+    def test_pattern_mask_cache_reuses_same_underlying_price_series(self):
+        class _CountingPattern(Pattern):
+            def __init__(self):
+                super().__init__(name="count")
+                self.calls = 0
+
+            def _base_mask(self, values: np.ndarray) -> np.ndarray:
+                self.calls += 1
+                return np.ones(values.shape[0], dtype=np.bool_)
+
+        prices = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        pattern = _CountingPattern()
+
+        pattern(prices)
+        pattern(prices[:])
+
+        self.assertEqual(pattern.calls, 1)
+
+    def test_pattern_mask_cache_invalidates_when_stock_field_changes(self):
+        class _AmountPattern(Pattern):
+            def __init__(self):
+                super().__init__(name="amount_count")
+                self.calls = 0
+
+            def _base_mask(self, values: np.ndarray) -> np.ndarray:
+                self.calls += 1
+                amount = self._get_stock_values("amount")
+                return np.asarray(amount > 0.0, dtype=np.bool_)
+
+        prices = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        amount = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+        pattern = _AmountPattern()
+
+        pattern._set_stock_values("amount", amount)
+        pattern(prices)
+        pattern(prices[:])
+        pattern._set_stock_values("amount", amount.copy())
+        pattern(prices)
+
+        self.assertEqual(pattern.calls, 2)
+
     def test_relative_strength_supports_on_market_argument(self):
         prices = np.array([100.0, 100.0, 100.0, 105.0, 110.0, 115.0])
         market = np.array([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
@@ -36,6 +77,23 @@ class PatternFilterTests(unittest.TestCase):
         self.assertEqual(
             pattern(prices).tolist(),
             [False, False, False, True, True, True],
+        )
+
+    def test_relative_strength_supports_below_trigger_for_recent_losers(self):
+        prices = np.array([100.0, 101.0, 102.0, 100.0, 95.0, 90.0])
+        market = np.array([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+
+        pattern = RelativeStrength(name="rs").on(
+            market="kospi",
+            window=3,
+            trigger="below",
+            threshold=-0.08,
+        )
+        pattern._set_market_values(market)
+
+        self.assertEqual(
+            pattern(prices).tolist(),
+            [False, False, False, False, True, True],
         )
 
     def test_amount_surge_marks_amount_spike_against_rolling_mean(self):

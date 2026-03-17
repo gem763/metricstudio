@@ -116,6 +116,13 @@ class Simulator:
                     "entry_idx": int(bucket["entry_idx"]),
                     "signal_entry_idx": int(bucket.get("signal_entry_idx", bucket["entry_idx"])),
                     "cohort_id": int(bucket["cohort_id"]),
+                    "horizon_days": int(bucket.get("horizon_days", 0)),
+                    "stop_loss_pct": float(bucket["stop_loss_pct"])
+                    if bucket.get("stop_loss_pct") is not None
+                    else None,
+                    "take_profit_pct": float(bucket["take_profit_pct"])
+                    if bucket.get("take_profit_pct") is not None
+                    else None,
                 }
             )
         return copied
@@ -520,6 +527,11 @@ class Simulator:
         target_horizon_days: int,
         aggregate_lookback: int | str,
         pattern_mask: np.ndarray,
+        pattern_policy_id_matrix: np.ndarray | None,
+        policy_horizon_days: np.ndarray | None,
+        policy_stop_loss_pct: np.ndarray | None,
+        policy_take_profit_pct: np.ndarray | None,
+        policy_cohort_scale: np.ndarray | None,
         pattern_exit_mask: np.ndarray | None,
         pattern_dynamic_exit_index: np.ndarray | None,
         pattern_arith_series: np.ndarray,
@@ -582,7 +594,44 @@ class Simulator:
             raise ValueError("min_cohort_size는 1 이상의 정수여야 합니다.")
         buy_fee_value = float(self.buy_fee)
         sell_fee_value = float(self.sell_fee)
-        cohort_weight = 1.0 / float(horizon_days)
+        if pattern_policy_id_matrix is None or pattern_policy_id_matrix.shape != pattern_mask.shape:
+            pattern_policy_id_matrix = np.zeros(pattern_mask.shape, dtype=np.int16)
+            pattern_policy_id_matrix[pattern_mask] = 1
+        else:
+            pattern_policy_id_matrix = np.asarray(pattern_policy_id_matrix, dtype=np.int16)
+
+        if policy_horizon_days is None or len(policy_horizon_days) == 0:
+            policy_horizon_days = np.asarray([horizon_days, horizon_days], dtype=np.int32)
+        else:
+            policy_horizon_days = np.asarray(policy_horizon_days, dtype=np.int32)
+        if policy_horizon_days[0] <= 0:
+            policy_horizon_days[0] = int(horizon_days)
+
+        if policy_stop_loss_pct is None or len(policy_stop_loss_pct) < len(policy_horizon_days):
+            policy_stop_loss_pct = np.full(len(policy_horizon_days), np.nan, dtype=np.float64)
+        else:
+            policy_stop_loss_pct = np.asarray(policy_stop_loss_pct, dtype=np.float64)
+
+        if policy_take_profit_pct is None or len(policy_take_profit_pct) < len(policy_horizon_days):
+            policy_take_profit_pct = np.full(len(policy_horizon_days), np.nan, dtype=np.float64)
+        else:
+            policy_take_profit_pct = np.asarray(policy_take_profit_pct, dtype=np.float64)
+        if policy_cohort_scale is None or len(policy_cohort_scale) < len(policy_horizon_days):
+            policy_cohort_scale = np.ones(len(policy_horizon_days), dtype=np.float64)
+        else:
+            policy_cohort_scale = np.asarray(policy_cohort_scale, dtype=np.float64)
+        invalid_scale = (~np.isfinite(policy_cohort_scale)) | (policy_cohort_scale <= 0.0) | (policy_cohort_scale > 1.0)
+        if np.any(invalid_scale):
+            raise ValueError("policy_cohort_scale 값은 모두 0보다 크고 1 이하여야 합니다.")
+
+        if stop_loss_value is not None and not np.isfinite(policy_stop_loss_pct[0]):
+            policy_stop_loss_pct[0] = float(stop_loss_value)
+        if take_profit_value is not None and not np.isfinite(policy_take_profit_pct[0]):
+            policy_take_profit_pct[0] = float(take_profit_value)
+        has_policy_stop_loss = bool(np.any(np.isfinite(policy_stop_loss_pct) & (policy_stop_loss_pct > 0.0)))
+        has_policy_take_profit = bool(
+            np.any(np.isfinite(policy_take_profit_pct) & (policy_take_profit_pct > 0.0))
+        )
 
         wealth = np.full(len(self.dates), np.nan, dtype=np.float64)
         exposure = np.full(len(self.dates), np.nan, dtype=np.float64)
@@ -619,6 +668,11 @@ class Simulator:
             signal_idx = t if lag_days == 1 else (t + 1)
             signal_mask = pattern_mask[signal_idx]
             selected = np.where(signal_mask)[0]
+            selected_policy_ids = (
+                np.asarray(pattern_policy_id_matrix[signal_idx, selected], dtype=np.int16)
+                if selected.size > 0
+                else np.zeros(0, dtype=np.int16)
+            )
             if (not allow_reentry_value) and selected.size > 0 and active_buckets:
                 active_idx_parts: list[np.ndarray] = []
                 for bucket in active_buckets:
@@ -628,15 +682,18 @@ class Simulator:
                 if active_idx_parts:
                     held_idx = np.unique(np.concatenate(active_idx_parts))
                     if held_idx.size > 0:
-                        selected = selected[~np.isin(selected, held_idx)]
+                        keep_selected = ~np.isin(selected, held_idx)
+                        selected = selected[keep_selected]
+                        selected_policy_ids = selected_policy_ids[keep_selected]
             if selected.size < min_cohort_size_value:
                 selected = selected[:0]
+                selected_policy_ids = selected_policy_ids[:0]
             actual_selected = 0
 
             # lag=1: t 기준 판정 -> t+1 체결, lag=0: t+1 기준 판정 -> t+1 체결
             if (
-                stop_loss_value is not None
-                or take_profit_value is not None
+                has_policy_stop_loss
+                or has_policy_take_profit
                 or has_pattern_exit
                 or has_dynamic_pattern_exit
             ) and lag_days == 1:
@@ -646,10 +703,14 @@ class Simulator:
                     idx = np.asarray(bucket["idx"], dtype=np.int64)
                     hit = np.zeros(vals_t.shape, dtype=np.bool_)
                     valid = np.isfinite(vals_t) & np.isfinite(entry_vals) & (entry_vals > 0.0)
-                    if stop_loss_value is not None:
-                        hit |= valid & (vals_t <= entry_vals * (1.0 - stop_loss_value))
-                    if take_profit_value is not None:
-                        hit |= valid & (vals_t >= entry_vals * (1.0 + take_profit_value))
+                    bucket_stop_loss_value = bucket.get("stop_loss_pct")
+                    bucket_take_profit_value = bucket.get("take_profit_pct")
+                    if bucket_stop_loss_value is not None:
+                        hit |= valid & (vals_t <= entry_vals * (1.0 - float(bucket_stop_loss_value)))
+                    if bucket_take_profit_value is not None:
+                        hit |= valid & (
+                            vals_t >= entry_vals * (1.0 + float(bucket_take_profit_value))
+                        )
                     if has_pattern_exit:
                         hit |= np.asarray(pattern_exit_mask[t, idx], dtype=np.bool_)
                     if has_dynamic_pattern_exit:
@@ -680,8 +741,8 @@ class Simulator:
                 bucket["age"] = int(bucket["age"]) + 1
 
             if (
-                stop_loss_value is not None
-                or take_profit_value is not None
+                has_policy_stop_loss
+                or has_policy_take_profit
                 or has_pattern_exit
                 or has_dynamic_pattern_exit
             ) and lag_days == 0:
@@ -691,10 +752,14 @@ class Simulator:
                     idx = np.asarray(bucket["idx"], dtype=np.int64)
                     hit = np.zeros(vals_t.shape, dtype=np.bool_)
                     valid = np.isfinite(vals_t) & np.isfinite(entry_vals) & (entry_vals > 0.0)
-                    if stop_loss_value is not None:
-                        hit |= valid & (vals_t <= entry_vals * (1.0 - stop_loss_value))
-                    if take_profit_value is not None:
-                        hit |= valid & (vals_t >= entry_vals * (1.0 + take_profit_value))
+                    bucket_stop_loss_value = bucket.get("stop_loss_pct")
+                    bucket_take_profit_value = bucket.get("take_profit_pct")
+                    if bucket_stop_loss_value is not None:
+                        hit |= valid & (vals_t <= entry_vals * (1.0 - float(bucket_stop_loss_value)))
+                    if bucket_take_profit_value is not None:
+                        hit |= valid & (
+                            vals_t >= entry_vals * (1.0 + float(bucket_take_profit_value))
+                        )
                     if has_pattern_exit:
                         hit |= np.asarray(pattern_exit_mask[t + 1, idx], dtype=np.bool_)
                     if has_dynamic_pattern_exit:
@@ -710,6 +775,7 @@ class Simulator:
             next_active: list[dict[str, np.ndarray | int]] = []
             for bucket in active_buckets:
                 age = int(bucket["age"])
+                bucket_horizon_days = int(bucket.get("horizon_days", horizon_days))
                 idx = np.asarray(bucket["idx"], dtype=np.int64)
                 vals = np.asarray(bucket["values"], dtype=np.float64)
                 entry_vals = np.asarray(bucket["entry_values"], dtype=np.float64)
@@ -720,7 +786,7 @@ class Simulator:
                 if exit_mask.shape[0] != idx.size:
                     exit_mask = np.zeros(idx.size, dtype=np.bool_)
 
-                if age >= horizon_days:
+                if age >= bucket_horizon_days:
                     gross_sell_value = float(vals.sum())
                     sell_fee_paid = gross_sell_value * sell_fee_value
                     total_sell_fee_paid += sell_fee_paid
@@ -810,35 +876,95 @@ class Simulator:
                     )
                 cohort_scale = 1.0 if full_cohort else fallback_exposure_value
 
-                target_gross = curr_wealth * cohort_weight * cohort_scale
-                invest_amount = min(float(target_gross), float(cash))
-                if invest_amount > 0.0:
-                    net_budget = invest_amount / (1.0 + buy_fee_value)
-                    per_stock_value = net_budget / float(selected.size)
-                    if per_stock_value > 0.0:
-                        buy_idx = selected.astype(np.int64, copy=False)
-                        buy_values = np.full(buy_idx.size, per_stock_value, dtype=np.float64)
-                        invested_net = float(buy_values.sum())
-                        buy_fee_paid = invested_net * buy_fee_value
-                        gross_spend = invested_net + buy_fee_paid
-                        total_buy_fee_paid += buy_fee_paid
-                        cash -= gross_spend
-                        cohort_id = int(next_cohort_id)
-                        active_buckets.append(
-                            {
-                                "idx": buy_idx,
-                                "values": buy_values,
-                                "entry_values": buy_values.copy(),
-                                "age": 0,
-                                "entry_idx": t + 1,
-                                "signal_entry_idx": signal_idx,
-                                "cohort_id": cohort_id,
-                            }
+                group_orders: list[tuple[np.ndarray, int, float | None, float | None, float]] = []
+                target_total = 0.0
+                for policy_id in np.unique(selected_policy_ids):
+                    group_selected = selected[selected_policy_ids == policy_id]
+                    if group_selected.size == 0:
+                        continue
+
+                    policy_idx = int(policy_id)
+                    group_horizon_days = int(horizon_days)
+                    if 0 <= policy_idx < len(policy_horizon_days) and int(policy_horizon_days[policy_idx]) > 0:
+                        group_horizon_days = int(policy_horizon_days[policy_idx])
+                    group_stop_loss_value = None
+                    if 0 <= policy_idx < len(policy_stop_loss_pct):
+                        stop_val = float(policy_stop_loss_pct[policy_idx])
+                        if np.isfinite(stop_val) and stop_val > 0.0:
+                            group_stop_loss_value = stop_val
+                    group_take_profit_value = None
+                    if 0 <= policy_idx < len(policy_take_profit_pct):
+                        take_val = float(policy_take_profit_pct[policy_idx])
+                        if np.isfinite(take_val) and take_val > 0.0:
+                            group_take_profit_value = take_val
+                    group_cohort_scale = 1.0
+                    if 0 <= policy_idx < len(policy_cohort_scale):
+                        group_cohort_scale = float(policy_cohort_scale[policy_idx])
+
+                    target_gross = (
+                        curr_wealth
+                        * (1.0 / float(group_horizon_days))
+                        * cohort_scale
+                        * group_cohort_scale
+                    )
+                    if target_gross <= 0.0:
+                        continue
+                    group_orders.append(
+                        (
+                            group_selected.astype(np.int64, copy=False),
+                            group_horizon_days,
+                            group_stop_loss_value,
+                            group_take_profit_value,
+                            float(target_gross),
                         )
-                        cohort_entry_net[cohort_id] = invested_net
-                        cohort_exit_net[cohort_id] = 0.0
-                        next_cohort_id += 1
-                        actual_selected = int(buy_idx.size)
+                    )
+                    target_total += float(target_gross)
+
+                spend_scale = 0.0
+                if target_total > 0.0 and cash > 0.0:
+                    spend_scale = min(1.0, float(cash) / float(target_total))
+
+                for (
+                    buy_idx,
+                    group_horizon_days,
+                    group_stop_loss_value,
+                    group_take_profit_value,
+                    target_gross,
+                ) in group_orders:
+                    invest_amount = float(target_gross) * float(spend_scale)
+                    if invest_amount <= 0.0:
+                        continue
+
+                    net_budget = invest_amount / (1.0 + buy_fee_value)
+                    per_stock_value = net_budget / float(buy_idx.size)
+                    if per_stock_value <= 0.0:
+                        continue
+
+                    buy_values = np.full(buy_idx.size, per_stock_value, dtype=np.float64)
+                    invested_net = float(buy_values.sum())
+                    buy_fee_paid = invested_net * buy_fee_value
+                    gross_spend = invested_net + buy_fee_paid
+                    total_buy_fee_paid += buy_fee_paid
+                    cash -= gross_spend
+                    cohort_id = int(next_cohort_id)
+                    active_buckets.append(
+                        {
+                            "idx": buy_idx,
+                            "values": buy_values,
+                            "entry_values": buy_values.copy(),
+                            "age": 0,
+                            "entry_idx": t + 1,
+                            "signal_entry_idx": signal_idx,
+                            "cohort_id": cohort_id,
+                            "horizon_days": int(group_horizon_days),
+                            "stop_loss_pct": group_stop_loss_value,
+                            "take_profit_pct": group_take_profit_value,
+                        }
+                    )
+                    cohort_entry_net[cohort_id] = invested_net
+                    cohort_exit_net[cohort_id] = 0.0
+                    next_cohort_id += 1
+                    actual_selected += int(buy_idx.size)
 
             # 4) 다음 날짜 기준 자산/메타 시계열 기록
             invested_value = 0.0

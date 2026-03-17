@@ -553,6 +553,19 @@ _STOCK_FIELD_TABLE_CACHE: Dict[
     tuple[int, tuple[tuple[str, ...] | None, bool | None, tuple[str, ...]]],
     Dict[str, pd.DataFrame],
 ] = {}
+_REGIME_FRAME_TABLE_CACHE: Dict[
+    tuple[
+        int,
+        tuple[str, ...] | None,
+        bool | None,
+        tuple[str, ...],
+        str,
+        int,
+        str,
+        str,
+    ],
+    pd.DataFrame,
+] = {}
 _DB_MANAGER_CACHE: Dict[int, object] = {}
 
 
@@ -1177,6 +1190,10 @@ class Backtest:
         self._pattern_mask_cache: Dict[tuple[str, bool], np.ndarray] = {}
         self._pattern_exit_mask_cache: Dict[str, np.ndarray] = {}
         self._pattern_exit_index_cache: Dict[tuple[str, int], np.ndarray] = {}
+        self._pattern_policy_id_cache: Dict[tuple[str, bool], np.ndarray] = {}
+        self._pattern_trade_profile_cache: Dict[
+            tuple[str, bool], Dict[int, tuple[object | None, float | None, float | None, float | None]]
+        ] = {}
         self._all_stock_geom_cache: Dict[tuple[int, int], np.ndarray] = {}
         self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._all_opportunity_count_cache: np.ndarray | None = None
@@ -1342,8 +1359,23 @@ class Backtest:
         if market_key in self._regime_frame_cache:
             return self._regime_frame_cache[market_key]
 
-        idx = pd.DatetimeIndex(self.dates)
         breadth_univ = self._resolve_regime_breadth_univ()
+        idx = pd.DatetimeIndex(self.dates)
+        global_key = (
+            int(self.db_mode),
+            breadth_univ.market,
+            breadth_univ.is_tradable,
+            breadth_univ.dept_excludes,
+            str(market_key),
+            len(self.dates),
+            str(idx[0].date()),
+            str(idx[-1].date()),
+        )
+        if global_key in _REGIME_FRAME_TABLE_CACHE:
+            frame = _REGIME_FRAME_TABLE_CACHE[global_key]
+            self._regime_frame_cache[market_key] = frame
+            return frame
+
         stock_tables = _load_stock_field_tables(["close", "amount", "marketcap"], self.db_mode, breadth_univ)
         close_df = stock_tables["close"].reindex(index=idx)
         amount_df = stock_tables["amount"].reindex(index=idx, columns=close_df.columns)
@@ -1360,6 +1392,7 @@ class Backtest:
             market_cap_df=marketcap_df,
             percentile_window=TRADING_DAYS_PER_YEAR,
         )
+        _REGIME_FRAME_TABLE_CACHE[global_key] = frame
         self._regime_frame_cache[market_key] = frame
         return frame
 
@@ -1368,10 +1401,16 @@ class Backtest:
         패턴에 연결된 Regime 객체에 날짜별 허용 마스크를 주입한다.
         """
 
+        prepared: set[int] = set()
         for regime in self._iter_attached_regimes(pattern_fn):
-            frame = self._get_regime_frame(regime)
-            mask_values = regime_mask_from_frame(frame, regime.kind)
-            regime._bind(self.dates, mask_values, frame)
+            for leaf in regime._iter_leaf_regimes():
+                leaf_id = id(leaf)
+                if leaf_id in prepared:
+                    continue
+                frame = self._get_regime_frame(leaf)
+                mask_values = regime_mask_from_frame(frame, leaf.kind)
+                leaf._bind(self.dates, mask_values, frame)
+                prepared.add(leaf_id)
 
     def _combined_regime_mask(self, pattern_fn: Pattern) -> np.ndarray | None:
         """
@@ -1585,6 +1624,10 @@ class Backtest:
         for cache_key in list(self._pattern_mask_cache):
             if cache_key[0] == pattern_name:
                 self._pattern_mask_cache.pop(cache_key, None)
+        for cache_key in list(self._pattern_policy_id_cache):
+            if cache_key[0] == pattern_name:
+                self._pattern_policy_id_cache.pop(cache_key, None)
+                self._pattern_trade_profile_cache.pop(cache_key, None)
         self._pattern_exit_mask_cache.pop(pattern_name, None)
         for cache_key in list(self._pattern_exit_index_cache):
             if cache_key[0] == pattern_name:
@@ -2382,6 +2425,71 @@ class Backtest:
         self._pattern_mask_cache[cache_key] = mask_matrix
         return mask_matrix
 
+    def _build_pattern_policy_id_matrix(
+        self,
+        pattern_name: str,
+        pattern_fn: Pattern,
+        filter_obj: Filter | None = None,
+    ) -> tuple[np.ndarray, Dict[int, tuple[object | None, float | None, float | None, float | None]]]:
+        cache_key = (pattern_name, bool(filter_obj is not None and filter_obj.is_active))
+        if cache_key in self._pattern_policy_id_cache:
+            return (
+                self._pattern_policy_id_cache[cache_key],
+                dict(self._pattern_trade_profile_cache.get(cache_key, {})),
+            )
+
+        pattern_mask = self._build_pattern_mask_matrix(
+            pattern_name,
+            pattern_fn,
+            filter_obj=filter_obj,
+        )
+        try:
+            resolved_profile = pattern_fn._resolved_trade_profile()
+        except ValueError:
+            resolved_profile = None
+        if resolved_profile is not None:
+            policy_id_matrix = np.zeros(pattern_mask.shape, dtype=np.int16)
+            policy_id_matrix[pattern_mask] = 1
+            trade_profiles = {1: resolved_profile}
+            self._pattern_policy_id_cache[cache_key] = policy_id_matrix
+            self._pattern_trade_profile_cache[cache_key] = dict(trade_profiles)
+            return policy_id_matrix, dict(trade_profiles)
+
+        self._prepare_regime_sources(pattern_fn)
+        self._prepare_market_sources(pattern_fn)
+
+        full_filter_mask = None
+        allowed_cols = None
+        if filter_obj is not None and filter_obj.is_active:
+            full_filter_mask = filter_obj.mask_matrix()
+            allowed_cols = None if full_filter_mask is None else np.any(full_filter_mask, axis=0)
+
+        num_codes = len(self.codes)
+        policy_id_matrix = np.zeros((len(self.dates), num_codes), dtype=np.int16)
+        profile_to_id: dict[tuple[object | None, float | None, float | None, float | None], int] = {}
+        id_to_profile: dict[int, tuple[object | None, float | None, float | None, float | None]] = {}
+
+        column_indices = range(num_codes)
+        if allowed_cols is not None:
+            column_indices = np.flatnonzero(allowed_cols)
+
+        for col_idx in column_indices:
+            values = self.prices[:, col_idx]
+            self._prepare_stock_sources(pattern_fn, col_idx)
+            col_policy_ids = np.asarray(
+                pattern_fn._build_policy_id_mask(values, profile_to_id, id_to_profile),
+                dtype=np.int16,
+            )
+            if col_policy_ids.shape != (len(self.dates),):
+                raise ValueError("pattern policy id mask shape이 일치하지 않습니다.")
+            if full_filter_mask is not None:
+                col_policy_ids = np.where(full_filter_mask[:, col_idx], col_policy_ids, 0)
+            policy_id_matrix[:, col_idx] = col_policy_ids
+
+        self._pattern_policy_id_cache[cache_key] = policy_id_matrix
+        self._pattern_trade_profile_cache[cache_key] = dict(id_to_profile)
+        return policy_id_matrix, dict(id_to_profile)
+
     def _all_stock_history_metrics(
         self,
         horizon_days: int,
@@ -2794,6 +2902,14 @@ class Backtest:
             pattern_fn,
             filter_obj=pattern_filter,
         )
+        (
+            pattern_policy_id_matrix,
+            pattern_trade_profiles,
+        ) = self._build_pattern_policy_id_matrix(
+            pattern,
+            pattern_fn,
+            filter_obj=pattern_filter,
+        )
         pattern_exit_mask = self._build_pattern_exit_mask_matrix(pattern, pattern_fn)
         pattern_dynamic_exit_index = None
         if pattern_fn.has_entry_dependent_exit():
@@ -2840,6 +2956,29 @@ class Backtest:
         trade_prices, execution_lag_days, execution_price_mode = self._resolve_trade_price_mode(
             trade_price_mode
         )
+        default_stop_loss_pct = Simulator._normalize_stop_loss_pct(stop_loss_pct)
+        default_take_profit_pct = Simulator._normalize_take_profit_pct(take_profit_pct)
+        max_policy_id = max(pattern_trade_profiles.keys(), default=0)
+        policy_horizon_days = np.full(max_policy_id + 1, int(horizon_days), dtype=np.int32)
+        policy_stop_loss_pct = np.full(max_policy_id + 1, np.nan, dtype=np.float64)
+        policy_take_profit_pct = np.full(max_policy_id + 1, np.nan, dtype=np.float64)
+        policy_cohort_scale = np.ones(max_policy_id + 1, dtype=np.float64)
+        if default_stop_loss_pct is not None:
+            policy_stop_loss_pct[:] = float(default_stop_loss_pct)
+        if default_take_profit_pct is not None:
+            policy_take_profit_pct[:] = float(default_take_profit_pct)
+        for policy_id, profile in pattern_trade_profiles.items():
+            horizon_override, stop_override, take_override, cohort_scale_override = profile
+            resolved_horizon_days = int(horizon_days)
+            if horizon_override is not None:
+                _, resolved_horizon_days = self._resolve_horizon(horizon_override)
+            policy_horizon_days[int(policy_id)] = int(resolved_horizon_days)
+            if stop_override is not None:
+                policy_stop_loss_pct[int(policy_id)] = float(stop_override)
+            if take_override is not None:
+                policy_take_profit_pct[int(policy_id)] = float(take_override)
+            if cohort_scale_override is not None:
+                policy_cohort_scale[int(policy_id)] = float(cohort_scale_override)
         simulator = Simulator(
             dates=self.dates,
             prices=trade_prices,
@@ -2854,6 +2993,11 @@ class Backtest:
             target_horizon_days=horizon_days,
             aggregate_lookback=aggregate_lookback,
             pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=pattern_policy_id_matrix,
+            policy_horizon_days=policy_horizon_days,
+            policy_stop_loss_pct=policy_stop_loss_pct,
+            policy_take_profit_pct=policy_take_profit_pct,
+            policy_cohort_scale=policy_cohort_scale,
             pattern_exit_mask=pattern_exit_mask,
             pattern_dynamic_exit_index=pattern_dynamic_exit_index,
             pattern_arith_series=pattern_arith_series,

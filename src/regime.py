@@ -54,7 +54,7 @@ def _normalize_regime_kind(kind: str) -> str:
     if key not in alias_map:
         raise ValueError(
             "kind는 "
-            "{'trend_friendly', 'contrarian_friendly', 'panic_rebound_risk', 'neutral', "
+            "{'trend', 'contrarian', 'panic', 'trend_friendly', 'contrarian_friendly', 'panic_rebound_risk', 'neutral', "
             "'quiet_tag', 'narrow_tag', 'quiet_squeeze_expansion', 'broad_bull_breakout', "
             "'narrow_leadership', 'sideways_choppy'} 중 하나여야 합니다."
         )
@@ -353,12 +353,17 @@ class Regime:
         self._dates: np.ndarray | None = None
         self._mask_values: np.ndarray | None = None
         self._frame: pd.DataFrame | None = None
+        self._op: str | None = None
+        self._left: Regime | None = None
+        self._right: Regime | None = None
 
     def on(
         self,
         kind: str = REGIME_TREND,
         market: str = "kospi",
     ):
+        if self._op is not None:
+            raise ValueError("합성 Regime에는 on(...)을 다시 호출할 수 없습니다.")
         market_name = str(market or "").strip().lower()
         if not market_name:
             raise ValueError("market은 비어 있을 수 없습니다.")
@@ -368,37 +373,117 @@ class Regime:
         )
         return self
 
+    def _iter_leaf_regimes(self):
+        if self._op is None:
+            if self.params is None:
+                raise ValueError("Regime은 사용 전에 on(...)으로 설정해야 합니다.")
+            yield self
+            return
+        if self._left is not None:
+            yield from self._left._iter_leaf_regimes()
+        if self._right is not None:
+            yield from self._right._iter_leaf_regimes()
+
+    @staticmethod
+    def _compose_unary(op: str, child: Regime) -> Regime:
+        out = Regime()
+        out._op = op
+        out._left = child
+        return out
+
+    @staticmethod
+    def _compose_binary(op: str, left: Regime, right: Regime) -> Regime:
+        if left.market != right.market:
+            raise ValueError("Regime 연산은 같은 market끼리만 지원합니다.")
+        out = Regime()
+        out._op = op
+        out._left = left
+        out._right = right
+        return out
+
+    def __invert__(self) -> Regime:
+        return self._compose_unary("invert", self)
+
+    def __add__(self, other: Regime) -> Regime:
+        if not isinstance(other, Regime):
+            return NotImplemented
+        return self._compose_binary("and", self, other)
+
+    def __or__(self, other: Regime) -> Regime:
+        if not isinstance(other, Regime):
+            return NotImplemented
+        return self._compose_binary("or", self, other)
+
+    def __sub__(self, other: Regime) -> Regime:
+        if not isinstance(other, Regime):
+            return NotImplemented
+        return self._compose_binary("and", self, ~other)
+
+    def __bool__(self) -> bool:
+        raise TypeError("Regime에는 Python의 'not'을 쓸 수 없습니다. '~regime'을 사용하세요.")
+
     @property
     def kind(self) -> str:
+        if self._op is not None:
+            raise ValueError("합성 Regime에는 단일 kind가 없습니다.")
         if self.params is None:
             raise ValueError("Regime은 사용 전에 on(...)으로 설정해야 합니다.")
         return str(self.params.kind)
 
     @property
     def market(self) -> str:
-        if self.params is None:
+        markets = []
+        for leaf in self._iter_leaf_regimes():
+            market_name = str(leaf.params.market)
+            if market_name not in markets:
+                markets.append(market_name)
+        if not markets:
             raise ValueError("Regime은 사용 전에 on(...)으로 설정해야 합니다.")
-        return str(self.params.market)
+        if len(markets) != 1:
+            raise ValueError("합성 Regime은 하나의 market으로만 구성되어야 합니다.")
+        return markets[0]
 
-    def cache_key(self) -> tuple[str, str]:
-        return self.kind, self.market
+    def cache_key(self):
+        if self._op is None:
+            return ("leaf", self.kind, self.market)
+        if self._op == "invert":
+            return ("invert", self._left.cache_key())
+        return (self._op, self._left.cache_key(), self._right.cache_key())
 
     def _bind(self, dates: np.ndarray, mask_values: np.ndarray, frame: pd.DataFrame) -> None:
+        if self._op is not None:
+            raise ValueError("합성 Regime에는 mask를 직접 bind할 수 없습니다.")
         self._dates = np.asarray(dates, dtype="datetime64[ns]")
         self._mask_values = np.array(mask_values, dtype=np.bool_, copy=True)
         self._frame = frame.copy()
 
     def mask(self, length: int | None = None) -> np.ndarray:
-        if self._mask_values is None:
-            raise ValueError("Regime mask가 준비되지 않았습니다. Backtest.analyze()/run()을 먼저 실행하세요.")
-        if length is not None and int(length) != int(self._mask_values.shape[0]):
-            raise ValueError("Regime mask 길이가 패턴 시계열 길이와 일치하지 않습니다.")
-        return np.asarray(self._mask_values, dtype=np.bool_)
+        if self._op is None:
+            if self._mask_values is None:
+                raise ValueError("Regime mask가 준비되지 않았습니다. Backtest.analyze()/run()을 먼저 실행하세요.")
+            if length is not None and int(length) != int(self._mask_values.shape[0]):
+                raise ValueError("Regime mask 길이가 패턴 시계열 길이와 일치하지 않습니다.")
+            return np.asarray(self._mask_values, dtype=np.bool_)
+
+        if self._op == "invert":
+            return np.logical_not(np.asarray(self._left.mask(length), dtype=np.bool_))
+        if self._op == "and":
+            return np.asarray(self._left.mask(length), dtype=np.bool_) & np.asarray(
+                self._right.mask(length),
+                dtype=np.bool_,
+            )
+        if self._op == "or":
+            return np.asarray(self._left.mask(length), dtype=np.bool_) | np.asarray(
+                self._right.mask(length),
+                dtype=np.bool_,
+            )
+        raise ValueError(f"지원하지 않는 Regime 연산입니다: {self._op}")
 
     def to_frame(self, copy: bool = True) -> pd.DataFrame:
-        if self._frame is None:
+        first_leaf = next(self._iter_leaf_regimes(), None)
+        if first_leaf is None or first_leaf._frame is None:
             raise ValueError("Regime 데이터가 준비되지 않았습니다. Backtest.analyze()/run()을 먼저 실행하세요.")
-        return self._frame.copy() if copy else self._frame
+        return first_leaf._frame.copy() if copy else first_leaf._frame
 
 
 __all__ = [

@@ -9,6 +9,8 @@ import numpy as np
 from src.regime import Regime
 from src import util as u
 
+_UNSET = object()
+
 
 class Pattern:
     @staticmethod
@@ -26,11 +28,17 @@ class Pattern:
         self.market_field: str = "close"
         self._market_values: np.ndarray | None = None
         self._stock_values: dict[str, np.ndarray | None] = {}
+        self._cached_mask_key: tuple[object, ...] | None = None
+        self._cached_mask_value: np.ndarray | None = None
         self._cached_exit_mask_key: tuple[object, ...] | None = None
         self._cached_exit_mask_value: np.ndarray | None = None
         self.params: SimpleNamespace | None = None
         self._post_mask_fn: Callable[[np.ndarray], np.ndarray] = self._post_mask_base
         self._regimes: list[Regime] = []
+        self._trade_target_horizon: str | int | None = None
+        self._trade_stop_loss_pct: float | None = None
+        self._trade_take_profit_pct: float | None = None
+        self._trade_cohort_scale: float | None = None
 
     def _resolve_name(self, value: str | None) -> str:
         if value is None:
@@ -67,6 +75,31 @@ class Pattern:
             raise ValueError("trim method는 'remove' 또는 'winsorize'여야 합니다.")
         return method_text
 
+    @staticmethod
+    def _normalize_trade_horizon(value: str | int) -> str | int:
+        if isinstance(value, str):
+            text = str(value).strip()
+            if not text:
+                raise ValueError("target_horizon은 비어 있을 수 없습니다.")
+            return text
+        out = int(value)
+        if out <= 0:
+            raise ValueError("target_horizon은 양의 정수 또는 horizon 라벨이어야 합니다.")
+        return out
+
+    @staticmethod
+    def _normalize_trade_pct(value: float | None, name: str) -> float | None:
+        if value is None:
+            return None
+        out = float(value)
+        if not np.isfinite(out) or out <= 0.0:
+            raise ValueError(f"{name}는 양수여야 합니다.")
+        if out >= 1.0:
+            out = out / 100.0
+        if out <= 0.0 or out >= 1.0:
+            raise ValueError(f"{name}는 0~1(소수) 또는 1~100(%) 범위여야 합니다.")
+        return out
+
     def trim(
         self,
         quantile: float | None,
@@ -80,6 +113,46 @@ class Pattern:
         self.trim_quantile = self._normalize_trim_quantile(quantile)
         self.trim_method = self._normalize_trim_method(method)
         return self
+
+    def trade(
+        self,
+        *,
+        target_horizon: str | int | object = _UNSET,
+        stop_loss_pct: float | None | object = _UNSET,
+        take_profit_pct: float | None | object = _UNSET,
+        cohort_scale: float | object = _UNSET,
+    ):
+        if target_horizon is not _UNSET:
+            self._trade_target_horizon = (
+                None
+                if target_horizon is None
+                else self._normalize_trade_horizon(target_horizon)
+            )
+        if stop_loss_pct is not _UNSET:
+            self._trade_stop_loss_pct = self._normalize_trade_pct(
+                None if stop_loss_pct is None else float(stop_loss_pct),
+                "stop_loss_pct",
+            )
+        if take_profit_pct is not _UNSET:
+            self._trade_take_profit_pct = self._normalize_trade_pct(
+                None if take_profit_pct is None else float(take_profit_pct),
+                "take_profit_pct",
+            )
+        if cohort_scale is not _UNSET:
+            self._trade_cohort_scale = self._normalize_trade_scale(
+                None if cohort_scale is None else float(cohort_scale),
+                "cohort_scale",
+            )
+        return self
+
+    @staticmethod
+    def _normalize_trade_scale(value: float | None, name: str) -> float | None:
+        if value is None:
+            return None
+        out = float(value)
+        if not np.isfinite(out) or out <= 0.0 or out > 1.0:
+            raise ValueError(f"{name}는 0보다 크고 1 이하여야 합니다.")
+        return out
 
     @staticmethod
     def _normalize_market_field(field: str) -> str:
@@ -106,6 +179,14 @@ class Pattern:
 
     def _set_stock_values(self, field: str, values: np.ndarray | None) -> None:
         self._stock_values[str(field).strip().lower()] = values
+
+    @staticmethod
+    def _array_cache_token(values: np.ndarray | None) -> tuple[object, ...] | None:
+        if values is None:
+            return None
+        arr = np.asarray(values)
+        data_ptr = int(arr.__array_interface__["data"][0]) if arr.size else 0
+        return (data_ptr, arr.shape, arr.strides, arr.dtype.str)
 
     def _get_stock_values(self, field: str) -> np.ndarray:
         key = str(field).strip().lower()
@@ -145,13 +226,27 @@ class Pattern:
             source_values = self._market_values
 
         prices = np.asarray(source_values, dtype=np.float64)
-        base_mask = np.asarray(self._base_mask(prices), dtype=np.bool_)
-        if base_mask.shape != prices.shape:
-            raise ValueError(f"패턴 '{self.name}'의 mask shape이 일치하지 않습니다.")
-        post_mask = np.asarray(self._post_mask_fn(prices), dtype=np.bool_)
-        if post_mask.shape != prices.shape:
-            raise ValueError(f"패턴 '{self.name}'의 후처리 mask shape이 일치하지 않습니다.")
-        return base_mask & post_mask
+        stock_keys = tuple(
+            (field, self._array_cache_token(arr))
+            for field, arr in sorted(self._stock_values.items())
+        )
+        cache_key = (
+            self._array_cache_token(np.asarray(values, dtype=np.float64)),
+            self._array_cache_token(prices),
+            self._array_cache_token(self._market_values),
+            stock_keys,
+            id(self._post_mask_fn),
+        )
+        if self._cached_mask_key != cache_key or self._cached_mask_value is None:
+            base_mask = np.asarray(self._base_mask(prices), dtype=np.bool_)
+            if base_mask.shape != prices.shape:
+                raise ValueError(f"패턴 '{self.name}'의 mask shape이 일치하지 않습니다.")
+            post_mask = np.asarray(self._post_mask_fn(prices), dtype=np.bool_)
+            if post_mask.shape != prices.shape:
+                raise ValueError(f"패턴 '{self.name}'의 후처리 mask shape이 일치하지 않습니다.")
+            self._cached_mask_key = cache_key
+            self._cached_mask_value = base_mask & post_mask
+        return self._cached_mask_value
 
     def exit_mask(self, values: np.ndarray) -> np.ndarray:
         return self._get_cached_exit_mask(values)
@@ -180,12 +275,12 @@ class Pattern:
     def _get_cached_exit_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         stock_keys = tuple(
-            (field, id(arr) if arr is not None else None)
+            (field, self._array_cache_token(arr))
             for field, arr in sorted(self._stock_values.items())
         )
         cache_key = (
-            id(prices),
-            id(self._market_values) if self._market_values is not None else None,
+            self._array_cache_token(prices),
+            self._array_cache_token(self._market_values),
             stock_keys,
         )
         if self._cached_exit_mask_key != cache_key or self._cached_exit_mask_value is None:
@@ -219,6 +314,84 @@ class Pattern:
         if hits.size == 0:
             return -1
         return int(lo + hits[0])
+
+    @staticmethod
+    def _is_empty_trade_profile(
+        profile: tuple[object | None, float | None, float | None, float | None]
+    ) -> bool:
+        return profile == (None, None, None, None)
+
+    @staticmethod
+    def _merge_trade_profiles(
+        left: tuple[object | None, float | None, float | None, float | None],
+        right: tuple[object | None, float | None, float | None, float | None],
+    ) -> tuple[object | None, float | None, float | None, float | None]:
+        if Pattern._is_empty_trade_profile(left):
+            return right
+        if Pattern._is_empty_trade_profile(right):
+            return left
+        if left == right:
+            return left
+        raise ValueError(
+            "trade 설정이 서로 다른 패턴은 단일 branch로 결합할 수 없습니다. "
+            "최종 branch에 trade(...)를 주거나 양쪽 설정을 동일하게 맞추세요."
+        )
+
+    def _trade_profile(self) -> tuple[object | None, float | None, float | None, float | None]:
+        return (
+            self._trade_target_horizon,
+            self._trade_stop_loss_pct,
+            self._trade_take_profit_pct,
+            self._trade_cohort_scale,
+        )
+
+    def _resolved_trade_profile(
+        self,
+    ) -> tuple[object | None, float | None, float | None, float | None]:
+        return self._trade_profile()
+
+    @staticmethod
+    def _register_trade_profile(
+        profile: tuple[object | None, float | None, float | None, float | None],
+        profile_to_id: dict[tuple[object | None, float | None, float | None, float | None], int],
+        id_to_profile: dict[int, tuple[object | None, float | None, float | None, float | None]],
+    ) -> int:
+        if profile not in profile_to_id:
+            next_id = len(profile_to_id) + 1
+            profile_to_id[profile] = next_id
+            id_to_profile[next_id] = profile
+        return int(profile_to_id[profile])
+
+    def _build_policy_id_mask(
+        self,
+        values: np.ndarray,
+        profile_to_id: dict[tuple[object | None, float | None, float | None, float | None], int],
+        id_to_profile: dict[int, tuple[object | None, float | None, float | None, float | None]],
+    ) -> np.ndarray:
+        mask = np.asarray(self(values), dtype=np.bool_)
+        return self._build_policy_id_mask_from_mask(
+            mask,
+            profile_to_id,
+            id_to_profile,
+        )
+
+    def _build_policy_id_mask_from_mask(
+        self,
+        mask: np.ndarray,
+        profile_to_id: dict[tuple[object | None, float | None, float | None, float | None], int],
+        id_to_profile: dict[int, tuple[object | None, float | None, float | None, float | None]],
+    ) -> np.ndarray:
+        mask = np.asarray(mask, dtype=np.bool_)
+        out = np.zeros(mask.shape, dtype=np.int16)
+        if not np.any(mask):
+            return out
+        profile_id = self._register_trade_profile(
+            self._resolved_trade_profile(),
+            profile_to_id,
+            id_to_profile,
+        )
+        out[mask] = int(profile_id)
+        return out
 
 
 class CombinedPattern(Pattern):
@@ -299,6 +472,17 @@ class CombinedPattern(Pattern):
             return left_idx
         return min(left_idx, right_idx)
 
+    def _resolved_trade_profile(
+        self,
+    ) -> tuple[object | None, float | None, float | None, float | None]:
+        direct = self._trade_profile()
+        if not self._is_empty_trade_profile(direct):
+            return direct
+        return self._merge_trade_profiles(
+            self.left._resolved_trade_profile(),
+            self.right._resolved_trade_profile(),
+        )
+
 
 class RegimePattern(Pattern):
     def __init__(
@@ -339,6 +523,14 @@ class RegimePattern(Pattern):
     ) -> int:
         return self.pattern.first_exit_index(values, entry_idx, last_idx)
 
+    def _resolved_trade_profile(
+        self,
+    ) -> tuple[object | None, float | None, float | None, float | None]:
+        direct = self._trade_profile()
+        if not self._is_empty_trade_profile(direct):
+            return direct
+        return self.pattern._resolved_trade_profile()
+
 
 class UnionPattern(Pattern):
     def __init__(
@@ -367,7 +559,21 @@ class UnionPattern(Pattern):
 
     def _get_cached_child_masks(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         prices = np.asarray(values, dtype=np.float64)
-        cache_key = (id(prices),)
+        left_stock_keys = tuple(
+            (field, self._array_cache_token(arr))
+            for field, arr in sorted(self.left._stock_values.items())
+        )
+        right_stock_keys = tuple(
+            (field, self._array_cache_token(arr))
+            for field, arr in sorted(self.right._stock_values.items())
+        )
+        cache_key = (
+            self._array_cache_token(prices),
+            self._array_cache_token(self.left._market_values),
+            left_stock_keys,
+            self._array_cache_token(self.right._market_values),
+            right_stock_keys,
+        )
         if self._cached_child_mask_key != cache_key:
             self._cached_left_mask = np.asarray(self.left(values), dtype=np.bool_)
             self._cached_right_mask = np.asarray(self.right(values), dtype=np.bool_)
@@ -412,6 +618,69 @@ class UnionPattern(Pattern):
         if not candidates:
             return -1
         return min(candidates)
+
+    def _resolved_trade_profile(
+        self,
+    ) -> tuple[object | None, float | None, float | None, float | None]:
+        direct = self._trade_profile()
+        if not self._is_empty_trade_profile(direct):
+            return direct
+        left_profile = self.left._resolved_trade_profile()
+        right_profile = self.right._resolved_trade_profile()
+        if self._is_empty_trade_profile(left_profile) and self._is_empty_trade_profile(right_profile):
+            return left_profile
+        if left_profile == right_profile:
+            return left_profile
+        raise ValueError(
+            "분기 패턴의 trade 설정이 branch별로 다릅니다. "
+            "UnionPattern은 branch별 policy id를 사용해야 합니다."
+        )
+
+    def _build_policy_id_mask(
+        self,
+        values: np.ndarray,
+        profile_to_id: dict[tuple[object | None, float | None, float | None, float | None], int],
+        id_to_profile: dict[int, tuple[object | None, float | None, float | None, float | None]],
+    ) -> np.ndarray:
+        direct = self._trade_profile()
+        if not self._is_empty_trade_profile(direct):
+            return super()._build_policy_id_mask(values, profile_to_id, id_to_profile)
+
+        left_mask, right_mask = self._get_cached_child_masks(values)
+        try:
+            left_ids = np.asarray(
+                self.left._build_policy_id_mask_from_mask(
+                    left_mask,
+                    profile_to_id,
+                    id_to_profile,
+                ),
+                dtype=np.int16,
+            )
+        except ValueError:
+            left_ids = np.asarray(
+                self.left._build_policy_id_mask(values, profile_to_id, id_to_profile),
+                dtype=np.int16,
+            )
+        try:
+            right_ids = np.asarray(
+                self.right._build_policy_id_mask_from_mask(
+                    right_mask,
+                    profile_to_id,
+                    id_to_profile,
+                ),
+                dtype=np.int16,
+            )
+        except ValueError:
+            right_ids = np.asarray(
+                self.right._build_policy_id_mask(values, profile_to_id, id_to_profile),
+                dtype=np.int16,
+            )
+        if left_ids.shape != right_ids.shape:
+            raise ValueError("분기 패턴의 policy id mask shape이 일치하지 않습니다.")
+        out = left_ids.copy()
+        fill = out == 0
+        out[fill] = right_ids[fill]
+        return out
 
 
 class SizeBucket(Pattern):
@@ -523,6 +792,7 @@ class RelativeStrength(Pattern):
     def on(
         self,
         window: int = 60,
+        trigger: Literal["above", "below"] = "above",
         threshold: float = 0.0,
         stay_days: int = 1,
         cooldown_days: int = 0,
@@ -531,6 +801,9 @@ class RelativeStrength(Pattern):
         window_value = int(window)
         if window_value <= 0:
             raise ValueError("window는 1 이상이어야 합니다.")
+        trigger_text = str(trigger or "above").strip().lower()
+        if trigger_text not in {"above", "below"}:
+            raise ValueError("trigger는 'above' 또는 'below'여야 합니다.")
         threshold_value = float(threshold)
         if not np.isfinite(threshold_value):
             raise ValueError("threshold는 유한한 숫자여야 합니다.")
@@ -541,6 +814,7 @@ class RelativeStrength(Pattern):
 
         self.params = SimpleNamespace(
             window=window_value,
+            trigger=trigger_text,
             threshold=threshold_value,
             stay_days=int(max(1, stay_days)),
             cooldown_days=int(max(0, cooldown_days)),
@@ -549,13 +823,26 @@ class RelativeStrength(Pattern):
 
     def __call__(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
-        base_mask = np.asarray(self._base_mask(prices), dtype=np.bool_)
-        if base_mask.shape != prices.shape:
-            raise ValueError(f"패턴 '{self.name}'의 mask shape이 일치하지 않습니다.")
-        post_mask = np.asarray(self._post_mask_fn(prices), dtype=np.bool_)
-        if post_mask.shape != prices.shape:
-            raise ValueError(f"패턴 '{self.name}'의 후처리 mask shape이 일치하지 않습니다.")
-        return base_mask & post_mask
+        stock_keys = tuple(
+            (field, self._array_cache_token(arr))
+            for field, arr in sorted(self._stock_values.items())
+        )
+        cache_key = (
+            self._array_cache_token(prices),
+            self._array_cache_token(self._market_values),
+            stock_keys,
+            id(self._post_mask_fn),
+        )
+        if self._cached_mask_key != cache_key or self._cached_mask_value is None:
+            base_mask = np.asarray(self._base_mask(prices), dtype=np.bool_)
+            if base_mask.shape != prices.shape:
+                raise ValueError(f"패턴 '{self.name}'의 mask shape이 일치하지 않습니다.")
+            post_mask = np.asarray(self._post_mask_fn(prices), dtype=np.bool_)
+            if post_mask.shape != prices.shape:
+                raise ValueError(f"패턴 '{self.name}'의 후처리 mask shape이 일치하지 않습니다.")
+            self._cached_mask_key = cache_key
+            self._cached_mask_value = base_mask & post_mask
+        return self._cached_mask_value
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         if self.params is None:
@@ -595,7 +882,10 @@ class RelativeStrength(Pattern):
         rel = stock_ret - market_ret
 
         cond = np.zeros(n, dtype=np.bool_)
-        cond[window:] = valid & np.isfinite(rel) & (rel >= float(self.params.threshold))
+        if self.params.trigger == "above":
+            cond[window:] = valid & np.isfinite(rel) & (rel >= float(self.params.threshold))
+        else:
+            cond[window:] = valid & np.isfinite(rel) & (rel <= float(self.params.threshold))
         return u.stay_cooldown_mask(cond, self.params.stay_days, self.params.cooldown_days)
 
 
@@ -1104,13 +1394,11 @@ class Trending(Pattern):
             return u.stay_cooldown_mask(out, self.params.stay_days, self.params.cooldown_days)
 
         is_uptrend = trigger == "ma_trend_up"
-        for i in range(1, n):
-            if not (valid_end[i] and valid_end[i - 1]):
-                continue
-            if is_uptrend:
-                out[i] = mean[i] > mean[i - 1]
-            else:
-                out[i] = mean[i] < mean[i - 1]
+        valid_pair = valid_end[1:] & valid_end[:-1]
+        if is_uptrend:
+            out[1:] = valid_pair & (mean[1:] > mean[:-1])
+        else:
+            out[1:] = valid_pair & (mean[1:] < mean[:-1])
         return u.stay_cooldown_mask(out, self.params.stay_days, self.params.cooldown_days)
 
 
@@ -1245,7 +1533,11 @@ class Bollinger(Pattern):
         if high.shape != prices.shape or low.shape != prices.shape:
             raise ValueError("Bollinger trailing_stop 입력 시계열 shape이 일치하지 않습니다.")
 
-        cache_key = (id(prices), id(high), id(low))
+        cache_key = (
+            self._array_cache_token(prices),
+            self._array_cache_token(high),
+            self._array_cache_token(low),
+        )
         cached_key = getattr(self, "_cached_trailing_atr_key", None)
         cached_value = getattr(self, "_cached_trailing_atr_value", None)
         if cached_key != cache_key or cached_value is None:
