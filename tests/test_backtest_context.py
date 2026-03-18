@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.backtest import Backtest
+from src.backtest import Backtest, Univ
 from src.pattern import MFI, Pattern
 from src.regime import Regime
 from src.simulate import Simulator
@@ -55,6 +55,38 @@ class _FakeSimulator:
     def summary(self) -> dict[str, float | str]:
         return dict(self._summary)
 
+    def plot(
+        self,
+        figsize=(12, 5),
+        show_kospi: bool = False,
+        return_handles: bool = False,
+        axes=None,
+    ):
+        created_axes = axes is None
+        if created_axes:
+            fig, axes = plt.subplots(1, 3, figsize=figsize)
+        else:
+            axes = np.asarray(axes, dtype=object).reshape(-1)
+            fig = axes[0].figure
+            for ax in axes:
+                ax.clear()
+
+        axes[0].plot(self._frame.index, self._frame["exposure"], label="Daily exposure")
+        axes[1].plot(self._frame.index, np.arange(len(self._frame)), label="New cohort count")
+        axes[2].plot(self._frame.index, self._frame["wealth"], label=self.pattern)
+        if show_kospi and "kospi_reference_curve" in self._frame.attrs:
+            axes[2].plot(
+                self._frame.index,
+                self._frame.attrs["kospi_reference_curve"],
+                label="KOSPI",
+            )
+
+        if return_handles:
+            return fig, axes
+        if created_axes:
+            plt.show()
+        return None
+
 
 class _MaskPattern(Pattern):
     def __init__(self, name: str, mask):
@@ -68,6 +100,12 @@ class _MaskPattern(Pattern):
 class BacktestContextTests(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
+
+    def test_univ_excludes_reits_by_default(self):
+        univ = Univ()
+
+        self.assertTrue(univ.exclude_reits)
+        self.assertNotIn("리츠", univ.dept_excludes)
 
     def _bind_regime(self, kind: str, values: list[bool]) -> Regime:
         regime = Regime().on(kind=kind, market="kospi")
@@ -231,6 +269,77 @@ class BacktestContextTests(unittest.TestCase):
         self.assertEqual(profiles[1], (None, None, None, None))
         self.assertEqual(profiles[2], ("3W", None, None, 0.35))
 
+    def test_build_pattern_mask_matrix_applies_pattern_nmax_rank_order(self):
+        bt = Backtest.__new__(Backtest)
+        bt.dates = pd.date_range("2025-01-01", periods=4, freq="B").to_numpy()
+        bt.prices = np.ones((4, 4), dtype=np.float64)
+        bt.codes = ["A", "B", "C", "D"]
+        bt.start_idx = 0
+        bt.end_idx = 4
+        bt.regime = None
+        bt._pattern_mask_cache = {}
+        bt._pattern_policy_id_cache = {}
+        bt._pattern_trade_profile_cache = {}
+        bt._pattern_exit_mask_cache = {}
+        bt._pattern_exit_index_cache = {}
+        bt._stock_field_matrix_cache = {}
+        bt._pattern_nmax_node_cache = {}
+        bt._pattern_nmax_series_cache = {}
+        bt._market_values_cache = {}
+        bt._regime_frame_cache = {}
+
+        pattern = _MaskPattern("cap", [True, True, False, False]).nmax(2)
+        bt._get_nmax_rank_key = lambda pattern_fn, date_idx, col_idx: {
+            0: (0.20, -2.0, -0.99, -70.0, 0),
+            1: (0.10, -2.0, -0.90, -50.0, 1),
+            2: (0.10, -1.5, -0.96, -54.0, 2),
+            3: (0.10, -1.5, -0.96, -56.0, 3),
+        }[int(col_idx)]
+
+        mask_matrix = bt._build_pattern_mask_matrix("cap", pattern)
+        policy_ids, profiles = bt._build_pattern_policy_id_matrix("cap", pattern)
+
+        self.assertEqual(mask_matrix[0].tolist(), [False, True, False, True])
+        self.assertEqual(mask_matrix[1].tolist(), [False, True, False, True])
+        self.assertEqual(policy_ids[0].tolist(), [0, 1, 0, 1])
+        self.assertEqual(policy_ids[1].tolist(), [0, 1, 0, 1])
+        self.assertEqual(profiles[1], (None, None, None, None))
+
+    def test_build_pattern_mask_matrix_can_use_market_cap_as_nmax_tiebreaker(self):
+        bt = Backtest.__new__(Backtest)
+        bt.dates = pd.date_range("2025-01-01", periods=4, freq="B").to_numpy()
+        bt.prices = np.ones((4, 4), dtype=np.float64)
+        bt.codes = ["A", "B", "C", "D"]
+        bt.start_idx = 0
+        bt.end_idx = 4
+        bt.regime = None
+        bt._pattern_mask_cache = {}
+        bt._pattern_policy_id_cache = {}
+        bt._pattern_trade_profile_cache = {}
+        bt._pattern_exit_mask_cache = {}
+        bt._pattern_exit_index_cache = {}
+        bt._stock_field_matrix_cache = {
+            "marketcap": np.tile(
+                np.asarray([[100.0, 200.0, 400.0, 300.0]], dtype=np.float64),
+                (4, 1),
+            )
+        }
+        bt._pattern_nmax_node_cache = {}
+        bt._pattern_nmax_series_cache = {}
+        bt._market_values_cache = {}
+        bt._regime_frame_cache = {}
+
+        pattern = _MaskPattern("cap_mc", [True, True, False, False]).nmax(2, market_cap=True)
+        bt._get_nmax_metric_series = lambda node, metric_name, col_idx: np.asarray(
+            [0.0, {0: 0.01, 1: 0.02, 2: 0.30, 3: 0.20}[int(col_idx)], 0.0, 0.0],
+            dtype=np.float64,
+        )
+
+        mask_matrix = bt._build_pattern_mask_matrix("cap_mc", pattern)
+
+        self.assertEqual(mask_matrix[0].tolist(), [False, False, True, True])
+        self.assertEqual(mask_matrix[1].tolist(), [False, False, True, True])
+
     def test_plot_wealth_curves_uses_last_analyze_order_and_returns_summary(self):
         bt = Backtest.__new__(Backtest)
         bt._last_stats_collection = SimpleNamespace(
@@ -334,6 +443,56 @@ class BacktestContextTests(unittest.TestCase):
         ax = plt.gcf().axes[0]
         self.assertEqual([line.get_label() for line in ax.lines], ["benchmark", "trend_base", "KOSPI"])
 
+    def test_stats_plot_with_simulator_stacks_into_single_figure(self):
+        dates = pd.date_range("2025-01-01", periods=5, freq="B").to_numpy()
+        horizons = [("1W", 5), ("1M", 20)]
+        benchmark = Stats.create_daily(dates, horizons)
+        alpha = Stats.create_daily(dates, horizons)
+
+        benchmark.daily_arith[0, :2] = [0.01, 0.015]
+        benchmark.daily_geom[0, :2] = [0.01, 0.014]
+        benchmark.daily_rise[0, :2] = [1.0, 1.0]
+        benchmark.daily_arith[1, :2] = [0.02, 0.018]
+        benchmark.daily_geom[1, :2] = [0.019, 0.017]
+        benchmark.daily_rise[1, :2] = [1.0, 0.0]
+
+        alpha.daily_arith[0, :2] = [0.02, 0.025]
+        alpha.daily_geom[0, :2] = [0.019, 0.024]
+        alpha.daily_rise[0, :2] = [1.0, 1.0]
+        alpha.daily_arith[1, :2] = [0.03, 0.028]
+        alpha.daily_geom[1, :2] = [0.029, 0.027]
+        alpha.daily_rise[1, :2] = [1.0, 1.0]
+
+        stats = StatsCollection(
+            {"benchmark": benchmark, "alpha": alpha},
+            benchmark_names={"benchmark"},
+        )
+        sim = _FakeSimulator(
+            pattern="alpha",
+            cagr=0.12,
+            kospi_curve=np.asarray([1.0, 1.01, 1.02], dtype=np.float64),
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            fig, axes_map = stats.plot_with_simulator(
+                simulator=sim,
+                patterns=["benchmark", "alpha"],
+                annualized=True,
+                show_kospi=True,
+                return_handles=True,
+            )
+
+        self.assertEqual(len(fig.axes), 7)
+        self.assertEqual(len(axes_map["stats"]), 4)
+        self.assertEqual(len(axes_map["simulator"]), 3)
+        self.assertIs(axes_map["stats"][0].figure, fig)
+        self.assertIs(axes_map["simulator"][0].figure, fig)
+        self.assertEqual(
+            [line.get_label() for line in axes_map["simulator"][2].lines],
+            ["alpha", "KOSPI"],
+        )
+
     def test_stats_plot_uses_absolute_day_exposure(self):
         dates = pd.date_range("2025-01-01", periods=5, freq="B").to_numpy()
         horizons = [("1W", 5)]
@@ -419,6 +578,8 @@ class BacktestContextTests(unittest.TestCase):
         sim.cohort_win_rate = 0.6
         sim.cohort_payoff_ratio = 1.4
         sim.active_day_ratio = 0.5
+        sim.mean_turnover = 0.02
+        sim.annual_turnover = 4.8
         sim.total_buy_fee_paid = 0.001
         sim.total_sell_fee_paid = 0.002
 
@@ -427,8 +588,108 @@ class BacktestContextTests(unittest.TestCase):
             _, axes = sim.plot(show_kospi=True, return_handles=True)
 
         self.assertGreaterEqual(len(axes[0].patches), 2)
+        self.assertIn("포트 평균 종목수", axes[1].texts[0].get_text())
+        self.assertIn("코호트 평균 종목수", axes[1].texts[0].get_text())
         self.assertGreaterEqual(len(axes[2].patches), 2)
         self.assertEqual([line.get_label() for line in axes[2].lines], ["demo", "KOSPI"])
+        self.assertIn("회전율(연환산)", axes[2].texts[0].get_text())
+
+    def test_simulator_plot_keeps_wealth_y_ticks_on_left_when_axes_are_injected(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=np.ones((4, 1), dtype=np.float64),
+        )
+        sim.data = pd.DataFrame(
+            {
+                "wealth": [1.0, 1.02, 1.03, 1.05],
+                "exposure": [0.2, 0.25, 0.15, 0.3],
+                "selected_count": [1.0, 0.0, 1.0, 0.0],
+                "active_count": [1.0, 1.0, 1.0, 1.0],
+            },
+            index=dates,
+        )
+        sim.data.attrs["kospi_reference_curve"] = np.asarray([1.0, 1.01, 1.02, 1.03], dtype=np.float64)
+        sim.pattern = "demo"
+        sim.target_horizon = "1M"
+        sim.target_horizon_days = 20
+        sim.aggregate_lookback = "1Y"
+        sim.fallback_exposure = 0.5
+        sim.max_weight_per_stock = float("nan")
+        sim.run_years = 1.0
+        sim.total_return = 0.05
+        sim.cagr = 0.05
+        sim.max_drawdown = -0.02
+        sim.cohort_win_rate = 0.6
+        sim.cohort_payoff_ratio = 1.4
+        sim.active_day_ratio = 0.5
+        sim.mean_turnover = 0.02
+        sim.annual_turnover = 4.8
+        sim.total_buy_fee_paid = 0.001
+        sim.total_sell_fee_paid = 0.002
+
+        fig, axes = plt.subplots(1, 3, figsize=(12, 5))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            sim.plot(show_kospi=True, axes=axes)
+
+        self.assertEqual(axes[2].yaxis.get_ticks_position(), "left")
+        self.assertEqual([line.get_label() for line in axes[2].lines], ["demo", "KOSPI"])
+
+    def test_simulator_summary_includes_annualized_turnover(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        prices = np.ones((4, 1), dtype=np.float64)
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A"],
+            buy_fee=0.0,
+            sell_fee=0.0,
+        )
+
+        pattern_mask = np.zeros((4, 1), dtype=np.bool_)
+        pattern_mask[1, 0] = True
+
+        sim.run(
+            start_idx=0,
+            end_idx=4,
+            pattern="turnover",
+            target_horizon="1M",
+            target_horizon_days=3,
+            aggregate_lookback="1Y",
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=None,
+            policy_horizon_days=np.asarray([3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0], dtype=np.float64),
+            pattern_exit_mask=np.zeros((4, 1), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            pattern_arith_series=np.zeros(4, dtype=np.float64),
+            pattern_geom_series=np.zeros(4, dtype=np.float64),
+            pattern_rise_series=np.ones(4, dtype=np.float64),
+            all_stock_arith_series=np.zeros(4, dtype=np.float64),
+            all_stock_geom_series=np.zeros(4, dtype=np.float64),
+            all_stock_rise_series=np.ones(4, dtype=np.float64),
+            fallback_exposure=0.5,
+            gate_geom_min=0.0,
+            gate_arith_min=0.0,
+            gate_rise_min=0.5,
+            gate_use_geom=False,
+            gate_use_arith=False,
+            gate_use_rise=False,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+        )
+
+        summary = sim.summary()
+
+        self.assertTrue(np.isclose(summary["mean_turnover"], 1.0 / 12.0))
+        self.assertTrue(np.isclose(summary["annual_turnover"], 20.0))
 
     def test_simulator_respects_branch_specific_horizon_days(self):
         dates = pd.date_range("2025-01-01", periods=5, freq="B")
@@ -543,6 +804,58 @@ class BacktestContextTests(unittest.TestCase):
 
         self.assertEqual(len(sim.port_at(dates[1])), 2)
         self.assertEqual(len(sim.port_at(dates[2])), 1)
+
+    def test_simulator_caps_new_cohort_size(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        prices = np.ones((4, 3), dtype=np.float64)
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A", "B", "C"],
+        )
+
+        pattern_mask = np.zeros((4, 3), dtype=np.bool_)
+        pattern_mask[1] = [True, True, True]
+
+        sim.run(
+            start_idx=0,
+            end_idx=4,
+            pattern="cap_test",
+            target_horizon="1M",
+            target_horizon_days=3,
+            aggregate_lookback="1Y",
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=None,
+            policy_horizon_days=np.asarray([3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0], dtype=np.float64),
+            pattern_exit_mask=np.zeros((4, 3), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            pattern_arith_series=np.zeros(4, dtype=np.float64),
+            pattern_geom_series=np.zeros(4, dtype=np.float64),
+            pattern_rise_series=np.ones(4, dtype=np.float64),
+            all_stock_arith_series=np.zeros(4, dtype=np.float64),
+            all_stock_geom_series=np.zeros(4, dtype=np.float64),
+            all_stock_rise_series=np.ones(4, dtype=np.float64),
+            fallback_exposure=0.5,
+            gate_geom_min=0.0,
+            gate_arith_min=0.0,
+            gate_rise_min=0.5,
+            gate_use_geom=False,
+            gate_use_arith=False,
+            gate_use_rise=False,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+            max_cohort_size=2,
+        )
+
+        self.assertEqual(len(sim.port_at(dates[1])), 2)
+        self.assertTrue(np.isclose(sim.summary()["max_cohort_size"], 2.0))
 
     def test_simulator_respects_branch_specific_cohort_scale(self):
         dates = pd.date_range("2025-01-01", periods=4, freq="B")

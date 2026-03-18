@@ -908,6 +908,7 @@ class BigQueryStockData(BigQueryData):
     STOCK_DAILY_EXTRA_WHERE = (
         "is_tradable IS TRUE",
         "(dept IS NULL OR dept NOT IN ('SPAC', '관리종목', '투자주의환기종목', '외국기업'))",
+        "(name IS NULL OR name NOT LIKE '%리츠%' OR name LIKE '%메리츠%' OR name LIKE '%블리츠%')",
     )
     DEFAULT_OUTPUT_FIELDS = ("ticker", "name")
 

@@ -809,7 +809,7 @@ class StatsCollection:
             ordered_handles,
             legend_labels,
             loc="upper left",
-            fontsize=9,
+            fontsize=10,
             frameon=True,
         )
 
@@ -997,6 +997,7 @@ class StatsCollection:
         rise_ylim=None,
         return_ylim=None,
         return_handles: bool = False,
+        axes=None,
     ):
         """
         horizon별 산술/기하/상승확률/빈도 비교 차트를 그린다.
@@ -1063,7 +1064,21 @@ class StatsCollection:
         x = np.arange(len(periods))
         period_index = {label: idx for idx, label in enumerate(periods)}
 
-        fig, axes = plt.subplots(1, 4, figsize=figsize, constrained_layout=True)
+        created_axes = axes is None
+        title_fontsize = 14
+        label_fontsize = 10
+        tick_fontsize = 10
+        if created_axes:
+            fig, axes = plt.subplots(1, 4, figsize=figsize, constrained_layout=True)
+        else:
+            axes = np.asarray(axes, dtype=object).reshape(-1)
+            if axes.size != 4:
+                raise ValueError("axes는 길이 4인 matplotlib Axes 컬렉션이어야 합니다.")
+            fig = axes[0].figure
+            if any(ax.figure is not fig for ax in axes):
+                raise ValueError("axes는 모두 같은 figure에 속해야 합니다.")
+            for ax in axes:
+                ax.clear()
 
         for name in names:
             group = combined.loc[combined["pattern"] == name]
@@ -1079,8 +1094,6 @@ class StatsCollection:
             axes[3].plot(xs, group["exposure_ratio"] * 100.0, marker="o", color=color, label=name)
 
         return_title_prefix = "Annualized " if annualized else ""
-        if cost_enabled:
-            return_title_prefix += "After Cost "
         return_ylabel = "Annualized Return (%)" if annualized else "Return (%)"
         for ax, title, ylabel, draw_zero in [
             (axes[0], f"{return_title_prefix}Arithmetic Mean", return_ylabel, True),
@@ -1092,8 +1105,9 @@ class StatsCollection:
                 ax.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
             ax.set_xticks(x)
             ax.set_xticklabels(periods, rotation=0)
-            ax.set_title(title)
-            ax.set_ylabel(ylabel)
+            ax.set_title(title, fontsize=title_fontsize)
+            ax.set_ylabel(ylabel, fontsize=label_fontsize)
+            ax.tick_params(axis="both", labelsize=tick_fontsize)
 
         axes[2].set_ylabel("")
         axes[3].set_ylabel("")
@@ -1128,6 +1142,72 @@ class StatsCollection:
 
         if return_handles:
             return fig, axes
+        return None
+
+    def plot_with_simulator(
+        self,
+        simulator,
+        patterns: Iterable[str] | None = None,
+        start=None,
+        end=None,
+        figsize=(14.5, 8.0),
+        annualized: bool = False,
+        cost: bool | None = None,
+        rise_ylim=None,
+        return_ylim=None,
+        show_kospi: bool = False,
+        hspace: float = 0.08,
+        wspace: float = 0.36,
+        return_handles: bool = False,
+    ):
+        """
+        StatsCollection 4패널과 Simulator 3패널을 한 figure에 위아래로 붙여 그린다.
+        """
+
+        _configure_plot_font()
+        plt, _, _, _ = _plot_modules()
+        fig = plt.figure(figsize=figsize, constrained_layout=False)
+        grid = fig.add_gridspec(
+            2,
+            12,
+            height_ratios=[1.0, 1.15],
+            hspace=float(hspace),
+            wspace=float(wspace),
+        )
+        stats_axes = np.asarray(
+            [fig.add_subplot(grid[0, i * 3 : (i + 1) * 3]) for i in range(4)],
+            dtype=object,
+        )
+        simulator_axes = np.asarray(
+            [fig.add_subplot(grid[1, i * 4 : (i + 1) * 4]) for i in range(3)],
+            dtype=object,
+        )
+
+        self.plot(
+            patterns=patterns,
+            start=start,
+            end=end,
+            annualized=annualized,
+            cost=cost,
+            rise_ylim=rise_ylim,
+            return_ylim=return_ylim,
+            axes=stats_axes,
+        )
+        simulator.plot(
+            show_kospi=show_kospi,
+            axes=simulator_axes,
+        )
+        fig.subplots_adjust(
+            left=0.045,
+            right=0.99,
+            top=0.96,
+            bottom=0.08,
+            hspace=float(hspace),
+            wspace=float(wspace),
+        )
+
+        if return_handles:
+            return fig, {"stats": stats_axes, "simulator": simulator_axes}
         return None
 
     def plot_compare(

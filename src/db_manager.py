@@ -56,6 +56,14 @@ def _quote_sql_text(text: str) -> str:
     return "'" + str(text).replace("'", "''") + "'"
 
 
+def _reits_name_exclusion_sql(name_col: str = "name") -> str:
+    col = str(name_col).strip() or "name"
+    return (
+        f"({col} IS NULL OR {col} NOT LIKE '%리츠%' "
+        f"OR {col} LIKE '%메리츠%' OR {col} LIKE '%블리츠%')"
+    )
+
+
 def _normalize_column_names(columns: Sequence[str], base: Sequence[str]) -> list[str]:
     cleaned = [str(c).strip() for c in columns if str(c).strip()]
     if not cleaned:
@@ -139,6 +147,7 @@ class DB:
         market: Sequence[str] | None = DEFAULT_MARKETS,
         is_tradable: bool | None = True,
         dept_excludes: Sequence[str] = DEFAULT_DEPT_EXCLUDES,
+        exclude_reits: bool = True,
     ) -> pd.DataFrame:
         """
         DuckDB로 adjusted-stock parquet를 읽어 필터링한 뒤
@@ -181,6 +190,8 @@ class DB:
             if depts:
                 quoted = ", ".join(_quote_sql_text(d) for d in depts)
                 where_parts.append(f"(dept IS NULL OR dept NOT IN ({quoted}))")
+        if bool(exclude_reits):
+            where_parts.append(_reits_name_exclusion_sql("name"))
 
         base_where_sql = ""
         if where_parts:
@@ -269,6 +280,7 @@ class DB:
         market: Sequence[str] | None = DEFAULT_MARKETS,
         is_tradable: bool | None = True,
         dept_excludes: Sequence[str] = DEFAULT_DEPT_EXCLUDES,
+        exclude_reits: bool = True,
     ) -> pd.DataFrame:
         """
         adjusted-stock long 포맷을 (date x ticker) wide 포맷으로 변환한다.
@@ -291,6 +303,7 @@ class DB:
             market=market,
             is_tradable=is_tradable,
             dept_excludes=dept_excludes,
+            exclude_reits=exclude_reits,
         )
         if field_name not in long_df.columns:
             raise ValueError(f"adjusted-stock 데이터에 '{field_name}' 컬럼이 없습니다.")
@@ -386,6 +399,7 @@ def load_adjusted_stock_duckdb(
     market: Sequence[str] | None = DEFAULT_MARKETS,
     is_tradable: bool | None = True,
     dept_excludes: Sequence[str] = DEFAULT_DEPT_EXCLUDES,
+    exclude_reits: bool = True,
 ) -> pd.DataFrame:
     return DB(db_root_dir=db_root_dir, adjusted_pattern=adjusted_pattern).load_adjusted_stock_duckdb(
         adjusted_pattern=adjusted_pattern,
@@ -396,6 +410,7 @@ def load_adjusted_stock_duckdb(
         market=market,
         is_tradable=is_tradable,
         dept_excludes=dept_excludes,
+        exclude_reits=exclude_reits,
     )
 
 

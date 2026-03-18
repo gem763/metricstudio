@@ -18,7 +18,8 @@ from src.db_manager import (
     DEFAULT_MARKETS,
 )
 from src.db_manager_archive import DB as ArchiveDBManager
-from src.pattern import Pattern
+from src import util as u
+from src.pattern import AmountSurge, Bollinger, High, MFI, Pattern
 from src.regime import Regime, build_market_cap_bucket_masks, build_regime_frame, regime_mask_from_frame
 from src.simulate import Simulator
 from src.stats import Stats, StatsCollection
@@ -100,19 +101,22 @@ class Univ:
     market: tuple[str, ...] | None = DEFAULT_MARKETS
     is_tradable: bool | None = True
     dept_excludes: tuple[str, ...] = DEFAULT_DEPT_EXCLUDES
+    exclude_reits: bool = True
 
     def __init__(
         self,
         market=DEFAULT_MARKETS,
         is_tradable: bool | None = True,
         dept_excludes=DEFAULT_DEPT_EXCLUDES,
+        exclude_reits: bool = True,
     ):
         object.__setattr__(self, "market", _normalize_univ_markets(market))
         object.__setattr__(self, "is_tradable", None if is_tradable is None else bool(is_tradable))
         object.__setattr__(self, "dept_excludes", _normalize_univ_depts(dept_excludes))
+        object.__setattr__(self, "exclude_reits", bool(exclude_reits))
 
-    def cache_key(self) -> tuple[tuple[str, ...] | None, bool | None, tuple[str, ...]]:
-        return self.market, self.is_tradable, self.dept_excludes
+    def cache_key(self) -> tuple[tuple[str, ...] | None, bool | None, tuple[str, ...], bool]:
+        return self.market, self.is_tradable, self.dept_excludes, self.exclude_reits
 
 
 def _normalize_bucket_list(values, name: str) -> tuple[int, ...] | None:
@@ -626,6 +630,7 @@ def _load_stock_field_tables(fields: list[str], db_mode: int, univ: Univ | None 
             market=resolved_univ.market,
             is_tradable=resolved_univ.is_tradable,
             dept_excludes=resolved_univ.dept_excludes,
+            exclude_reits=resolved_univ.exclude_reits,
         )
         for key in missing_keys:
             source_field = field_map.get(key, key)
@@ -669,6 +674,7 @@ def _load_stock_table(db_mode: int, univ: Univ | None = None) -> StockTable:
         market=resolved_univ.market,
         is_tradable=resolved_univ.is_tradable,
         dept_excludes=resolved_univ.dept_excludes,
+        exclude_reits=resolved_univ.exclude_reits,
     )
     close_wide.index = pd.to_datetime(close_wide.index, errors="coerce")
     close_wide = close_wide[close_wide.index.notna()]
@@ -1198,6 +1204,11 @@ class Backtest:
         self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._all_opportunity_count_cache: np.ndarray | None = None
         self._stock_field_matrix_cache: Dict[str, np.ndarray] = {}
+        self._pattern_nmax_node_cache: Dict[
+            int,
+            tuple[Bollinger | None, AmountSurge | None, High | None, MFI | None],
+        ] = {}
+        self._pattern_nmax_series_cache: Dict[tuple[int, str, int], np.ndarray] = {}
         self._regime_frame_cache: Dict[str, pd.DataFrame] = {}
         self._vwap_matrix: np.ndarray | None = None
         if self.benchmark is not None:
@@ -1485,7 +1496,193 @@ class Backtest:
                 matrix = self._get_stock_field_matrix(field)
                 node._set_stock_values(field, matrix[:, col_idx])
 
-    def _run_pattern_normal(self, pattern_fn: Pattern, progress_label: str) -> Stats:
+    def _find_first_pattern_node(
+        self,
+        pattern_fn: Pattern,
+        pattern_type: type[Pattern],
+    ) -> Pattern | None:
+        seen: set[int] = set()
+
+        def _walk(node: Pattern | None) -> Pattern | None:
+            if not isinstance(node, Pattern):
+                return None
+            node_id = id(node)
+            if node_id in seen:
+                return None
+            seen.add(node_id)
+            if isinstance(node, pattern_type):
+                return node
+            child = getattr(node, "pattern", None)
+            found = _walk(child)
+            if found is not None:
+                return found
+            left = getattr(node, "left", None)
+            found = _walk(left)
+            if found is not None:
+                return found
+            right = getattr(node, "right", None)
+            return _walk(right)
+
+        return _walk(pattern_fn)
+
+    def _resolve_pattern_nmax_nodes(
+        self,
+        pattern_fn: Pattern,
+    ) -> tuple[Bollinger | None, AmountSurge | None, High | None, MFI | None]:
+        if not hasattr(self, "_pattern_nmax_node_cache"):
+            self._pattern_nmax_node_cache = {}
+        cache_key = int(id(pattern_fn))
+        if cache_key not in self._pattern_nmax_node_cache:
+            self._pattern_nmax_node_cache[cache_key] = (
+                self._find_first_pattern_node(pattern_fn, Bollinger),
+                self._find_first_pattern_node(pattern_fn, AmountSurge),
+                self._find_first_pattern_node(pattern_fn, High),
+                self._find_first_pattern_node(pattern_fn, MFI),
+            )
+        return self._pattern_nmax_node_cache[cache_key]
+
+    def _get_nmax_metric_series(
+        self,
+        node: Pattern | None,
+        metric_name: str,
+        col_idx: int,
+    ) -> np.ndarray | None:
+        if node is None:
+            return None
+        if not hasattr(self, "_pattern_nmax_series_cache"):
+            self._pattern_nmax_series_cache = {}
+
+        cache_key = (int(id(node)), str(metric_name), int(col_idx))
+        if cache_key in self._pattern_nmax_series_cache:
+            return self._pattern_nmax_series_cache[cache_key]
+
+        prices = np.asarray(self.prices[:, col_idx], dtype=np.float64)
+        series = np.full(prices.shape[0], np.nan, dtype=np.float64)
+
+        if isinstance(node, Bollinger) and metric_name == "bandwidth":
+            mean, std, valid_end = u.rolling_mean_std(prices, int(node.window))
+            valid = valid_end & np.isfinite(mean) & (mean > 0.0) & np.isfinite(std)
+            series[valid] = (float(node.sigma) * std[valid]) / mean[valid]
+        elif isinstance(node, AmountSurge) and metric_name == "amount_ratio":
+            amount = np.asarray(self._get_stock_field_matrix("amount")[:, col_idx], dtype=np.float64)
+            mean_amount, valid_end = u.rolling_mean(amount, int(node.params.window))
+            valid = (
+                valid_end
+                & np.isfinite(amount)
+                & (amount > 0.0)
+                & np.isfinite(mean_amount)
+                & (mean_amount > 0.0)
+            )
+            series[valid] = amount[valid] / mean_amount[valid]
+        elif isinstance(node, High) and metric_name == "high_proximity":
+            high_series = u.rolling_high(prices, int(node.params.window))
+            valid = (
+                np.isfinite(prices)
+                & (prices > 0.0)
+                & np.isfinite(high_series)
+                & (high_series > 0.0)
+            )
+            series[valid] = prices[valid] / high_series[valid]
+        elif isinstance(node, MFI) and metric_name == "mfi":
+            high = np.asarray(self._get_stock_field_matrix("high")[:, col_idx], dtype=np.float64)
+            low = np.asarray(self._get_stock_field_matrix("low")[:, col_idx], dtype=np.float64)
+            volume = np.asarray(self._get_stock_field_matrix("volume")[:, col_idx], dtype=np.float64)
+            mfi, valid_end = u.money_flow_index(high, low, prices, volume, int(node.window))
+            valid = valid_end & np.isfinite(mfi)
+            series[valid] = mfi[valid]
+
+        self._pattern_nmax_series_cache[cache_key] = series
+        return series
+
+    def _get_nmax_rank_key(
+        self,
+        pattern_fn: Pattern,
+        date_idx: int,
+        col_idx: int,
+    ) -> tuple[float, float, float, float, float, int]:
+        bollinger_node, amount_node, high_node, mfi_node = self._resolve_pattern_nmax_nodes(pattern_fn)
+        use_market_cap = bool(pattern_fn._resolved_nmax_market_cap())
+
+        bandwidth_series = self._get_nmax_metric_series(bollinger_node, "bandwidth", col_idx)
+        amount_series = self._get_nmax_metric_series(amount_node, "amount_ratio", col_idx)
+        high_series = self._get_nmax_metric_series(high_node, "high_proximity", col_idx)
+        mfi_series = self._get_nmax_metric_series(mfi_node, "mfi", col_idx)
+
+        bandwidth_value = (
+            float(bandwidth_series[date_idx])
+            if bandwidth_series is not None and np.isfinite(bandwidth_series[date_idx])
+            else float("inf")
+        )
+        amount_value = (
+            -float(amount_series[date_idx])
+            if amount_series is not None and np.isfinite(amount_series[date_idx])
+            else float("inf")
+        )
+        high_value = (
+            -float(high_series[date_idx])
+            if high_series is not None and np.isfinite(high_series[date_idx])
+            else float("inf")
+        )
+        mfi_value = (
+            -float(mfi_series[date_idx])
+            if mfi_series is not None and np.isfinite(mfi_series[date_idx])
+            else float("inf")
+        )
+        market_cap_value = float("inf")
+        if use_market_cap:
+            market_cap = float(self._get_stock_field_matrix("marketcap")[date_idx, col_idx])
+            if np.isfinite(market_cap) and market_cap > 0.0:
+                market_cap_value = -market_cap
+            return (
+                market_cap_value,
+                bandwidth_value,
+                amount_value,
+                high_value,
+                mfi_value,
+                int(col_idx),
+            )
+        return bandwidth_value, amount_value, high_value, mfi_value, market_cap_value, int(col_idx)
+
+    def _apply_pattern_nmax(
+        self,
+        pattern_fn: Pattern,
+        mask_matrix: np.ndarray,
+        slice_start: int,
+    ) -> np.ndarray:
+        max_cohort_size = pattern_fn._resolved_max_cohort_size()
+        if max_cohort_size is None:
+            return mask_matrix
+
+        limit = int(max_cohort_size)
+        if limit <= 0 or mask_matrix.size == 0:
+            return mask_matrix
+
+        counts = np.count_nonzero(mask_matrix, axis=1)
+        overflow_rows = np.flatnonzero(counts > limit)
+        if overflow_rows.size == 0:
+            return mask_matrix
+
+        capped = np.asarray(mask_matrix, dtype=np.bool_).copy()
+        for row_idx in overflow_rows:
+            selected = np.flatnonzero(capped[row_idx])
+            if selected.size <= limit:
+                continue
+            date_idx = int(slice_start + row_idx)
+            ranked = sorted(
+                selected.tolist(),
+                key=lambda col_idx: self._get_nmax_rank_key(pattern_fn, date_idx, int(col_idx)),
+            )
+            keep = np.asarray(ranked[:limit], dtype=np.int64)
+            capped[row_idx] = False
+            capped[row_idx, keep] = True
+        return capped
+
+    def _run_pattern_normal(
+        self,
+        pattern_fn: Pattern,
+        progress_label: str,
+        cache_name: str | None = None,
+    ) -> Stats:
         """
         trim 없이 이벤트 기반 통계를 계산한다.
         """
@@ -1493,34 +1690,29 @@ class Backtest:
         stats = Stats.create(self.dates, HORIZONS)
         stats.eval_start_idx = self.start_idx
         stats.eval_end_idx = self.end_idx
+        eval_len = max(0, self.end_idx - self.start_idx)
+        mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
         exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
-        use_exit_mask = bool(pattern_fn.has_exit_rule())
-        for col_idx, code in enumerate(_progress(self.codes, desc=progress_label)):
-            values = self.prices[:, col_idx]
-            self._prepare_stock_sources(pattern_fn, col_idx)
-            mask = self._compute_mask(pattern_fn, values, code)
-            if mask is None:
-                continue
-            _numba_accumulate_occurrences(
-                mask,
-                self.start_idx,
-                self.end_idx,
-                stats.occurrence_counts,
+        if eval_len > 0:
+            stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
+                mask_matrix,
+                axis=1,
+                dtype=np.int64,
             )
-            _numba_accumulate_returns(
-                values,
-                mask,
-                self.start_idx,
-                self.end_idx,
-                self.horizon_offsets,
-                exit_mask_matrix[:, col_idx],
-                use_exit_mask,
-                stats.counts,
-                stats.sum_ret,
-                stats.sum_log,
-                stats.pos_counts,
-                stats.geom_invalid,
-            )
+        self._store_runtime_cache(
+            cache_name,
+            mask_matrix=mask_matrix,
+            exit_mask_matrix=exit_mask_matrix,
+        )
+        self._accumulate_dates(
+            mask_matrix,
+            exit_mask_matrix,
+            bool(pattern_fn.has_exit_rule()),
+            None,
+            stats,
+            progress_label,
+            write_daily=False,
+        )
         return stats
 
     def _build_mask_matrix(
@@ -1551,7 +1743,7 @@ class Backtest:
                 mask_matrix[:, ~allowed_cols] = False
             if prefilter_mask is not None:
                 mask_matrix &= prefilter_mask
-            return mask_matrix
+            return self._apply_pattern_nmax(pattern_fn, mask_matrix, slice_start)
 
         column_indices = range(num_codes)
         if allowed_cols is not None:
@@ -1568,7 +1760,7 @@ class Backtest:
             if prefilter_mask is not None:
                 eval_mask = eval_mask & prefilter_mask[:, col_idx]
             mask_matrix[:, col_idx] = eval_mask
-        return mask_matrix
+        return self._apply_pattern_nmax(pattern_fn, mask_matrix, slice_start)
 
     def _build_exit_mask_matrix(
         self,
@@ -2259,7 +2451,11 @@ class Backtest:
 
         if agg_mode == AGG_MODE_EVENT:
             if trim_q is None or trim_q <= 0.0:
-                return self._run_pattern_normal(pattern_fn, progress_label)
+                return self._run_pattern_normal(
+                    pattern_fn,
+                    progress_label,
+                    cache_name=cache_name,
+                )
             return self._run_pattern_trim(
                 pattern_fn,
                 trim_q,
@@ -2486,6 +2682,8 @@ class Backtest:
                 col_policy_ids = np.where(full_filter_mask[:, col_idx], col_policy_ids, 0)
             policy_id_matrix[:, col_idx] = col_policy_ids
 
+        policy_id_matrix = np.where(pattern_mask, policy_id_matrix, 0)
+
         self._pattern_policy_id_cache[cache_key] = policy_id_matrix
         self._pattern_trade_profile_cache[cache_key] = dict(id_to_profile)
         return policy_id_matrix, dict(id_to_profile)
@@ -2683,6 +2881,11 @@ class Backtest:
                 if mask is None:
                     continue
                 row_mask[col_idx] = bool(mask[date_idx])
+            row_mask = self._apply_pattern_nmax(
+                pattern_fn,
+                row_mask.reshape(1, -1),
+                date_idx,
+            )[0]
 
         selected_idx = np.flatnonzero(row_mask)
         selected_codes = [self.codes[i] for i in selected_idx]
@@ -2897,6 +3100,7 @@ class Backtest:
         pattern_fn = self._analyzed_patterns[pattern]
         pattern_stats = self._analyzed_stats[pattern]
         pattern_filter = self._pattern_filter(pattern)
+        max_cohort_size = pattern_fn._resolved_max_cohort_size()
         pattern_mask = self._build_pattern_mask_matrix(
             pattern,
             pattern_fn,
@@ -3019,6 +3223,7 @@ class Backtest:
             execution_price_mode=execution_price_mode,
             allow_reentry=allow_reentry,
             min_cohort_size=min_cohort_size,
+            max_cohort_size=max_cohort_size,
         )
         regime_mask = self._combined_regime_mask(pattern_fn)
         if regime_mask is not None and result.data is not None:

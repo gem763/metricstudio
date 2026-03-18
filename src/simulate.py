@@ -58,6 +58,7 @@ class Simulator:
     max_weight_per_stock: float | None = field(default=None, init=False)
     allow_reentry: bool | None = field(default=None, init=False)
     min_cohort_size: int | None = field(default=None, init=False)
+    max_cohort_size: int | None = field(default=None, init=False)
     run_years: float | None = field(default=None, init=False)
     total_return: float | None = field(default=None, init=False)
     cagr: float | None = field(default=None, init=False)
@@ -65,6 +66,8 @@ class Simulator:
     cohort_win_rate: float | None = field(default=None, init=False)
     cohort_payoff_ratio: float | None = field(default=None, init=False)
     active_day_ratio: float | None = field(default=None, init=False)
+    mean_turnover: float | None = field(default=None, init=False)
+    annual_turnover: float | None = field(default=None, init=False)
     total_buy_fee_paid: float | None = field(default=None, init=False)
     total_sell_fee_paid: float | None = field(default=None, init=False)
     _portfolio_snapshots: dict[int, list[dict[str, np.ndarray | int]]] | None = field(
@@ -314,6 +317,9 @@ class Simulator:
             "min_cohort_size": float(self.min_cohort_size)
             if self.min_cohort_size is not None
             else float("nan"),
+            "max_cohort_size": float(self.max_cohort_size)
+            if self.max_cohort_size is not None
+            else float("nan"),
             "buy_fee": float(self.buy_fee),
             "sell_fee": float(self.sell_fee),
             "run_years": float(self.run_years),
@@ -336,6 +342,12 @@ class Simulator:
             else float("nan"),
             "active_day_ratio": float(self.active_day_ratio)
             if self.active_day_ratio is not None
+            else float("nan"),
+            "mean_turnover": float(self.mean_turnover)
+            if self.mean_turnover is not None
+            else float("nan"),
+            "annual_turnover": float(self.annual_turnover)
+            if self.annual_turnover is not None
             else float("nan"),
             "closed_cohort_count": float(self.data.attrs.get("closed_cohort_count", np.nan)),
             "total_buy_fee_paid": float(self.total_buy_fee_paid),
@@ -397,7 +409,13 @@ class Simulator:
             zorder=1.0,
         )
 
-    def plot(self, figsize=(12, 5), show_kospi: bool = False, return_handles: bool = False):
+    def plot(
+        self,
+        figsize=(12, 5),
+        show_kospi: bool = False,
+        return_handles: bool = False,
+        axes=None,
+    ):
         """
         노출도/보유종목수/자산곡선을 3개 패널로 시각화한다.
         """
@@ -425,15 +443,41 @@ class Simulator:
         win_rate = float(meta["win_rate"])
         payoff_ratio = float(meta["payoff_ratio"])
         active_day_ratio = float(meta.get("active_day_ratio", np.nan))
+        annual_turnover = float(meta.get("annual_turnover", np.nan))
         mean_exposure = float(np.nanmean(out["exposure"].to_numpy(dtype=float)))
+        mean_selected_count = float(np.nanmean(out["selected_count"].to_numpy(dtype=float)))
+        mean_active_count = (
+            float(np.nanmean(out["active_count"].to_numpy(dtype=float)))
+            if "active_count" in out.columns
+            else float("nan")
+        )
         win_text = f"{win_rate * 100.0:.2f}%" if np.isfinite(win_rate) else "nan"
         payoff_text = f"{payoff_ratio:.2f}" if np.isfinite(payoff_ratio) else "nan"
         active_text = f"{active_day_ratio * 100.0:.2f}%" if np.isfinite(active_day_ratio) else "nan"
+        turnover_text = f"{annual_turnover * 100.0:.2f}%" if np.isfinite(annual_turnover) else "nan"
         mean_exposure_text = f"{mean_exposure * 100.0:.2f}%" if np.isfinite(mean_exposure) else "nan"
+        mean_selected_count_text = f"{mean_selected_count:.1f}" if np.isfinite(mean_selected_count) else "nan"
+        mean_active_count_text = f"{mean_active_count:.1f}" if np.isfinite(mean_active_count) else "nan"
         plt = _plot_modules()
-        fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=False, sharex=True)
-        for ax in axes:
-            ax.set_box_aspect(1.0)
+        created_axes = axes is None
+        title_fontsize = 14
+        label_fontsize = 10
+        tick_fontsize = 10
+        legend_fontsize = 10
+        info_fontsize = 11
+        if created_axes:
+            fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=False, sharex=True)
+            for ax in axes:
+                ax.set_box_aspect(1.0)
+        else:
+            axes = np.asarray(axes, dtype=object).reshape(-1)
+            if axes.size != 3:
+                raise ValueError("axes는 길이 3인 matplotlib Axes 컬렉션이어야 합니다.")
+            fig = axes[0].figure
+            if any(ax.figure is not fig for ax in axes):
+                raise ValueError("axes는 모두 같은 figure에 속해야 합니다.")
+            for ax in axes:
+                ax.clear()
         regime_mask = out.attrs.get("regime_active_mask")
         for ax in axes:
             self._shade_regime_spans(ax, out.index, regime_mask)
@@ -453,9 +497,10 @@ class Simulator:
                 linestyle="--",
                 label=f"Mean {mean_exposure * 100.0:.1f}%",
             )
-        axes[0].set_title("Portfolio Exposure")
-        axes[0].set_ylabel("Exposure (%)")
-        axes[0].legend(loc="upper left", fontsize=8)
+        axes[0].set_title("Portfolio Exposure", fontsize=title_fontsize)
+        axes[0].set_ylabel("Exposure (%)", fontsize=label_fontsize)
+        axes[0].tick_params(axis="both", labelsize=tick_fontsize)
+        axes[0].legend(loc="upper left", fontsize=legend_fontsize)
         axes[0].grid(alpha=0.25, linestyle="--")
 
         axes[1].plot(
@@ -474,9 +519,24 @@ class Simulator:
                 alpha=0.9,
                 label="Total active count",
             )
-            axes[1].legend(loc="upper left", fontsize=9)
-        axes[1].set_title("Portfolio count")
+            axes[1].legend(loc="upper left", fontsize=legend_fontsize)
+        axes[1].set_title("Portfolio count", fontsize=title_fontsize)
+        axes[1].tick_params(axis="both", labelsize=tick_fontsize)
+        axes[1].tick_params(axis="y", pad=2)
         axes[1].grid(alpha=0.25, linestyle="--")
+        axes[1].text(
+            0.98,
+            0.98,
+            "포트 평균 종목수: {active}\n코호트 평균 종목수: {selected}".format(
+                active=mean_active_count_text,
+                selected=mean_selected_count_text,
+            ),
+            transform=axes[1].transAxes,
+            ha="right",
+            va="top",
+            fontsize=info_fontsize,
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        )
 
         portfolio_label = str(meta.get("pattern", "Portfolio"))
         axes[2].plot(out.index, out["wealth"], color="#067BC2", linewidth=2.0, label=portfolio_label)
@@ -488,18 +548,31 @@ class Simulator:
         if show_kospi:
             self._plot_kospi_reference_curve(axes[2], out.index, kospi_curve)
         axes[2].set_yscale("log")
-        axes[2].set_title("Wealth (Log Scale)")
+        axes[2].set_title("Wealth (Log Scale)", fontsize=title_fontsize)
+        axes[2].tick_params(axis="both", labelsize=tick_fontsize)
+        if not created_axes:
+            axes[2].yaxis.tick_left()
+            axes[2].yaxis.set_label_position("left")
+            axes[2].tick_params(
+                axis="y",
+                labelright=False,
+                right=False,
+                labelleft=True,
+                left=True,
+                pad=4,
+            )
         axes[2].grid(alpha=0.25, linestyle="--")
-        axes[2].legend(loc="lower right", fontsize=9, frameon=True)
+        axes[2].legend(loc="lower right", fontsize=legend_fontsize, frameon=True)
         axes[2].text(
             0.02,
             0.98,
-            "CAGR: {cagr}\nMDD: {mdd}\n연변동성: {vol}\nIR: {ir}\n평균 노출도: {exposure}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
+            "CAGR: {cagr}\nMDD: {mdd}\n연변동성: {vol}\nIR: {ir}\n평균 노출도: {exposure}\n회전율(연환산): {turnover}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
                 cagr=cagr_text,
                 mdd=max_drawdown_text,
                 vol=ann_vol_text,
                 ir=ir_text,
                 exposure=mean_exposure_text,
+                turnover=turnover_text,
                 win=win_text,
                 payoff=payoff_text,
                 active=active_text,
@@ -507,14 +580,16 @@ class Simulator:
             transform=axes[2].transAxes,
             ha="left",
             va="top",
-            fontsize=10,
+            fontsize=info_fontsize,
             bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
         )
 
-        fig.subplots_adjust(top=0.92)
+        if created_axes:
+            fig.subplots_adjust(top=0.92)
         if return_handles:
             return fig, axes
-        plt.show()
+        if created_axes:
+            plt.show()
         return None
 
     def run(
@@ -553,6 +628,7 @@ class Simulator:
         execution_price_mode: str = "next_vwap",
         allow_reentry: bool = True,
         min_cohort_size: int = 1,
+        max_cohort_size: int | None = None,
     ) -> Simulator:
         """
         코호트별 fallback을 적용한 포트폴리오 시뮬레이션.
@@ -592,6 +668,9 @@ class Simulator:
         min_cohort_size_value = int(min_cohort_size)
         if min_cohort_size_value <= 0:
             raise ValueError("min_cohort_size는 1 이상의 정수여야 합니다.")
+        max_cohort_size_value = None if max_cohort_size is None else int(max_cohort_size)
+        if max_cohort_size_value is not None and max_cohort_size_value <= 0:
+            raise ValueError("max_cohort_size는 1 이상의 정수 또는 None이어야 합니다.")
         buy_fee_value = float(self.buy_fee)
         sell_fee_value = float(self.sell_fee)
         if pattern_policy_id_matrix is None or pattern_policy_id_matrix.shape != pattern_mask.shape:
@@ -637,6 +716,7 @@ class Simulator:
         exposure = np.full(len(self.dates), np.nan, dtype=np.float64)
         selected_count = np.full(len(self.dates), np.nan, dtype=np.float64)
         active_count = np.full(len(self.dates), np.nan, dtype=np.float64)
+        turnover = np.full(len(self.dates), np.nan, dtype=np.float64)
         pattern_arith_out = np.full(len(self.dates), np.nan, dtype=np.float64)
         all_arith_out = np.full(len(self.dates), np.nan, dtype=np.float64)
         pattern_geom_out = np.full(len(self.dates), np.nan, dtype=np.float64)
@@ -645,6 +725,7 @@ class Simulator:
         all_rise_out = np.full(len(self.dates), np.nan, dtype=np.float64)
 
         wealth[start_idx] = 1.0
+        turnover[start_idx] = 0.0
         cash = 1.0
         active_buckets: list[dict[str, np.ndarray | int]] = []
         snapshots: dict[int, list[dict[str, np.ndarray | int]]] = {start_idx: []}
@@ -685,6 +766,9 @@ class Simulator:
                         keep_selected = ~np.isin(selected, held_idx)
                         selected = selected[keep_selected]
                         selected_policy_ids = selected_policy_ids[keep_selected]
+            if max_cohort_size_value is not None and selected.size > max_cohort_size_value:
+                selected = selected[:max_cohort_size_value]
+                selected_policy_ids = selected_policy_ids[:max_cohort_size_value]
             if selected.size < min_cohort_size_value:
                 selected = selected[:0]
                 selected_policy_ids = selected_policy_ids[:0]
@@ -771,6 +855,12 @@ class Simulator:
                         hit |= exit_idx == (t + 1)
                     bucket["exit_next_mask"] = hit
 
+            trade_base_wealth = cash
+            for bucket in active_buckets:
+                trade_base_wealth += float(np.asarray(bucket["values"], dtype=np.float64).sum())
+            day_buy_notional = 0.0
+            day_sell_notional = 0.0
+
             # 2) 보유기간(horizon) 만료 버킷 청산
             next_active: list[dict[str, np.ndarray | int]] = []
             for bucket in active_buckets:
@@ -788,6 +878,7 @@ class Simulator:
 
                 if age >= bucket_horizon_days:
                     gross_sell_value = float(vals.sum())
+                    day_sell_notional += gross_sell_value
                     sell_fee_paid = gross_sell_value * sell_fee_value
                     total_sell_fee_paid += sell_fee_paid
                     net_sell_value = gross_sell_value - sell_fee_paid
@@ -807,6 +898,7 @@ class Simulator:
                     cohort_id = int(bucket["cohort_id"])
                     sell_value = float(vals[exit_mask].sum())
                     if sell_value > 0.0:
+                        day_sell_notional += sell_value
                         sell_fee_paid = sell_value * sell_fee_value
                         total_sell_fee_paid += sell_fee_paid
                         net_sell_value = sell_value - sell_fee_paid
@@ -942,6 +1034,7 @@ class Simulator:
 
                     buy_values = np.full(buy_idx.size, per_stock_value, dtype=np.float64)
                     invested_net = float(buy_values.sum())
+                    day_buy_notional += invested_net
                     buy_fee_paid = invested_net * buy_fee_value
                     gross_spend = invested_net + buy_fee_paid
                     total_buy_fee_paid += buy_fee_paid
@@ -974,6 +1067,11 @@ class Simulator:
                 total_active += int(np.asarray(bucket["idx"], dtype=np.int64).size)
             next_wealth = cash + invested_value
             wealth[t + 1] = next_wealth
+            turnover[t + 1] = (
+                (day_buy_notional + day_sell_notional) / trade_base_wealth
+                if np.isfinite(trade_base_wealth) and trade_base_wealth > 0.0
+                else np.nan
+            )
             exposure[t] = invested_value / next_wealth if next_wealth > 0.0 else np.nan
             selected_count[t] = float(actual_selected)
             active_count[t] = float(total_active)
@@ -992,6 +1090,8 @@ class Simulator:
             final_active += int(np.asarray(bucket["idx"], dtype=np.int64).size)
         final_wealth = cash + final_invested
         wealth[end_idx - 1] = final_wealth
+        if not np.isfinite(turnover[end_idx - 1]):
+            turnover[end_idx - 1] = 0.0
         exposure[end_idx - 1] = final_invested / final_wealth if final_wealth > 0.0 else np.nan
         selected_count[end_idx - 1] = 0.0
         active_count[end_idx - 1] = float(final_active)
@@ -1033,6 +1133,17 @@ class Simulator:
             if winners.size > 0 and losers.size > 0:
                 payoff_ratio_value = float(winners.mean() / abs(losers.mean()))
         active_day_ratio_value = float(np.mean(active_mask)) if active_mask.size > 0 else float("nan")
+        turnover_window = turnover[start_idx:end_idx]
+        mean_turnover_value = (
+            float(np.nanmean(turnover_window))
+            if np.any(np.isfinite(turnover_window))
+            else float("nan")
+        )
+        annual_turnover_value = (
+            float(mean_turnover_value * float(TRADING_DAYS_PER_YEAR))
+            if np.isfinite(mean_turnover_value)
+            else float("nan")
+        )
 
         start_wealth = float(out["wealth"].iloc[0]) if len(out) > 0 else float("nan")
         end_wealth = float(out["wealth"].iloc[-1]) if len(out) > 0 else float("nan")
@@ -1077,6 +1188,8 @@ class Simulator:
         out.attrs["cohort_win_rate"] = win_rate_value
         out.attrs["cohort_payoff_ratio"] = payoff_ratio_value
         out.attrs["active_day_ratio"] = active_day_ratio_value
+        out.attrs["mean_turnover"] = mean_turnover_value
+        out.attrs["annual_turnover"] = annual_turnover_value
         out.attrs["closed_cohort_count"] = float(cohort_ret.size)
         out.attrs["pattern"] = pattern
         out.attrs["target_horizon"] = target_horizon
@@ -1098,6 +1211,11 @@ class Simulator:
         out.attrs["max_weight_per_stock"] = float("nan")
         out.attrs["allow_reentry"] = bool(allow_reentry_value)
         out.attrs["min_cohort_size"] = float(min_cohort_size_value)
+        out.attrs["max_cohort_size"] = (
+            float(max_cohort_size_value)
+            if max_cohort_size_value is not None
+            else float("nan")
+        )
         out.attrs["buy_fee"] = buy_fee_value
         out.attrs["sell_fee"] = sell_fee_value
         out.attrs["total_buy_fee_paid"] = total_buy_fee_paid
@@ -1123,6 +1241,11 @@ class Simulator:
         self.max_weight_per_stock = float("nan")
         self.allow_reentry = bool(allow_reentry_value)
         self.min_cohort_size = int(min_cohort_size_value)
+        self.max_cohort_size = (
+            int(max_cohort_size_value)
+            if max_cohort_size_value is not None
+            else None
+        )
         self.run_years = years
         self.total_return = total_return
         self.cagr = cagr
@@ -1130,6 +1253,8 @@ class Simulator:
         self.cohort_win_rate = win_rate_value
         self.cohort_payoff_ratio = payoff_ratio_value
         self.active_day_ratio = active_day_ratio_value
+        self.mean_turnover = mean_turnover_value
+        self.annual_turnover = annual_turnover_value
         self.total_buy_fee_paid = total_buy_fee_paid
         self.total_sell_fee_paid = total_sell_fee_paid
         self._portfolio_snapshots = snapshots

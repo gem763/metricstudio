@@ -39,6 +39,8 @@ class Pattern:
         self._trade_stop_loss_pct: float | None = None
         self._trade_take_profit_pct: float | None = None
         self._trade_cohort_scale: float | None = None
+        self._max_cohort_size: int | None = None
+        self._max_cohort_use_market_cap: bool = False
 
     def _resolve_name(self, value: str | None) -> str:
         if value is None:
@@ -50,6 +52,24 @@ class Pattern:
 
     def named(self, value: str | None):
         self.name = self._resolve_name(value)
+        return self
+
+    @staticmethod
+    def _normalize_max_cohort_size(value: int | None) -> int | None:
+        if value is None:
+            return None
+        out = int(value)
+        if out <= 0:
+            raise ValueError("nmax 값은 1 이상의 정수 또는 None이어야 합니다.")
+        return out
+
+    def nmax(self, value: int | None, market_cap: bool = False):
+        if value is None:
+            self._max_cohort_size = None
+            self._max_cohort_use_market_cap = False
+            return self
+        self._max_cohort_size = self._normalize_max_cohort_size(value)
+        self._max_cohort_use_market_cap = bool(market_cap)
         return self
 
     @staticmethod
@@ -345,10 +365,41 @@ class Pattern:
             self._trade_cohort_scale,
         )
 
+    @staticmethod
+    def _merge_nmax_profile(
+        left: tuple[int | None, bool],
+        right: tuple[int | None, bool],
+    ) -> tuple[int | None, bool]:
+        if left[0] is None:
+            return right
+        if right[0] is None:
+            return left
+        if left == right:
+            return left
+        raise ValueError(
+            "nmax 설정이 서로 다른 패턴은 단일 branch로 결합할 수 없습니다. "
+            "최종 패턴에 nmax(...)를 주거나 양쪽 설정을 동일하게 맞추세요."
+        )
+
+    def _nmax_profile(self) -> tuple[int | None, bool]:
+        return (
+            self._max_cohort_size,
+            bool(self._max_cohort_use_market_cap) if self._max_cohort_size is not None else False,
+        )
+
     def _resolved_trade_profile(
         self,
     ) -> tuple[object | None, float | None, float | None, float | None]:
         return self._trade_profile()
+
+    def _resolved_nmax_profile(self) -> tuple[int | None, bool]:
+        return self._nmax_profile()
+
+    def _resolved_max_cohort_size(self) -> int | None:
+        return self._resolved_nmax_profile()[0]
+
+    def _resolved_nmax_market_cap(self) -> bool:
+        return bool(self._resolved_nmax_profile()[1])
 
     @staticmethod
     def _register_trade_profile(
@@ -483,6 +534,14 @@ class CombinedPattern(Pattern):
             self.right._resolved_trade_profile(),
         )
 
+    def _resolved_nmax_profile(self) -> tuple[int | None, bool]:
+        if self._max_cohort_size is not None:
+            return self._nmax_profile()
+        return self._merge_nmax_profile(
+            self.left._resolved_nmax_profile(),
+            self.right._resolved_nmax_profile(),
+        )
+
 
 class RegimePattern(Pattern):
     def __init__(
@@ -530,6 +589,11 @@ class RegimePattern(Pattern):
         if not self._is_empty_trade_profile(direct):
             return direct
         return self.pattern._resolved_trade_profile()
+
+    def _resolved_nmax_profile(self) -> tuple[int | None, bool]:
+        if self._max_cohort_size is not None:
+            return self._nmax_profile()
+        return self.pattern._resolved_nmax_profile()
 
 
 class UnionPattern(Pattern):
@@ -634,6 +698,14 @@ class UnionPattern(Pattern):
         raise ValueError(
             "분기 패턴의 trade 설정이 branch별로 다릅니다. "
             "UnionPattern은 branch별 policy id를 사용해야 합니다."
+        )
+
+    def _resolved_nmax_profile(self) -> tuple[int | None, bool]:
+        if self._max_cohort_size is not None:
+            return self._nmax_profile()
+        return self._merge_nmax_profile(
+            self.left._resolved_nmax_profile(),
+            self.right._resolved_nmax_profile(),
         )
 
     def _build_policy_id_mask(
