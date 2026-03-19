@@ -2545,3 +2545,318 @@ conda run -n metricstudio python -m py_compile scripts/validate_trend_strength_r
 - 최신 수치 인용 시
   반드시 `20.15`의 router 결과와
   이전 `contrarian` 결과를 섞지 말 것
+
+---
+
+## 21) 2026-03-19 추가 인계: 차트 UX / `nmax` / `Univ` / 최근 노트북 사용 메모
+
+이번 쓰레드에서는
+기존 레짐 실험을 더 이어서 대규모 재설계까지 하지는 않았고,
+대신 사용자가 실제 노트북에서 반복적으로 쓰는 UX와
+포트/코호트 제어 기능을 실전적으로 다듬는 작업이 중심이었다.
+
+이번 턴에서 실제로 건드린 핵심 파일은 대략 아래다.
+
+- `src/stats.py`
+- `src/simulate.py`
+- `src/pattern.py`
+- `src/backtest.py`
+- `src/db_manager.py`
+- `src/bq.py`
+- `scripts/validate_trend_character_strengthening.py`
+- `tests/test_backtest_context.py`
+- `tests/test_pattern_filters.py`
+- `CONTEXT.md`
+
+### 21.1 패턴 강화 실험 결론
+이 쓰레드 초반에는
+기존 대표 패턴
+`trend_amount1.5x`
+를 기준으로 “패턴 특성을 더 강화하면서 코호트 종목수를 줄이고,
+성과 희생은 최소화”하는 방향 실험을 한 번 더 돌렸다.
+
+재현 스크립트:
+
+- `scripts/validate_trend_character_strengthening.py`
+
+핵심 결론:
+
+- 가장 실전적인 1순위는 `trend_amount2.0x`
+- 더 공격적으로 종목 수를 줄이는 후보는 `trend_high93_amount1.8x`
+- `bandwidth_max`를 더 세게 줄이는 안은 코호트 압축은 되지만 CAGR 희생이 더 컸다
+
+대표 수치 메모:
+
+- baseline `trend_amount1.5x`
+  - `selected_mean 1.99`
+  - `CAGR 20.08%`
+  - `ann_vol 10.33%`
+  - `IR 1.94`
+  - `MDD -15.59%`
+  - `payoff 1.70`
+- `trend_amount2.0x`
+  - `selected_mean 1.44`
+  - `CAGR 20.63%`
+  - `ann_vol 9.93%`
+  - `IR 2.08`
+  - `MDD -14.79%`
+  - `payoff 1.81`
+- `trend_high93_amount1.8x`
+  - `selected_mean 1.29`
+  - `CAGR 19.37%`
+  - `ann_vol 9.48%`
+  - `IR 2.04`
+  - `payoff 1.76`
+
+즉 현재 해석은:
+
+- `AmountSurge`를 `2.0x`로 강화하는 안이 가장 자연스러운 1순위
+- `High threshold`를 `0.93~0.95` 쪽으로 더 끌어올리는 안은
+  코호트 수를 더 줄일 수 있지만 CAGR 희생을 감수하는 선택지
+
+### 21.2 `show_kospi`, 단일/복수 패턴 표시, 결합 차트 UX
+이번 쓰레드에서 사용자와 가장 많이 맞춘 UX 포인트 중 하나가
+`stats.plot()`과 `simul.plot()`를 어떻게 같이 보여줄지였다.
+
+중요한 사용 규칙:
+
+- `show_kospi`는 `bt.run(...)` 인자가 아니다
+- 아래 둘에 넣는다
+  - `simul.plot(show_kospi=True)`
+  - `bt.plot_wealth_curves(..., show_kospi=True)`
+
+또 하나 중요한 결정:
+
+- `bt.run(patterns=[...])` 같은 다중 패턴 실행 API는 일단 보류했다
+- 이유는 `run()` 결과가 단순 wealth 1개가 아니라
+  `wealth`, `portfolio exposure`, `selected_count`, `active_count`를 함께 그리는
+  `Simulator` 계약이라,
+  여러 패턴을 한 번에 넣으면 반환형/플롯 계약을 같이 다시 설계해야 하기 때문이다
+
+대신 현재 추가된 실전용 인터페이스는:
+
+```python
+stats = bt.analyze(strat)
+simul = bt.run(pattern="pattern", target_horizon=20, trade_price_mode="당일종가")
+
+stats.plot_with_simulator(
+    simul,
+    patterns=["모든주식", "pattern"],
+    annualized=True,
+    show_kospi=True,
+    hspace=0.2,
+    wspace=0.5,
+)
+```
+
+이 메서드는 한 figure 안에
+
+- 위: `stats` 4패널
+- 아래: `simulator` 3패널
+
+을 쌓아서 그린다.
+
+### 21.3 차트 레이아웃/텍스트 관련 현재 상태
+이번 턴에서 VS Code 노트북 가독성을 맞추기 위해
+시각화 기본값을 여러 번 세밀하게 조정했다.
+다음 에이전트는 이 상태를 현재 기준으로 가정하면 된다.
+
+현재 반영 상태:
+
+- 위/아래 차트는 separate output 2개가 아니라 single figure 1개로 붙어서 그려진다
+- figure 기본 비율은 가로를 약간 줄이고 세로를 약간 늘린 쪽으로 조정돼 있다
+- 각 서브플롯 제목 글씨는 이전보다 키워 둔 상태다
+- `Annualized ...` 제목에서 `After Cost` 문구는 제거했다
+  - 다만 계산 자체는 여전히 비용 반영 기준이다
+- 마지막 `Wealth` 차트의 y축 눈금/라벨은 현재 왼쪽에 둔 상태다
+- `Portfolio count` 차트 우상단에는
+  - `포트 평균 종목수`
+  - `코호트 평균 종목수`
+  가 텍스트로 표시된다
+- 위 두 평균 종목수 표시는 현재 소수점 1자리까지 출력한다
+- `Wealth` 정보 박스에는 `회전율(연환산)`도 같이 표시된다
+
+주의:
+
+- 차트 제목에서 `After Cost`를 지웠다고 해서
+  raw return으로 바뀐 것은 아니다
+- 해석은 여전히 비용 반영 기준으로 해야 한다
+
+### 21.4 `nmax()`가 현재 정식 코호트 상한 API
+사용자는 처음엔 `bt.run(max_cohort_size=10)` 같은 방식을 원했지만,
+최종적으로는 패턴 자체에 “이 패턴은 하루 신규 코호트 종목을 최대 몇 개까지 허용한다”를 붙이는 편이
+`analyze()`와 `run()`을 일관되게 맞출 수 있다고 판단했다.
+
+현재 정식 사용법:
+
+```python
+strat = (bb2 + uptrend + high52w + mfi_high + amt2).named("pattern").nmax(10)
+stats = bt.analyze(strat)
+simul = bt.run(pattern="pattern", target_horizon=20, trade_price_mode="익일종가")
+```
+
+즉 다음 에이전트는
+`bt.run(max_cohort_size=...)`
+를 새 API로 제안하지 말고,
+패턴 레벨의 `.nmax(...)`가 현재 정식이라고 이해하면 된다.
+
+현재 동작 특성:
+
+- `nmax()`는 `analyze()`, `run()`, `screen()`에 공통으로 반영된다
+- 컷은 pattern mask 단계에서 적용된다
+- 따라서 통계와 시뮬레이션이 같은 후보 집합을 본다
+- 다만 `allow_reentry=False`면 이미 보유 중인 종목이 나중에 빠져
+  실제 신규 진입 수는 `n`보다 작아질 수 있다
+
+### 21.5 `nmax()` 현재 랭킹 규칙
+사용자가 직접 우선순위를 지정했고,
+현재는 그 순서를 그대로 따른다.
+
+기본 `nmax(10)` 랭킹 순서:
+
+1. Bollinger `bandwidth`가 작은 순
+2. `amount ratio`가 큰 순
+3. `52주 고가 근접도`가 높은 순
+4. `MFI`가 높은 순
+
+추가로:
+
+```python
+strat = pat.nmax(10, market_cap=True)
+```
+
+처럼 `market_cap=True`를 넣으면,
+시가총액이 1순위가 된다.
+
+즉 현재 `market_cap=True`일 때 순서는:
+
+1. 시가총액 큰 순
+2. Bollinger `bandwidth` 작은 순
+3. `amount ratio` 큰 순
+4. `52주 고가 근접도` 높은 순
+5. `MFI` 높은 순
+
+### 21.6 `breakout_cooldown_days` 의미
+사용자가 중간에 물어본 포인트라,
+다음 에이전트도 다시 질문받을 가능성이 높다.
+
+`Bollinger(...).on(trigger="breakout_up", breakout_cooldown_days=3)`
+에서 `breakout_cooldown_days=3`은
+
+- “돌파 이후 돌파 상태가 3일 이상 유지돼야 한다”
+
+가 아니다.
+
+정확한 의미는:
+
+- 한 번 돌파 신호가 발생하면
+- 이후 `3`거래일 동안 추가 돌파 신호를 막는
+- signal cooldown이다
+
+즉 “상태 유지 조건”이 아니라
+“신호 재발생 억제”다.
+
+### 21.7 특정 날짜 포트/코호트 종목 확인 방법
+노트북에서 특정 날짜 종목을 바로 보고 싶다는 맥락도 있었다.
+현재 기준으로는 아래 두 개를 기억하면 된다.
+
+실제 보유 포트:
+
+```python
+simul.port_at("2024-03-15")
+```
+
+신호 발생일 스크리닝:
+
+```python
+bt.screen("2024-03-14", strat)
+```
+
+중요:
+
+- `trade_price_mode="익일종가"`면
+  신호일과 실제 포트 편입일이 1거래일 차이난다
+- 그래서 “신호가 나온 종목”을 볼 때와
+  “다음날 실제 포트에 들어간 종목”을 볼 때 날짜를 구분해야 한다
+
+### 21.8 `Univ()`의 리츠 제외 방식
+사용자가 `Univ()`에서 리츠를 기본 제외해 달라고 요청했고,
+처음에는 `dept='리츠'`가 있을 것으로 가정했지만
+실제 DB를 확인해 보니 그 가정은 틀렸다.
+
+로컬 최신 DB 확인 결과:
+
+- `dept LIKE '%리츠%'`: `0`
+- `dept = '리츠'`: `0`
+- `name LIKE '%리츠%'`: `38`종목
+
+다만 `name LIKE '%리츠%'`는
+`메리츠`, `블리츠` 같은 오탐을 같이 잡는다.
+
+따라서 현재 기본 동작은:
+
+- `Univ()`에 `exclude_reits=True`가 기본값
+- 부서(`dept`)가 아니라 종목명(`name`) 기반으로 리츠성 이름을 제외
+- 대신 `메리츠`, `블리츠`는 예외로 남긴다
+
+즉 다음 에이전트는
+`DEFAULT_DEPT_EXCLUDES`에 `"리츠"`가 있다고 가정하면 안 된다.
+현재 구현은 name filter 기반이다.
+
+### 21.9 `Filter(market_cap=...)`는 절대값 필터가 아니다
+사용자가 “현재 기준 시가총액 1천억 이상이면 `market_cap=[]`를 어떻게 넣어야 하느냐”고 물었고,
+중요한 결론이 하나 있었다.
+
+현재 `Filter(market_cap=[...])`는
+
+- 절대 시총 금액 기준이 아니라
+- 날짜별 시가총액 데실(1~10분위) 기준이다
+
+즉 `1000억 이상`을 정확히 표현하는 API는 아직 없다.
+
+다만 최신 DB 기준으로 근사치는 확인했다.
+
+기준일:
+
+- 로컬 최신 데이터 날짜 `2026-03-12`
+
+기본 `Univ()` 기준:
+
+- 전체 `2599`종목
+- 시가총액 `1000억 이상` `1470`종목
+- 비중 `56.56%`
+
+그날 데실 경계:
+
+- `5분위`: 대략 `899억 ~ 1298억`
+- `6분위`: 대략 `1300억 ~ 1923억`
+
+따라서 현재 해석은:
+
+- 가장 가까운 느슨한 근사: `market_cap=[5, 6, 7, 8, 9, 10]`
+- 더 엄격한 근사: `market_cap=[6, 7, 8, 9, 10]`
+
+그리고 중요한 사용 규칙:
+
+- `filter=`는 `bt.analyze(...)`에 넣는다
+- `bt.run(...)`에 다시 넣는 것이 아니다
+- 한 번 `analyze(..., filter=flt)`하면
+  이후 `run()`과 `screen()`은 그 analyzed pattern의 filter를 재사용한다
+
+### 21.10 환경 메모: `openpyxl`
+사용자 요청으로
+`metricstudio` 환경에 `openpyxl`을 설치했다.
+
+현재 확인 버전:
+
+- `openpyxl 3.1.5`
+
+즉 다음 세션에서는
+엑셀 입출력 때문에 `openpyxl`이 없다고 가정할 필요가 없다.
+
+### 21.11 이번 쓰레드에서 특히 기억할 한 줄 요약
+이번 턴의 실전적 요약은 아래 세 줄이면 충분하다.
+
+1. 코호트 폭증 통제는 이제 `bt.run(max_cohort_size=...)`가 아니라 패턴의 `.nmax(...)`로 한다
+2. `nmax(..., market_cap=True)`면 시가총액이 선택 1순위고, 기본은 `bandwidth -> amount -> 52주 고가 -> MFI` 순이다
+3. `Univ()`의 리츠 제외는 `dept='리츠'`가 아니라 종목명 기반 예외 처리이며, 차트/노트북 UX는 `stats.plot_with_simulator(...)` 중심으로 정리돼 있다
