@@ -3,12 +3,12 @@ from __future__ import annotations
 import numpy as np
 import unittest
 
-from src.pattern import AmountSurge, PanicRebound, Pattern, RelativeStrength, RetestBreakout
+from metricstudio.patterns import AmountSurge, BasePattern, PanicRebound, RelativeStrength, RetestBreakout
 
 
 class PatternFilterTests(unittest.TestCase):
     def test_pattern_nmax_supports_chaining_and_reset(self):
-        pattern = Pattern(name="base")
+        pattern = BasePattern(name="base")
 
         self.assertIs(pattern.nmax(10, market_cap=True), pattern)
         self.assertEqual(pattern._resolved_max_cohort_size(), 10)
@@ -20,7 +20,7 @@ class PatternFilterTests(unittest.TestCase):
         self.assertFalse(pattern._resolved_nmax_market_cap())
 
     def test_pattern_mask_cache_reuses_same_underlying_price_series(self):
-        class _CountingPattern(Pattern):
+        class _CountingPattern(BasePattern):
             def __init__(self):
                 super().__init__(name="count")
                 self.calls = 0
@@ -38,7 +38,7 @@ class PatternFilterTests(unittest.TestCase):
         self.assertEqual(pattern.calls, 1)
 
     def test_pattern_mask_cache_invalidates_when_stock_field_changes(self):
-        class _AmountPattern(Pattern):
+        class _AmountPattern(BasePattern):
             def __init__(self):
                 super().__init__(name="amount_count")
                 self.calls = 0

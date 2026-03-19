@@ -675,9 +675,9 @@ python -m unittest tests.test_pattern_filters -v
 지금 기준의 추천 기본 추세 패턴:
 
 ```python
-from src.backtest import Backtest, Univ
-from src.pattern import Bollinger, High, Trending, MFI, AmountSurge
-from src.regime import Regime
+from metricstudio.backtest import Backtest, Univ
+from metricstudio.patterns import Bollinger, High, Trending, MFI, AmountSurge
+from metricstudio.regime import Regime
 
 bt = Backtest(
     start='2000-01-01',
@@ -1426,7 +1426,7 @@ entry gate와 exit policy를 한 객체에 섞어 API를 오히려 복잡하게 
 현재 권장 표기:
 
 ```python
-from src.regime import Regime
+from metricstudio.regime import Regime
 
 panic = Regime().on(kind="panic", market="kospi")
 trend_regime = Regime().on(kind="trend", market="kospi")
@@ -1540,7 +1540,7 @@ python scripts/validate_regime_router.py
 현재 권장 후보 예시는 아래다.
 
 ```python
-from src.pattern import RelativeStrength, MFI
+from metricstudio.patterns import RelativeStrength, MFI
 
 contra_loser5_mfi35 = (
     RelativeStrength(name="5D상대낙폭").on(

@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import unittest
 import warnings
-from types import SimpleNamespace
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.backtest import Backtest, Univ
-from src.pattern import MFI, Pattern
-from src.regime import Regime
-from src.simulate import Simulator
-from src.stats import Stats, StatsCollection
+from metricstudio.backtest import Backtest
+from metricstudio.univ import Univ
+from metricstudio.patterns import BasePattern, MFI
+from metricstudio.regime import Regime
+from metricstudio.simulate import Simulator
+from metricstudio.stats import Stats, StatsCollection
 
 matplotlib.use("Agg")
 
@@ -88,7 +88,7 @@ class _FakeSimulator:
         return None
 
 
-class _MaskPattern(Pattern):
+class _MaskPattern(BasePattern):
     def __init__(self, name: str, mask):
         super().__init__(name=name)
         self._mask = np.asarray(mask, dtype=np.bool_)
@@ -144,7 +144,7 @@ class BacktestContextTests(unittest.TestCase):
     def test_regime_pattern_accepts_composed_regime(self):
         contrarian = self._bind_regime("contrarian", [False, True, True, False])
         panic = self._bind_regime("panic", [False, False, True, False])
-        pattern = Pattern(name="base").when(contrarian - panic)
+        pattern = BasePattern(name="base").when(contrarian - panic)
         prices = np.asarray([10.0, 11.0, 12.0, 13.0], dtype=np.float64)
 
         self.assertEqual(
@@ -178,7 +178,7 @@ class BacktestContextTests(unittest.TestCase):
         bt.regime = Regime().on(kind="trend_friendly", market="kospi")
 
         explicit_regime = Regime().on(kind="panic_rebound_risk", market="kospi")
-        pattern = Pattern(name="explicit").when(explicit_regime)
+        pattern = BasePattern(name="explicit").when(explicit_regime)
         resolved = bt._apply_default_regime(pattern)
 
         self.assertIs(resolved, pattern)
@@ -340,110 +340,7 @@ class BacktestContextTests(unittest.TestCase):
         self.assertEqual(mask_matrix[0].tolist(), [False, False, True, True])
         self.assertEqual(mask_matrix[1].tolist(), [False, False, True, True])
 
-    def test_plot_wealth_curves_uses_last_analyze_order_and_returns_summary(self):
-        bt = Backtest.__new__(Backtest)
-        bt._last_stats_collection = SimpleNamespace(
-            stats_map={
-                "trend_benchmark": object(),
-                "trend_base": object(),
-                "trend_amount1.5x": object(),
-            }
-        )
-
-        def _fake_run(*, pattern: str, target_horizon, trade_price_mode, **kwargs):
-            cagr_map = {
-                "trend_benchmark": 0.08,
-                "trend_base": 0.11,
-                "trend_amount1.5x": 0.13,
-            }
-            return _FakeSimulator(pattern=pattern, cagr=cagr_map[pattern])
-
-        bt.run = _fake_run
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            summary = bt.plot_wealth_curves(target_horizon="1M", trade_price_mode="당일종가")
-
-        self.assertEqual(
-            list(summary.index),
-            ["trend_benchmark", "trend_base", "trend_amount1.5x"],
-        )
-        self.assertTrue(np.isclose(summary.loc["trend_amount1.5x", "cagr"], 0.13))
-        self.assertTrue(np.isclose(summary.loc["trend_base", "final_wealth"], 1.10))
-        self.assertIn("mdd", summary.columns)
-        self.assertIn("ann_vol", summary.columns)
-
-    def test_plot_wealth_curves_reuses_stats_color_map(self):
-        class _FakeStatsCollection:
-            def __init__(self):
-                self.stats_map = {
-                    "benchmark": object(),
-                    "trend_base": object(),
-                    "trend_amount1.5x": object(),
-                }
-
-            def _ordered_pattern_names(self, patterns=None):
-                if patterns is None:
-                    return list(self.stats_map.keys())
-                return list(patterns)
-
-            def _pattern_colors(self, names):
-                return {
-                    "benchmark": "black",
-                    "trend_base": "#D56062",
-                    "trend_amount1.5x": "#067BC2",
-                }
-
-            def _apply_legend_order(self, ax, names, display_map=None):
-                ax.legend(loc="upper left", fontsize=9, frameon=True)
-
-        bt = Backtest.__new__(Backtest)
-        bt._last_stats_collection = _FakeStatsCollection()
-
-        def _fake_run(*, pattern: str, target_horizon, trade_price_mode, **kwargs):
-            cagr_map = {
-                "benchmark": 0.08,
-                "trend_base": 0.11,
-                "trend_amount1.5x": 0.13,
-            }
-            return _FakeSimulator(pattern=pattern, cagr=cagr_map[pattern])
-
-        bt.run = _fake_run
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            bt.plot_wealth_curves(target_horizon="1M", trade_price_mode="당일종가")
-
-        ax = plt.gcf().axes[0]
-        colors = [line.get_color() for line in ax.lines]
-        self.assertEqual(colors, ["black", "#D56062", "#067BC2"])
-
-    def test_plot_wealth_curves_can_show_kospi_reference(self):
-        bt = Backtest.__new__(Backtest)
-        bt._last_stats_collection = SimpleNamespace(
-            stats_map={
-                "benchmark": object(),
-                "trend_base": object(),
-            }
-        )
-
-        def _fake_run(*, pattern: str, target_horizon, trade_price_mode, **kwargs):
-            return _FakeSimulator(
-                pattern=pattern,
-                cagr=0.1,
-                kospi_curve=np.asarray([1.0, 1.01, 1.02], dtype=np.float64),
-            )
-
-        bt.run = _fake_run
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            bt.plot_wealth_curves(target_horizon="1M", trade_price_mode="당일종가", show_kospi=True)
-
-        ax = plt.gcf().axes[0]
-        self.assertEqual([line.get_label() for line in ax.lines], ["benchmark", "trend_base", "KOSPI"])
-
-    def test_stats_plot_with_simulator_stacks_into_single_figure(self):
+    def test_backtest_plot_stacks_last_stats_and_simulator_into_single_figure(self):
         dates = pd.date_range("2025-01-01", periods=5, freq="B").to_numpy()
         horizons = [("1W", 5), ("1M", 20)]
         benchmark = Stats.create_daily(dates, horizons)
@@ -472,11 +369,13 @@ class BacktestContextTests(unittest.TestCase):
             cagr=0.12,
             kospi_curve=np.asarray([1.0, 1.01, 1.02], dtype=np.float64),
         )
+        bt = Backtest.__new__(Backtest)
+        bt._last_stats_collection = stats
+        bt._last_simulator = sim
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            fig, axes_map = stats.plot_with_simulator(
-                simulator=sim,
+            fig, axes_map = bt.plot(
                 patterns=["benchmark", "alpha"],
                 annualized=True,
                 show_kospi=True,
@@ -911,33 +810,6 @@ class BacktestContextTests(unittest.TestCase):
         cohort_values = holdings.groupby("cohort_id")["cohort_value"].first().sort_index()
         self.assertEqual(cohort_values.index.tolist(), [1, 2])
         self.assertTrue(np.isclose(cohort_values.iloc[0] / cohort_values.iloc[1], 2.0, atol=0.05))
-
-    def test_plot_wealth_curves_shades_regime_spans_when_present(self):
-        bt = Backtest.__new__(Backtest)
-        bt._last_stats_collection = SimpleNamespace(
-            stats_map={
-                "benchmark": object(),
-                "trend_base": object(),
-            }
-        )
-
-        def _fake_run(*, pattern: str, target_horizon, trade_price_mode, **kwargs):
-            return _FakeSimulator(
-                pattern=pattern,
-                cagr=0.1,
-                regime_mask=np.asarray([True, False, True], dtype=np.bool_),
-            )
-
-        bt.run = _fake_run
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            bt.plot_wealth_curves(target_horizon="1M", trade_price_mode="당일종가")
-
-        ax = plt.gcf().axes[0]
-        self.assertGreaterEqual(len(ax.patches), 2)
-        self.assertEqual([line.get_label() for line in ax.lines], ["benchmark", "trend_base"])
-
 
 if __name__ == "__main__":
     unittest.main()
