@@ -317,92 +317,6 @@ def plot_stats_collection(
         return fig, axes
     return None
 
-
-def plot_stats_occurrence(
-    stats_collection: StatsCollection,
-    *,
-    patterns: Iterable[str] | None = None,
-    start=None,
-    end=None,
-    figsize=(3, 3),
-    ma_window: int | None = 240,
-    ylim=None,
-    show_daily: bool = False,
-    return_handles: bool = False,
-):
-    """
-    StatsCollection의 발생횟수 시계열을 그린다.
-    """
-
-    from metricstudio.stats import _apply_date_ticks
-
-    _configure_plot_font()
-    plt, _, _, _ = _plot_modules()
-    if not stats_collection.stats_map:
-        raise ValueError("StatsCollection이 비어 있습니다.")
-
-    names = stats_collection._ordered_pattern_names(patterns)
-    if not names:
-        raise ValueError("플롯할 패턴이 선택되지 않았습니다.")
-
-    color_map = stats_collection._pattern_colors(names)
-    display_map = stats_collection._display_label_map(names)
-    fig, ax = plt.subplots(1, 1, figsize=figsize, constrained_layout=True)
-
-    first_dates = None
-    for name in names:
-        df = stats_collection.occurrence(
-            start=start,
-            end=end,
-            ma_window=ma_window,
-            pattern=name,
-        )
-        dates = df.index.to_numpy()
-        if first_dates is None:
-            first_dates = dates
-        elif not np.array_equal(first_dates, dates):
-            raise ValueError("plot_occurrence에서는 모든 패턴이 동일한 날짜 인덱스를 가져야 합니다.")
-
-        color = color_map.get(name, None)
-        if show_daily:
-            ax.plot(
-                dates,
-                df["occurrence"].to_numpy(dtype=float),
-                color=color,
-                alpha=0.2,
-                linewidth=1.0,
-            )
-        line_vals = (
-            df["occurrence_ma"].to_numpy(dtype=float)
-            if ma_window is not None
-            else df["occurrence"].to_numpy(dtype=float)
-        )
-        ax.plot(
-            dates,
-            line_vals,
-            color=color,
-            linewidth=2.0,
-            label=name,
-        )
-
-    if ma_window is None:
-        ax.set_title("Pattern Occurrence")
-    else:
-        ax.set_title(f"Pattern Occurrence (Rolling {int(ma_window)}D Mean)")
-    ax.set_ylabel("Daily Occurrence Count")
-    stats_collection._apply_legend_order(ax, names, display_map)
-    if ylim is not None:
-        ax.set_ylim(float(ylim[0]), float(ylim[1]))
-
-    if first_dates is not None:
-        _apply_date_ticks([ax], first_dates)
-    ax.tick_params(axis="x", labelrotation=0)
-
-    if return_handles:
-        return fig, ax
-    return None
-
-
 def plot_stats_history(
     stats_collection: StatsCollection,
     *,
@@ -800,5 +714,4 @@ __all__ = [
     "plot_simulator",
     "plot_stats_collection",
     "plot_stats_history",
-    "plot_stats_occurrence",
 ]

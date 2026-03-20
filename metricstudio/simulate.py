@@ -6,23 +6,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from metricstudio._progress import progress as _progress
 from metricstudio.plot import plot_simulator
-from tqdm import tqdm
 
 TRADING_DAYS_PER_YEAR = 240
 
 BUY_FEE = 0.0003
 SELL_FEE = 0.0020
-
-
-def _progress(*args, **kwargs):
-    """
-    노트북 친화적인 tqdm 기본값을 적용한다.
-    """
-
-    kwargs.setdefault("leave", True)
-    kwargs.setdefault("dynamic_ncols", True)
-    return tqdm(*args, **kwargs)
 
 
 @dataclass

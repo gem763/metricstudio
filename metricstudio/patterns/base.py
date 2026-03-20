@@ -241,20 +241,6 @@ class BasePattern:
             )
         return np.asarray(values, dtype=np.float64)
 
-    def _chain_post_mask(
-        self,
-        step_fn: Callable[[np.ndarray], np.ndarray],
-    ):
-        prev_fn = self._post_mask_fn
-
-        def _composed(prices: np.ndarray) -> np.ndarray:
-            prev_mask = np.asarray(prev_fn(prices), dtype=np.bool_)
-            step_mask = np.asarray(step_fn(prices), dtype=np.bool_)
-            return prev_mask & step_mask
-
-        self._post_mask_fn = _composed
-        return self
-
     def when(self, regime: Regime):
         """
         현재 패턴을 특정 regime 구간에서만 활성화한다.

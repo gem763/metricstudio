@@ -23,8 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
-from research.notebook_experiment_utils import summarize_vs_benchmark
+from research.notebook_experiment_utils import build_default_backtest, summarize_vs_benchmark
 from metricstudio.patterns import (
     AllStockPattern,
     AmountSurge,
@@ -276,13 +275,10 @@ def main() -> None:
     pattern_names = [spec.name for spec in specs]
 
     with contextlib.redirect_stderr(io.StringIO()):
-        bt = Backtest(
+        bt = build_default_backtest(
+            benchmark=AllStockPattern(name="benchmark"),
             start=START,
             end=END,
-            by="day",
-            benchmark=AllStockPattern(name="benchmark"),
-            univ=Univ(market=["KOSPI", "KOSDAQ"]),
-            db=0,
         )
         stats = bt.analyze(*patterns)
         portfolio = _portfolio_summary(bt, pattern_names)

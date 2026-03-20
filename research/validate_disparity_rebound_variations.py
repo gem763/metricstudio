@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,10 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
+from research.notebook_experiment_utils import annualize_geom, apply_cost, build_default_backtest, summarize_periods_vs_benchmark
 from metricstudio.patterns import AllStockPattern, AmountSurge, BasePattern, Bollinger, Disparity, High, MFI, RelativeStrength, Trending
 from metricstudio.regime import Regime
-from metricstudio.simulate import BUY_FEE, SELL_FEE
 
 
 SCREEN_HORIZONS = ["1W", "2W", "3W"]
@@ -57,19 +55,6 @@ CANDIDATE_SPECS = [
     {"name": "disp90_mfi25_rs5", "threshold": 0.90, "extras": ("mfi_below_25", "rs_5d_loser")},
     {"name": "disp88_mfi25_rs5", "threshold": 0.88, "extras": ("mfi_below_25", "rs_5d_loser")},
 ]
-
-
-def apply_cost(value: float) -> float:
-    if not np.isfinite(value):
-        return float("nan")
-    out = ((1.0 + value) * (1.0 - SELL_FEE) / (1.0 + BUY_FEE)) - 1.0
-    return out if out > -1.0 else float("nan")
-
-
-def annualize_geom(value: float, horizon_days: int) -> float:
-    if not np.isfinite(value) or value <= -1.0:
-        return float("nan")
-    return float((1.0 + value) ** (240.0 / float(horizon_days)) - 1.0)
 
 
 def _build_trend_pattern(name: str) -> BasePattern:
@@ -149,46 +134,13 @@ def _build_candidate(spec: dict[str, object]) -> BasePattern:
 
 
 def _summarize_short_vs_benchmark(stats, pattern_names: list[str]) -> pd.DataFrame:
-    frame = stats.to_frame(start="2000-01-01", end="2025-12-31").reset_index()
-    frame = frame[(frame["scope"] != "empty") & (frame["period"].isin(SCREEN_HORIZONS))].copy()
-    benchmark = frame[frame["pattern"] == "benchmark"][
-        ["period", "count", "geom_mean", "rise_prob"]
-    ].rename(
-        columns={
-            "count": "benchmark_count",
-            "geom_mean": "benchmark_geom_mean",
-            "rise_prob": "benchmark_rise_prob",
-        }
+    return summarize_periods_vs_benchmark(
+        stats,
+        "benchmark",
+        pattern_names,
+        SCREEN_HORIZONS,
+        HORIZON_DAYS,
     )
-    merged = frame.merge(benchmark, on="period", how="left")
-    merged = merged[merged["pattern"].isin(pattern_names)].copy()
-    merged["count_ratio"] = merged["count"] / merged["benchmark_count"]
-    merged["geom_after_cost"] = merged["geom_mean"].map(apply_cost)
-    merged["benchmark_geom_after_cost"] = merged["benchmark_geom_mean"].map(apply_cost)
-    merged["geom_ann_after_cost"] = [
-        annualize_geom(value, HORIZON_DAYS[period])
-        for value, period in zip(merged["geom_after_cost"], merged["period"])
-    ]
-    merged["benchmark_geom_ann_after_cost"] = [
-        annualize_geom(value, HORIZON_DAYS[period])
-        for value, period in zip(merged["benchmark_geom_after_cost"], merged["period"])
-    ]
-    merged["geom_ann_gap_after_cost"] = (
-        merged["geom_ann_after_cost"] - merged["benchmark_geom_ann_after_cost"]
-    )
-    merged["rise_prob_gap"] = merged["rise_prob"] - merged["benchmark_rise_prob"]
-    return merged[
-        [
-            "pattern",
-            "period",
-            "count",
-            "count_ratio",
-            "rise_prob",
-            "rise_prob_gap",
-            "geom_ann_after_cost",
-            "geom_ann_gap_after_cost",
-        ]
-    ].sort_values(["pattern", "period"]).reset_index(drop=True)
 
 
 def _pivot(summary: pd.DataFrame, pattern_names: list[str], value_col: str) -> pd.DataFrame:
@@ -269,13 +221,7 @@ def _build_router_summary(
         kind="contrarian",
         market="kospi",
     )
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
-    )
+    bt = build_default_backtest()
 
     trend_all = _build_trend_pattern("trend_amount1.5x")
     trend_no_quiet_contrarian = (
@@ -328,13 +274,8 @@ def _build_router_summary(
 
 
 def main() -> None:
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
+    bt = build_default_backtest(
         benchmark=AllStockPattern(name="benchmark"),
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
     )
 
     trend = _build_trend_pattern("trend_amount1.5x")

@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,10 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
+from research.notebook_experiment_utils import annualize_geom as _annualize_geom, apply_cost as _apply_cost, build_default_backtest
 from metricstudio.patterns import AllStockPattern, AmountSurge, BasePattern, Bollinger, High, MFI, RetestBreakout, Trending
 from metricstudio.regime import Regime
-from metricstudio.simulate import BUY_FEE, SELL_FEE
 
 
 HORIZONS = ["1M", "2M", "3M"]
@@ -34,19 +32,6 @@ REGIME_SPECS = [
     ("narrow", "narrow_leadership"),
     ("panic", "panic"),
 ]
-
-
-def _apply_cost(value: float) -> float:
-    if not np.isfinite(value):
-        return float("nan")
-    out = ((1.0 + value) * (1.0 - SELL_FEE) / (1.0 + BUY_FEE)) - 1.0
-    return out if out > -1.0 else float("nan")
-
-
-def _annualize_geom(value: float, horizon_days: int) -> float:
-    if not np.isfinite(value) or value <= -1.0:
-        return float("nan")
-    return float((1.0 + value) ** (240.0 / float(horizon_days)) - 1.0)
 
 
 def _build_trend_pattern(
@@ -281,13 +266,7 @@ def build_router_summary(bt: Backtest) -> pd.DataFrame:
 
 
 def main() -> None:
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
-    )
+    bt = build_default_backtest()
 
     regime_gap = build_regime_gap_table(bt)
     router_summary = build_router_summary(bt)

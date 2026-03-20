@@ -22,9 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
-from research.notebook_experiment_utils import summarize_vs_benchmark, overall_pivot, window_pivot
+from research.notebook_experiment_utils import build_default_backtest, summarize_vs_benchmark, overall_pivot, window_pivot
 from metricstudio.patterns import AllStockPattern, AmountSurge, BasePattern, Disparity, MFI, RelativeStrength
 from metricstudio.regime import Regime
 
@@ -82,14 +80,9 @@ def _build_candidates():
 
 def build_report() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     contrarian = Regime().on(kind="contrarian", market="kospi")
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
+    bt = build_default_backtest(
         benchmark=AllStockPattern(name="benchmark"),
         regime=contrarian,
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
     )
 
     candidates = _build_candidates()

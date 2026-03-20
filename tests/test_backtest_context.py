@@ -347,17 +347,13 @@ class BacktestContextTests(unittest.TestCase):
         alpha = Stats.create_daily(dates, horizons)
 
         benchmark.daily_arith[0, :2] = [0.01, 0.015]
-        benchmark.daily_geom[0, :2] = [0.01, 0.014]
         benchmark.daily_rise[0, :2] = [1.0, 1.0]
         benchmark.daily_arith[1, :2] = [0.02, 0.018]
-        benchmark.daily_geom[1, :2] = [0.019, 0.017]
         benchmark.daily_rise[1, :2] = [1.0, 0.0]
 
         alpha.daily_arith[0, :2] = [0.02, 0.025]
-        alpha.daily_geom[0, :2] = [0.019, 0.024]
         alpha.daily_rise[0, :2] = [1.0, 1.0]
         alpha.daily_arith[1, :2] = [0.03, 0.028]
-        alpha.daily_geom[1, :2] = [0.029, 0.027]
         alpha.daily_rise[1, :2] = [1.0, 1.0]
 
         stats = StatsCollection(

@@ -20,8 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
+from research.notebook_experiment_utils import build_default_backtest
 from metricstudio.patterns import Bollinger, High, Trending, MFI, AmountSurge
 from metricstudio.regime import Regime
 
@@ -54,13 +53,7 @@ def _build_contrarian_pattern(name: str, trigger: str, regime: Regime):
 
 
 def build_run_summary() -> pd.DataFrame:
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
-    )
+    bt = build_default_backtest()
     panic = Regime().on(kind="panic", market="kospi")
     contrarian = Regime().on(kind="contrarian", market="kospi")
 

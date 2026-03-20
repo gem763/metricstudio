@@ -7,20 +7,10 @@ import re
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
+from metricstudio._progress import progress as _progress
 from metricstudio.dataload import DataLoader
 from metricstudio.univ import Univ
-
-
-def _progress(*args, **kwargs):
-    """
-    노트북 저장 시 widget 출력이 남지 않도록 일반 tqdm를 사용한다.
-    """
-
-    kwargs.setdefault("leave", True)
-    kwargs.setdefault("dynamic_ncols", True)
-    return tqdm(*args, **kwargs)
 
 
 def _normalize_bucket_list(values, name: str) -> tuple[int, ...] | None:

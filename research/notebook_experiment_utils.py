@@ -3,18 +3,40 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from metricstudio.backtest import Backtest
+from metricstudio.univ import Univ
 from metricstudio.simulate import BUY_FEE, SELL_FEE
 
 
+DEFAULT_START = "2000-01-01"
+DEFAULT_END = "2025-12-31"
 HORIZONS = ["1M", "2M", "3M", "6M"]
 HORIZON_DAYS = {"1M": 20, "2M": 40, "3M": 60, "6M": 120}
 WINDOWS = [
-    ("overall", "2000-01-01", "2025-12-31"),
-    ("2000-2006", "2000-01-01", "2006-12-31"),
+    ("overall", DEFAULT_START, DEFAULT_END),
+    ("2000-2006", DEFAULT_START, "2006-12-31"),
     ("2007-2012", "2007-01-01", "2012-12-31"),
     ("2013-2018", "2013-01-01", "2018-12-31"),
-    ("2019-2025", "2019-01-01", "2025-12-31"),
+    ("2019-2025", "2019-01-01", DEFAULT_END),
 ]
+
+
+def build_default_backtest(
+    *,
+    by: str = "day",
+    benchmark=None,
+    regime=None,
+    start: str = DEFAULT_START,
+    end: str = DEFAULT_END,
+) -> Backtest:
+    return Backtest(
+        start=start,
+        end=end,
+        by=by,
+        benchmark=benchmark,
+        regime=regime,
+        univ=Univ(market=["KOSPI", "KOSDAQ"]),
+    )
 
 
 def apply_cost(value: float) -> float:
@@ -92,6 +114,47 @@ def summarize_vs_benchmark(
     return out.sort_values(["window", "pattern", "period"]).reset_index(drop=True)
 
 
+def summarize_periods_vs_benchmark(
+    stats,
+    benchmark_name: str,
+    pattern_names: list[str],
+    periods: list[str],
+    horizon_days: dict[str, int],
+    *,
+    start: str = DEFAULT_START,
+    end: str = DEFAULT_END,
+) -> pd.DataFrame:
+    frame = stats.to_frame(start=start, end=end).reset_index()
+    frame = frame[(frame["scope"] != "empty") & (frame["period"].isin(periods))].copy()
+    benchmark_frame = frame[frame["pattern"] == benchmark_name][
+        ["period", "count", "geom_mean", "rise_prob"]
+    ].rename(
+        columns={
+            "count": "benchmark_count",
+            "geom_mean": "benchmark_geom_mean",
+            "rise_prob": "benchmark_rise_prob",
+        }
+    )
+    merged = frame.merge(benchmark_frame, on="period", how="left")
+    merged = merged[merged["pattern"].isin(pattern_names)].copy()
+    merged["count_ratio"] = merged["count"] / merged["benchmark_count"]
+    merged["geom_after_cost"] = merged["geom_mean"].map(apply_cost)
+    merged["benchmark_geom_after_cost"] = merged["benchmark_geom_mean"].map(apply_cost)
+    merged["geom_ann_after_cost"] = [
+        annualize_geom(value, horizon_days[period])
+        for value, period in zip(merged["geom_after_cost"], merged["period"])
+    ]
+    merged["benchmark_geom_ann_after_cost"] = [
+        annualize_geom(value, horizon_days[period])
+        for value, period in zip(merged["benchmark_geom_after_cost"], merged["period"])
+    ]
+    merged["geom_ann_gap_after_cost"] = (
+        merged["geom_ann_after_cost"] - merged["benchmark_geom_ann_after_cost"]
+    )
+    merged["rise_prob_gap"] = merged["rise_prob"] - merged["benchmark_rise_prob"]
+    return merged.sort_values(["pattern", "period"]).reset_index(drop=True)
+
+
 def overall_pivot(summary: pd.DataFrame, pattern_names: list[str], value_col: str) -> pd.DataFrame:
     overall = summary[summary["window"] == "overall"].copy()
     out = overall.pivot(index="pattern", columns="period", values=value_col)
@@ -108,12 +171,16 @@ def window_pivot(summary: pd.DataFrame, pattern_names: list[str], value_col: str
 
 
 __all__ = [
+    "DEFAULT_END",
+    "DEFAULT_START",
     "HORIZONS",
     "HORIZON_DAYS",
     "WINDOWS",
     "apply_cost",
     "annualize_geom",
+    "build_default_backtest",
     "summarize_vs_benchmark",
+    "summarize_periods_vs_benchmark",
     "overall_pivot",
     "window_pivot",
 ]

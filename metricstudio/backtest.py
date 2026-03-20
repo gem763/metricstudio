@@ -8,9 +8,9 @@ import re
 import numpy as np
 import pandas as pd
 from numba import njit
-from tqdm import tqdm
 
-from metricstudio.dataload import DataLoader, get_default_data_loader
+from metricstudio._progress import progress as _progress
+from metricstudio.dataload import get_default_data_loader
 from metricstudio.filter import Filter as _Filter
 from metricstudio.plot import plot_backtest
 from metricstudio import util as u
@@ -37,16 +37,6 @@ TRIM_MODE_WINSORIZE = 1
 AGG_MODE_EVENT = "event"
 AGG_MODE_DAY = "day"
 
-
-def _progress(*args, **kwargs):
-    """
-    노트북 저장 시 widget 출력이 남지 않도록 일반 tqdm를 사용한다.
-    """
-
-    kwargs.setdefault("leave", True)
-    kwargs.setdefault("dynamic_ncols", True)
-    return tqdm(*args, **kwargs)
-
 _REGIME_FRAME_TABLE_CACHE: Dict[
     tuple[
         int,
@@ -60,77 +50,6 @@ _REGIME_FRAME_TABLE_CACHE: Dict[
     ],
     pd.DataFrame,
 ] = {}
-
-
-@njit(cache=True)
-def _numba_accumulate_returns(
-    values,
-    mask,
-    start_idx,
-    end_idx,
-    horizon_offsets,
-    exit_mask,
-    use_exit_mask,
-    counts,
-    sum_ret,
-    sum_log,
-    pos_counts,
-    geom_invalid,
-):
-    """
-    패턴 발생일별 horizon 수익률 통계를 누적한다.
-    """
-
-    if end_idx < start_idx:
-        end_idx = start_idx
-    length = len(values)
-    num_h = len(horizon_offsets)
-
-    for i in range(start_idx, end_idx):
-        if not mask[i]:
-            continue
-        base = values[i]
-        if not np.isfinite(base) or base <= 0:
-            continue
-        for h_idx in range(num_h):
-            step = horizon_offsets[h_idx]
-            j = i + step
-            if j >= length:
-                continue
-            target_idx = j
-            if use_exit_mask:
-                for k in range(i + 1, j + 1):
-                    if exit_mask[k]:
-                        target_idx = k
-                        break
-            fwd = values[target_idx]
-            if not np.isfinite(fwd) or fwd <= 0:
-                continue
-            ret = fwd / base - 1.0
-            counts[h_idx, i] += 1
-            sum_ret[h_idx, i] += ret
-            if ret > 0:
-                pos_counts[h_idx, i] += 1
-            if ret <= -1.0:
-                geom_invalid[h_idx, i] = True
-            else:
-                sum_log[h_idx, i] += np.log1p(ret)
-
-
-@njit(cache=True)
-def _numba_accumulate_occurrences(mask, start_idx, end_idx, occurrence_counts):
-    """
-    구간 내 패턴 발생 횟수를 일자별로 누적한다.
-    """
-
-    if end_idx < start_idx:
-        end_idx = start_idx
-    length = len(mask)
-    lo = max(0, start_idx)
-    hi = min(end_idx, length)
-    for i in range(lo, hi):
-        if mask[i]:
-            occurrence_counts[i] += 1
 
 
 @njit(cache=True)
@@ -173,7 +92,6 @@ def _numba_accumulate_trim_for_date(
     pos_counts,
     geom_invalid,
     daily_arith,
-    daily_geom,
     daily_rise,
 ):
     """
@@ -261,15 +179,14 @@ def _numba_accumulate_trim_for_date(
         counts[h_idx, date_idx] = kept_count
         pos_counts[h_idx, date_idx] = kept_pos
         sum_ret[h_idx, date_idx] = kept_sum_ret
-        daily_arith[h_idx, date_idx] = kept_sum_ret / kept_count
-        daily_rise[h_idx, date_idx] = kept_pos / kept_count
 
         if has_geom_invalid:
             geom_invalid[h_idx, date_idx] = True
-            continue
+        else:
+            sum_log[h_idx, date_idx] = kept_sum_log
 
-        sum_log[h_idx, date_idx] = kept_sum_log
-        daily_geom[h_idx, date_idx] = np.exp(kept_sum_log / kept_count) - 1.0
+        daily_arith[h_idx, date_idx] = kept_sum_ret / kept_count
+        daily_rise[h_idx, date_idx] = kept_pos / kept_count
 
 
 @njit(cache=True)
@@ -289,7 +206,6 @@ def _numba_accumulate_for_date(
     pos_counts,
     geom_invalid,
     daily_arith,
-    daily_geom,
     daily_rise,
     write_daily,
 ):
@@ -360,8 +276,6 @@ def _numba_accumulate_for_date(
         if write_daily:
             daily_arith[h_idx, date_idx] = kept_sum_ret / kept_count
             daily_rise[h_idx, date_idx] = kept_pos / kept_count
-            if not has_geom_invalid:
-                daily_geom[h_idx, date_idx] = np.exp(kept_sum_log / kept_count) - 1.0
 
 
 def _infer_pattern_label(pattern_fn: BasePattern, idx: int) -> str:
@@ -476,7 +390,6 @@ class Backtest:
         regime: Regime | None = None,
         univ: _Univ | None = None,
         by: str = AGG_MODE_DAY,
-        db: int = 0,
     ):
         """
         백테스트 기간과 기준 패턴(옵션)을 초기화한다.
@@ -485,8 +398,7 @@ class Backtest:
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
         self.by = _normalize_analyze_by(by)
-        self.db_mode = DataLoader.normalize_db_mode(db)
-        self.data_loader = get_default_data_loader(self.db_mode)
+        self.data_loader = get_default_data_loader()
         if univ is not None and not isinstance(univ, _Univ):
             raise TypeError("univ는 Univ 객체여야 합니다.")
         self.univ = univ if isinstance(univ, _Univ) else _Univ()
@@ -519,7 +431,6 @@ class Backtest:
         self._pattern_trade_profile_cache: Dict[
             tuple[str, bool], Dict[int, tuple[object | None, float | None, float | None, float | None]]
         ] = {}
-        self._all_stock_geom_cache: Dict[tuple[int, int], np.ndarray] = {}
         self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._all_opportunity_count_cache: np.ndarray | None = None
         self._stock_field_matrix_cache: Dict[str, np.ndarray] = {}
@@ -692,7 +603,6 @@ class Backtest:
         breadth_univ = self._resolve_regime_breadth_univ()
         idx = pd.DatetimeIndex(self.dates)
         global_key = (
-            int(self.db_mode),
             breadth_univ.market,
             breadth_univ.is_tradable,
             breadth_univ.dept_excludes,
@@ -1012,12 +922,6 @@ class Backtest:
         eval_len = max(0, self.end_idx - self.start_idx)
         mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
         exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
-        if eval_len > 0:
-            stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
-                mask_matrix,
-                axis=1,
-                dtype=np.int64,
-            )
         self._store_runtime_cache(
             cache_name,
             mask_matrix=mask_matrix,
@@ -1252,9 +1156,8 @@ class Backtest:
         """
 
         daily_arith = stats.daily_arith
-        daily_geom = stats.daily_geom
         daily_rise = stats.daily_rise
-        if daily_arith is None or daily_geom is None or daily_rise is None:
+        if daily_arith is None or daily_rise is None:
             raise ValueError("trim 모드에서는 daily 통계 버퍼가 필요합니다.")
 
         iterator = range(mask_matrix.shape[0])
@@ -1285,7 +1188,6 @@ class Backtest:
                 stats.pos_counts,
                 stats.geom_invalid,
                 daily_arith,
-                daily_geom,
                 daily_rise,
             )
             if progress_bar is not None:
@@ -1302,7 +1204,6 @@ class Backtest:
         stats: Stats,
         progress_label: str,
         daily_arith: np.ndarray,
-        daily_geom: np.ndarray,
         daily_rise: np.ndarray,
         progress_bar=None,
     ) -> None:
@@ -1338,7 +1239,6 @@ class Backtest:
                 stats.pos_counts,
                 stats.geom_invalid,
                 daily_arith,
-                daily_geom,
                 daily_rise,
             )
             if progress_bar is not None:
@@ -1361,13 +1261,11 @@ class Backtest:
 
         if write_daily:
             daily_arith = stats.daily_arith
-            daily_geom = stats.daily_geom
             daily_rise = stats.daily_rise
-            if daily_arith is None or daily_geom is None or daily_rise is None:
+            if daily_arith is None or daily_rise is None:
                 raise ValueError("daily 집계에는 daily 통계 버퍼가 필요합니다.")
         else:
             daily_arith = np.full((1, 1), np.nan, dtype=np.float64)
-            daily_geom = np.full((1, 1), np.nan, dtype=np.float64)
             daily_rise = np.full((1, 1), np.nan, dtype=np.float64)
 
         iterator = range(mask_matrix.shape[0])
@@ -1396,7 +1294,6 @@ class Backtest:
                 stats.pos_counts,
                 stats.geom_invalid,
                 daily_arith,
-                daily_geom,
                 daily_rise,
                 write_daily,
             )
@@ -1421,12 +1318,6 @@ class Backtest:
         eval_len = max(0, self.end_idx - self.start_idx)
         mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
         exit_mask_matrix = self._build_exit_mask_matrix(pattern_fn, len(self.dates))
-        if eval_len > 0:
-            stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
-                mask_matrix,
-                axis=1,
-                dtype=np.int64,
-            )
         self._store_runtime_cache(
             cache_name,
             mask_matrix=mask_matrix,
@@ -1494,12 +1385,6 @@ class Backtest:
                 stats = Stats.create_daily(self.dates, HORIZONS)
                 stats.eval_start_idx = self.start_idx
                 stats.eval_end_idx = self.end_idx
-                if eval_len > 0:
-                    stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
-                        mask_matrix,
-                        axis=1,
-                        dtype=np.int64,
-                    )
                 if trim_q is None or trim_q <= 0.0:
                     self._accumulate_dates(
                         mask_matrix,
@@ -1530,13 +1415,6 @@ class Backtest:
             stats = Stats.create(self.dates, HORIZONS)
             stats.eval_start_idx = self.start_idx
             stats.eval_end_idx = self.end_idx
-            if eval_len > 0:
-                stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
-                    mask_matrix,
-                    axis=1,
-                    dtype=np.int64,
-                )
-
             if trim_q is None or trim_q <= 0.0:
                 self._accumulate_dates(
                     mask_matrix,
@@ -1554,7 +1432,6 @@ class Backtest:
             num_h = len(HORIZONS)
             num_dates = len(self.dates)
             tmp_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
-            tmp_daily_geom = np.full((num_h, num_dates), np.nan, dtype=np.float64)
             tmp_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
             trim_mode = _trim_mode_from_method(trim_method_text)
             self._accumulate_trim_dates_with_buffers(
@@ -1567,7 +1444,6 @@ class Backtest:
                 stats,
                 progress_label,
                 tmp_daily_arith,
-                tmp_daily_geom,
                 tmp_daily_rise,
                 progress_bar=progress_bar,
             )
@@ -1647,12 +1523,6 @@ class Backtest:
                 stats = Stats.create_daily(self.dates, HORIZONS)
                 stats.eval_start_idx = self.start_idx
                 stats.eval_end_idx = self.end_idx
-                if eval_len > 0:
-                    stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
-                        mask_matrix,
-                        axis=1,
-                        dtype=np.int64,
-                    )
                 if trim_q is None or trim_q <= 0.0:
                     self._accumulate_dates(
                         mask_matrix,
@@ -1683,13 +1553,6 @@ class Backtest:
             stats = Stats.create(self.dates, HORIZONS)
             stats.eval_start_idx = self.start_idx
             stats.eval_end_idx = self.end_idx
-            if eval_len > 0:
-                stats.occurrence_counts[self.start_idx:self.end_idx] = np.sum(
-                    mask_matrix,
-                    axis=1,
-                    dtype=np.int64,
-                )
-
             if trim_q is None or trim_q <= 0.0:
                 self._accumulate_dates(
                     mask_matrix,
@@ -1706,7 +1569,6 @@ class Backtest:
             num_h = len(HORIZONS)
             num_dates = len(self.dates)
             tmp_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
-            tmp_daily_geom = np.full((num_h, num_dates), np.nan, dtype=np.float64)
             tmp_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
             trim_mode = _trim_mode_from_method(trim_method_text)
             self._accumulate_trim_dates_with_buffers(
@@ -1719,7 +1581,6 @@ class Backtest:
                 stats,
                 progress_label,
                 tmp_daily_arith,
-                tmp_daily_geom,
                 tmp_daily_rise,
                 progress_bar=progress_bar,
             )
@@ -2098,17 +1959,6 @@ class Backtest:
         rise_asof = _asof_shift(rise_base)
         self._all_stock_metric_cache[cache_key] = (arith_asof, geom_asof, rise_asof)
         return arith_asof, geom_asof, rise_asof
-
-    def _all_stock_geom_history(self, horizon_days: int, lookback_window: int) -> np.ndarray:
-        """
-        전체 종목 기준 horizon 기하평균 수익률 히스토리를 계산한다.
-        """
-        cache_key = (int(horizon_days), int(lookback_window))
-        if cache_key in self._all_stock_geom_cache:
-            return self._all_stock_geom_cache[cache_key]
-        _, geom_asof, _ = self._all_stock_history_metrics(horizon_days, lookback_window)
-        self._all_stock_geom_cache[cache_key] = geom_asof
-        return geom_asof
 
     def _all_stock_opportunity_counts(self) -> np.ndarray:
         """

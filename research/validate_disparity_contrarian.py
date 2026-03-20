@@ -20,8 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
-from research.notebook_experiment_utils import summarize_vs_benchmark, overall_pivot
+from research.notebook_experiment_utils import build_default_backtest, summarize_vs_benchmark, overall_pivot
 from metricstudio.patterns import AllStockPattern, AmountSurge, BasePattern, Bollinger, Disparity, High, MFI, Trending
 from metricstudio.regime import Regime
 
@@ -131,13 +130,8 @@ def _collect_run_summary(bt: Backtest, pattern_names: list[str]) -> pd.DataFrame
 
 
 def build_no_regime_report() -> dict[str, object]:
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
+    bt = build_default_backtest(
         benchmark=AllStockPattern(name="benchmark"),
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
     )
 
     trend = _build_trend_pattern("trend_amount1.5x")
@@ -165,14 +159,9 @@ def build_regime_report(top_candidate_names: list[str]) -> pd.DataFrame:
 
     for regime_name, regime_builder in _build_regime_map().items():
         regime = regime_builder()
-        bt = Backtest(
-            start="2000-01-01",
-            end="2025-12-31",
-            by="day",
+        bt = build_default_backtest(
             benchmark=AllStockPattern(name="benchmark"),
             regime=regime,
-            univ=Univ(market=["KOSPI", "KOSDAQ"]),
-            db=0,
         )
 
         trend = _build_trend_pattern("trend_amount1.5x")

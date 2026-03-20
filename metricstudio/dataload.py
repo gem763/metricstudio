@@ -33,7 +33,7 @@ _INDEX_NAME_MAP: dict[str, str] = {
     "kq11": "코스닥",
     "ks200": "코스피200",
 }
-_DEFAULT_DATA_LOADERS: dict[int, "DataLoader"] = {}
+_DEFAULT_DATA_LOADER: "DataLoader | None" = None
 
 
 def _configure_duckdb_connection(con) -> None:
@@ -145,10 +145,8 @@ class DataLoader:
         db_root_dir: str | Path | None = None,
         adjusted_pattern: str = "adjusted-stock-*.parquet",
         index_file: str = "index.parquet",
-        db_mode: int = DB_MODE_DUCKDB,
     ) -> None:
         root = Path(__file__).resolve().parents[1]
-        self.db_mode = self.normalize_db_mode(db_mode)
         self.db_root_dir = Path(db_root_dir) if db_root_dir is not None else root / "db"
         self.adjusted_pattern = str(adjusted_pattern)
         self.index_file = str(index_file)
@@ -159,17 +157,6 @@ class DataLoader:
             tuple[tuple[str, ...] | None, bool | None, tuple[str, ...], bool],
             dict[str, pd.DataFrame],
         ] = {}
-
-    @staticmethod
-    def normalize_db_mode(db: int) -> int:
-        """
-        현재 지원하는 DB 모드인지 검증한다.
-        """
-
-        mode = int(db)
-        if mode != DB_MODE_DUCKDB:
-            raise ValueError("db는 현재 0만 지원합니다.")
-        return mode
 
     @staticmethod
     def _resolve_univ(univ: "Univ | None") -> "Univ":
@@ -575,15 +562,15 @@ class DataLoader:
         return out
 
 
-def get_default_data_loader(db_mode: int = DB_MODE_DUCKDB) -> DataLoader:
+def get_default_data_loader() -> DataLoader:
     """
     기본 DataLoader 싱글턴을 반환한다.
     """
 
-    mode = DataLoader.normalize_db_mode(db_mode)
-    if mode not in _DEFAULT_DATA_LOADERS:
-        _DEFAULT_DATA_LOADERS[mode] = DataLoader(db_mode=mode)
-    return _DEFAULT_DATA_LOADERS[mode]
+    global _DEFAULT_DATA_LOADER
+    if _DEFAULT_DATA_LOADER is None:
+        _DEFAULT_DATA_LOADER = DataLoader()
+    return _DEFAULT_DATA_LOADER
 
 
 __all__ = [

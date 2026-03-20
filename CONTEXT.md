@@ -684,7 +684,6 @@ bt = Backtest(
     end='2025-12-31',
     by='day',
     univ=Univ(market=['KOSPI', 'KOSDAQ']),
-    db=0,
 )
 
 reg_trend = Regime().on(kind='trend_friendly', market='kospi')

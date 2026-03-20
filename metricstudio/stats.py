@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
-from metricstudio.plot import _plot_modules, plot_stats_collection, plot_stats_history, plot_stats_occurrence
+from metricstudio.plot import _plot_modules, plot_stats_collection, plot_stats_history
 from metricstudio.simulate import BUY_FEE, SELL_FEE
 
 TRADING_DAYS_PER_YEAR = 240
@@ -322,12 +322,10 @@ class Stats:
     sum_log: np.ndarray
     pos_counts: np.ndarray
     geom_invalid: np.ndarray
-    occurrence_counts: np.ndarray
     eval_start_idx: int = 0
     eval_end_idx: int | None = None
     aggregation_mode: str = "event"
     daily_arith: np.ndarray | None = None
-    daily_geom: np.ndarray | None = None
     daily_rise: np.ndarray | None = None
 
     @classmethod
@@ -347,12 +345,10 @@ class Stats:
             sum_log=np.zeros((num_h, length), dtype=np.float64),
             pos_counts=np.zeros((num_h, length), dtype=np.int64),
             geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
-            occurrence_counts=np.zeros(length, dtype=np.int64),
             eval_start_idx=0,
             eval_end_idx=length,
             aggregation_mode="event",
             daily_arith=None,
-            daily_geom=None,
             daily_rise=None,
         )
 
@@ -373,12 +369,10 @@ class Stats:
             sum_log=np.zeros((num_h, length), dtype=np.float64),
             pos_counts=np.zeros((num_h, length), dtype=np.int64),
             geom_invalid=np.zeros((num_h, length), dtype=np.bool_),
-            occurrence_counts=np.zeros(length, dtype=np.int64),
             eval_start_idx=0,
             eval_end_idx=length,
             aggregation_mode="daily_mean",
             daily_arith=np.full((num_h, length), np.nan, dtype=np.float64),
-            daily_geom=np.full((num_h, length), np.nan, dtype=np.float64),
             daily_rise=np.full((num_h, length), np.nan, dtype=np.float64),
         )
 
@@ -405,34 +399,6 @@ class Stats:
         start_idx = max(eval_start, min(start_idx, eval_end))
         end_idx = max(start_idx, min(end_idx, eval_end))
         return start_idx, end_idx
-
-    def occurrence(
-        self,
-        start=None,
-        end=None,
-        ma_window: int | None = None,
-    ) -> pd.DataFrame:
-        """
-        일자별 패턴 발생횟수(옵션: 이동평균)를 반환한다.
-        """
-
-        start_idx, end_idx = self._slice_indices(start, end)
-        dates = pd.to_datetime(self.dates[start_idx:end_idx])
-        occ_full = self.occurrence_counts.astype(np.float64, copy=False)
-        occ = occ_full[start_idx:end_idx]
-
-        data = {
-            "occurrence": occ,
-        }
-        if ma_window is not None:
-            window = max(1, int(ma_window))
-            ma_full = pd.Series(occ_full).rolling(window=window, min_periods=window).mean().to_numpy()
-            ma = ma_full[start_idx:end_idx]
-            data["occurrence_ma"] = ma
-
-        out = pd.DataFrame(data, index=dates)
-        out.index.name = "date"
-        return out
 
     def to_frame(self, start=None, end=None) -> pd.DataFrame:
         """
@@ -793,41 +759,6 @@ class StatsCollection:
         combined = pd.concat(frames, keys=keys, names=["pattern"])
         return combined
 
-    def occurrence(
-        self,
-        start=None,
-        end=None,
-        ma_window: int | None = None,
-        pattern: str | None = None,
-    ) -> pd.DataFrame:
-        """
-        단일/다중 패턴 발생횟수 시계열을 반환한다.
-        """
-
-        cols = ["occurrence"] if ma_window is None else ["occurrence", "occurrence_ma"]
-        if not self.stats_map:
-            return pd.DataFrame(columns=cols)
-
-        if pattern is not None:
-            return self.get(pattern).occurrence(
-                start=start,
-                end=end,
-                ma_window=ma_window,
-            )
-
-        frames = []
-        keys = []
-        for name, stats in self.stats_map.items():
-            frames.append(
-                stats.occurrence(
-                    start=start,
-                    end=end,
-                    ma_window=ma_window,
-                )
-            )
-            keys.append(name)
-        return pd.concat(frames, keys=keys, names=["pattern"])
-
     def to_frame_history(
         self,
         horizon: str | int = "1M",
@@ -982,32 +913,6 @@ class StatsCollection:
         if return_handles:
             return short_result, long_result
         return None
-
-    def plot_occurrence(
-        self,
-        patterns: Iterable[str] | None = None,
-        start=None,
-        end=None,
-        figsize=(3, 3),
-        ma_window: int | None = TRADING_DAYS_PER_YEAR,
-        ylim=None,
-        show_daily: bool = False,
-        return_handles: bool = False,
-    ):
-        """
-        패턴 발생횟수(일별 또는 이동평균) 시계열을 그린다.
-        """
-        return plot_stats_occurrence(
-            self,
-            patterns=patterns,
-            start=start,
-            end=end,
-            figsize=figsize,
-            ma_window=ma_window,
-            ylim=ylim,
-            show_daily=show_daily,
-            return_handles=return_handles,
-        )
 
     def plot_history(
         self,

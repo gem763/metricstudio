@@ -17,8 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from metricstudio.backtest import Backtest
-from metricstudio.univ import Univ
+from research.notebook_experiment_utils import build_default_backtest
 from metricstudio.patterns import AllStockPattern, AmountSurge, BasePattern, Bollinger, High, MFI, RelativeStrength, Trending
 from metricstudio.regime import Regime
 
@@ -68,14 +67,9 @@ def _build_contra_with_exit(name: str, loss_cut: str):
 
 def build_contrarian_horizon_summary() -> pd.DataFrame:
     contrarian = Regime().on(kind="contrarian", market="kospi")
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
+    bt = build_default_backtest(
         benchmark=AllStockPattern(name="benchmark"),
         regime=contrarian,
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
     )
 
     patterns = [
@@ -122,13 +116,7 @@ def build_router_summary() -> pd.DataFrame:
     trend = Regime().on(kind="trend", market="kospi")
     contrarian = Regime().on(kind="contrarian", market="kospi")
 
-    bt = Backtest(
-        start="2000-01-01",
-        end="2025-12-31",
-        by="day",
-        univ=Univ(market=["KOSPI", "KOSDAQ"]),
-        db=0,
-    )
+    bt = build_default_backtest()
 
     trend_all = _build_trend_pattern("trend_amount1.5x")
     trend_no_panic = _build_trend_pattern("trend_no_panic", ~panic)
