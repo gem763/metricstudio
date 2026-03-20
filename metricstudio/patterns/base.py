@@ -45,6 +45,8 @@ class BasePattern:
         self._trade_cohort_scale: float | None = None
         self._max_cohort_size: int | None = None
         self._max_cohort_use_market_cap: bool = False
+        self._rank_method: str | None = None
+        self._rank_rules: tuple[tuple[object, str, str], ...] = ()
 
     def _resolve_name(self, value: str | None) -> str:
         if value is None:
@@ -181,6 +183,94 @@ class BasePattern:
             return self
         self._max_cohort_size = self._normalize_max_cohort_size(value)
         self._max_cohort_use_market_cap = bool(market_cap)
+        return self
+
+    @staticmethod
+    def _normalize_rank_order(order: str) -> str:
+        text = str(order or "").strip().lower()
+        if text not in {"asc", "desc"}:
+            raise ValueError("rank order는 'asc' 또는 'desc'여야 합니다.")
+        return text
+
+    @staticmethod
+    def _parse_rank_metric_text(metric_text: str) -> tuple[str, str | None]:
+        text = str(metric_text or "").strip()
+        if not text:
+            raise ValueError("rank metric은 비어 있을 수 없습니다.")
+        if "." not in text:
+            return text, None
+        metric_name, maybe_order = text.rsplit(".", 1)
+        if maybe_order.lower() not in {"asc", "desc"}:
+            return text, None
+        metric_name = metric_name.strip()
+        if not metric_name:
+            raise ValueError("rank metric 이름은 비어 있을 수 없습니다.")
+        return metric_name, maybe_order.lower()
+
+    @staticmethod
+    def _stock_rank_metrics() -> dict[str, str]:
+        return {
+            "marketcap": "desc",
+            "market_cap": "desc",
+        }
+
+    def rank_by(
+        self,
+        *rules,
+        method: Literal["rank_sum"] = "rank_sum",
+    ):
+        """
+        nmax 초과 후보를 줄일 때 사용할 외부 rank metric 규칙을 설정한다.
+        """
+
+        if not rules:
+            self._rank_method = None
+            self._rank_rules = ()
+            return self
+
+        method_text = str(method or "rank_sum").strip().lower()
+        if method_text != "rank_sum":
+            raise ValueError("rank_by method는 현재 'rank_sum'만 지원합니다.")
+
+        normalized_rules: list[tuple[object, str, str]] = []
+        for rule in rules:
+            if not isinstance(rule, (tuple, list)) or len(rule) not in {2, 3}:
+                raise ValueError("rank_by rule은 (pattern, 'metric.order') 또는 (pattern, metric, order) 형식이어야 합니다.")
+
+            target = rule[0]
+            if isinstance(target, str):
+                target_ref = str(target).strip().lower()
+                if target_ref != "stock":
+                    raise ValueError("rank_by의 문자열 target은 현재 'stock'만 지원합니다.")
+                available_metrics = self._stock_rank_metrics()
+                target_label = target_ref
+            elif isinstance(target, BasePattern):
+                target_ref = target
+                available_metrics = target.rank_metrics()
+                target_label = target.name
+            else:
+                raise TypeError("rank_by target은 BasePattern 또는 'stock'이어야 합니다.")
+
+            metric_name, parsed_order = self._parse_rank_metric_text(str(rule[1]))
+            explicit_order = parsed_order if len(rule) == 2 else str(rule[2] or "").strip().lower()
+            normalized_metric = metric_name.strip().lower()
+            if target_ref == "stock" and normalized_metric == "market_cap":
+                normalized_metric = "marketcap"
+            if normalized_metric not in available_metrics:
+                raise ValueError(
+                    f"rank metric '{metric_name}'은 pattern '{target_label}'에서 지원되지 않습니다."
+                )
+            order = explicit_order or available_metrics[normalized_metric]
+            normalized_rules.append(
+                (
+                    target_ref,
+                    normalized_metric,
+                    self._normalize_rank_order(order),
+                )
+            )
+
+        self._rank_method = method_text
+        self._rank_rules = tuple(normalized_rules)
         return self
 
     @staticmethod
@@ -400,6 +490,21 @@ class BasePattern:
     def _required_stock_fields(self) -> tuple[str, ...]:
         return ()
 
+    def rank_metrics(self) -> dict[str, str]:
+        """
+        외부 rank_by(...)에서 참조 가능한 metric과 기본 정렬 방향을 반환한다.
+        """
+
+        return {}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field: Callable[[str], np.ndarray],
+    ) -> np.ndarray:
+        raise KeyError(f"pattern '{self.name}'은 rank metric '{metric}'을 지원하지 않습니다.")
+
     def _exit_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         return np.zeros(prices.shape[0], dtype=np.bool_)
@@ -505,11 +610,30 @@ class BasePattern:
             "최종 패턴에 nmax(...)를 주거나 양쪽 설정을 동일하게 맞추세요."
         )
 
+    @staticmethod
+    def _merge_rank_profile(
+        left: tuple[str | None, tuple[tuple[object, str, str], ...]],
+        right: tuple[str | None, tuple[tuple[object, str, str], ...]],
+    ) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        if not left[1]:
+            return right
+        if not right[1]:
+            return left
+        if left == right:
+            return left
+        raise ValueError(
+            "rank_by 설정이 서로 다른 패턴은 단일 branch로 결합할 수 없습니다. "
+            "최종 패턴에 rank_by(...)를 주거나 양쪽 설정을 동일하게 맞추세요."
+        )
+
     def _nmax_profile(self) -> tuple[int | None, bool]:
         return (
             self._max_cohort_size,
             bool(self._max_cohort_use_market_cap) if self._max_cohort_size is not None else False,
         )
+
+    def _rank_profile(self) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        return self._rank_method, tuple(self._rank_rules)
 
     def _resolved_trade_profile(
         self,
@@ -518,6 +642,9 @@ class BasePattern:
 
     def _resolved_nmax_profile(self) -> tuple[int | None, bool]:
         return self._nmax_profile()
+
+    def _resolved_rank_profile(self) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        return self._rank_profile()
 
     def _resolved_max_cohort_size(self) -> int | None:
         return self._resolved_nmax_profile()[0]
@@ -668,6 +795,14 @@ class _CombinedPattern(BasePattern):
             self.right._resolved_nmax_profile(),
         )
 
+    def _resolved_rank_profile(self) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        if self._rank_rules:
+            return self._rank_profile()
+        return self._merge_rank_profile(
+            self.left._resolved_rank_profile(),
+            self.right._resolved_rank_profile(),
+        )
+
 
 class _RegimePattern(BasePattern):
     """
@@ -724,6 +859,11 @@ class _RegimePattern(BasePattern):
         if self._max_cohort_size is not None:
             return self._nmax_profile()
         return self.pattern._resolved_nmax_profile()
+
+    def _resolved_rank_profile(self) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        if self._rank_rules:
+            return self._rank_profile()
+        return self.pattern._resolved_rank_profile()
 
 
 class _UnionPattern(BasePattern):
@@ -840,6 +980,14 @@ class _UnionPattern(BasePattern):
         return self._merge_nmax_profile(
             self.left._resolved_nmax_profile(),
             self.right._resolved_nmax_profile(),
+        )
+
+    def _resolved_rank_profile(self) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        if self._rank_rules:
+            return self._rank_profile()
+        return self._merge_rank_profile(
+            self.left._resolved_rank_profile(),
+            self.right._resolved_rank_profile(),
         )
 
     def _build_policy_id_mask(

@@ -485,11 +485,43 @@ def _pattern_cache_signature(pattern_fn: BasePattern) -> tuple[object, ...]:
         ("post_mask", _callable_cache_key(getattr(pattern_fn, "_post_mask_fn", None))),
         ("trade_profile", _freeze_cache_value(pattern_fn._trade_profile())),
         ("nmax_profile", _freeze_cache_value(pattern_fn._resolved_nmax_profile())),
+        ("rank_profile", _freeze_cache_value(pattern_fn._resolved_rank_profile())),
         ("regimes", regimes),
         ("left", _pattern_cache_signature(left) if isinstance(left, BasePattern) else None),
         ("right", _pattern_cache_signature(right) if isinstance(right, BasePattern) else None),
         ("pattern", _pattern_cache_signature(child) if isinstance(child, BasePattern) else None),
     )
+
+
+def _rank_score_from_values(values: np.ndarray, descending: bool) -> np.ndarray:
+    """
+    단일 날짜 후보군의 metric 값을 0~1 점수로 정규화한다.
+    """
+
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.zeros(arr.shape[0], dtype=np.float64)
+    valid_idx = np.flatnonzero(np.isfinite(arr))
+    if valid_idx.size == 0:
+        return out
+
+    valid_values = arr[valid_idx]
+    order = np.argsort(-valid_values if descending else valid_values, kind="mergesort")
+    sorted_values = valid_values[order]
+    if sorted_values.size == 1:
+        out[valid_idx[order[0]]] = 1.0
+        return out
+
+    denom = float(sorted_values.size - 1)
+    i = 0
+    while i < sorted_values.size:
+        j = i + 1
+        while j < sorted_values.size and sorted_values[j] == sorted_values[i]:
+            j += 1
+        avg_rank = 0.5 * float(i + j - 1)
+        score = 1.0 - (avg_rank / denom)
+        out[valid_idx[order[i:j]]] = score
+        i = j
+    return out
 
 
 class Backtest:
@@ -861,6 +893,94 @@ class Backtest:
                 matrix = self._get_stock_field_matrix(field)
                 node._set_stock_values(field, matrix[:, col_idx])
 
+    def _resolve_pattern_rank_profile(
+        self,
+        pattern_fn: BasePattern,
+    ) -> tuple[str | None, tuple[tuple[object, str, str], ...]]:
+        if not hasattr(self, "_pattern_rank_profile_cache"):
+            self._pattern_rank_profile_cache = {}
+        cache_key = int(id(pattern_fn))
+        if cache_key in self._pattern_rank_profile_cache:
+            return self._pattern_rank_profile_cache[cache_key]
+
+        method, rules = pattern_fn._resolved_rank_profile()
+        if not rules:
+            out = (method, ())
+            self._pattern_rank_profile_cache[cache_key] = out
+            return out
+
+        tree_node_ids = {int(id(node)) for node in self._iter_pattern_nodes(pattern_fn)}
+        normalized_rules: list[tuple[object, str, str]] = []
+        for target, metric_name, order in rules:
+            if isinstance(target, BasePattern):
+                if int(id(target)) not in tree_node_ids:
+                    raise ValueError(
+                        f"rank_by target pattern '{target.name}'은 현재 결합 패턴 트리에 포함되어야 합니다."
+                    )
+                normalized_rules.append((target, str(metric_name), str(order)))
+                continue
+
+            target_name = str(target).strip().lower()
+            if target_name != "stock":
+                raise ValueError(f"지원하지 않는 rank_by target입니다: {target}")
+            normalized_rules.append(("stock", str(metric_name), str(order)))
+
+        out = (method, tuple(normalized_rules))
+        self._pattern_rank_profile_cache[cache_key] = out
+        return out
+
+    def _get_rank_metric_series(
+        self,
+        target: object,
+        metric_name: str,
+        col_idx: int,
+    ) -> np.ndarray:
+        if not hasattr(self, "_pattern_rank_series_cache"):
+            self._pattern_rank_series_cache = {}
+
+        target_key: object
+        if isinstance(target, BasePattern):
+            target_key = int(id(target))
+        else:
+            target_key = str(target).strip().lower()
+        cache_key = (target_key, str(metric_name), int(col_idx))
+        if cache_key in self._pattern_rank_series_cache:
+            return self._pattern_rank_series_cache[cache_key]
+
+        if target_key == "stock":
+            field_name = "marketcap" if str(metric_name).strip().lower() in {"marketcap", "market_cap"} else None
+            if field_name is None:
+                raise ValueError(f"지원하지 않는 stock rank metric입니다: {metric_name}")
+            series = np.array(self._get_stock_field_matrix(field_name)[:, col_idx], dtype=np.float64, copy=True)
+            self._pattern_rank_series_cache[cache_key] = series
+            return series
+
+        if not isinstance(target, BasePattern):
+            raise TypeError("rank target은 BasePattern 또는 'stock'이어야 합니다.")
+
+        prices = np.asarray(self.prices[:, col_idx], dtype=np.float64)
+        stock_field_cache: dict[str, np.ndarray] = {}
+
+        def _get_stock_field(field: str) -> np.ndarray:
+            key = str(field).strip().lower()
+            if key not in stock_field_cache:
+                stock_field_cache[key] = np.asarray(
+                    self._get_stock_field_matrix(key)[:, col_idx],
+                    dtype=np.float64,
+                )
+            return stock_field_cache[key]
+
+        series = np.asarray(
+            target._compute_rank_metric_series(str(metric_name), prices, _get_stock_field),
+            dtype=np.float64,
+        )
+        if series.shape != prices.shape:
+            raise ValueError(
+                f"pattern '{target.name}'의 rank metric '{metric_name}' series shape이 가격 시계열과 일치하지 않습니다."
+            )
+        self._pattern_rank_series_cache[cache_key] = series
+        return series
+
     def _find_first_pattern_node(
         self,
         pattern_fn: BasePattern,
@@ -1027,6 +1147,19 @@ class Backtest:
         if overflow_rows.size == 0:
             return mask_matrix
 
+        rank_method, rank_rules = self._resolve_pattern_rank_profile(pattern_fn)
+        if rank_rules:
+            if rank_method != "rank_sum":
+                raise ValueError(f"지원하지 않는 rank_by method입니다: {rank_method}")
+            return self._apply_pattern_rank_sum_nmax(
+                pattern_fn=pattern_fn,
+                mask_matrix=mask_matrix,
+                slice_start=slice_start,
+                overflow_rows=overflow_rows,
+                limit=limit,
+                rank_rules=rank_rules,
+            )
+
         capped = np.asarray(mask_matrix, dtype=np.bool_).copy()
         for row_idx in overflow_rows:
             selected = np.flatnonzero(capped[row_idx])
@@ -1038,6 +1171,40 @@ class Backtest:
                 key=lambda col_idx: self._get_nmax_rank_key(pattern_fn, date_idx, int(col_idx)),
             )
             keep = np.asarray(ranked[:limit], dtype=np.int64)
+            capped[row_idx] = False
+            capped[row_idx, keep] = True
+        return capped
+
+    def _apply_pattern_rank_sum_nmax(
+        self,
+        pattern_fn: BasePattern,
+        mask_matrix: np.ndarray,
+        slice_start: int,
+        overflow_rows: np.ndarray,
+        limit: int,
+        rank_rules: tuple[tuple[object, str, str], ...],
+    ) -> np.ndarray:
+        capped = np.asarray(mask_matrix, dtype=np.bool_).copy()
+        for row_idx in overflow_rows:
+            selected = np.flatnonzero(capped[row_idx])
+            if selected.size <= limit:
+                continue
+
+            date_idx = int(slice_start + row_idx)
+            score = np.zeros(selected.size, dtype=np.float64)
+            for target, metric_name, order in rank_rules:
+                metric_values = np.fromiter(
+                    (
+                        float(self._get_rank_metric_series(target, metric_name, int(col_idx))[date_idx])
+                        for col_idx in selected
+                    ),
+                    dtype=np.float64,
+                    count=selected.size,
+                )
+                score += _rank_score_from_values(metric_values, descending=(str(order) == "desc"))
+
+            ranked_idx = np.lexsort((selected, -score))
+            keep = np.asarray(selected[ranked_idx[:limit]], dtype=np.int64)
             capped[row_idx] = False
             capped[row_idx, keep] = True
         return capped

@@ -78,6 +78,38 @@ class RetestBreakout(BasePattern):
             return ()
         return ("amount",)
 
+    def rank_metrics(self) -> dict[str, str]:
+        return {"breakout_gap": "desc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("RetestBreakout은 사용 전에 on(...)으로 설정해야 합니다.")
+        if str(metric).strip().lower() != "breakout_gap":
+            raise KeyError(metric)
+
+        series = np.asarray(prices, dtype=np.float64)
+        out = np.full(series.shape[0], np.nan, dtype=np.float64)
+        window = int(self.params.breakout_window)
+        if series.shape[0] <= window:
+            return out
+
+        rolling_high = u.rolling_high(series, window)
+        prior_high = rolling_high[:-1]
+        valid = (
+            np.isfinite(series[1:])
+            & (series[1:] > 0.0)
+            & np.isfinite(prior_high)
+            & (prior_high > 0.0)
+        )
+        out_slice = out[1:]
+        out_slice[valid] = series[1:][valid] / prior_high[valid] - 1.0
+        return out
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         if self.params is None:
             raise ValueError("RetestBreakout은 사용 전에 on(...)으로 설정해야 합니다.")

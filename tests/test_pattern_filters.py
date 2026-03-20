@@ -1,9 +1,26 @@
 from __future__ import annotations
 
-import numpy as np
 import unittest
+import numpy as np
 
-from metricstudio.patterns import AmountSurge, BasePattern, PanicRebound, RelativeStrength, RetestBreakout
+from metricstudio.patterns import (
+    AmountSurge,
+    BasePattern,
+    Disparity,
+    GoldenCross,
+    PanicRebound,
+    RelativeStrength,
+    RetestBreakout,
+    Trending,
+)
+
+
+class _RankMetricPattern(BasePattern):
+    def __init__(self, name: str = "rank"):
+        super().__init__(name=name)
+
+    def rank_metrics(self) -> dict[str, str]:
+        return {"value": "desc"}
 
 
 class PatternFilterTests(unittest.TestCase):
@@ -18,6 +35,19 @@ class PatternFilterTests(unittest.TestCase):
 
         self.assertIsNone(pattern._resolved_max_cohort_size())
         self.assertFalse(pattern._resolved_nmax_market_cap())
+
+    def test_pattern_rank_by_supports_chaining_and_reset(self):
+        pattern = _RankMetricPattern(name="rank")
+
+        self.assertIs(pattern.rank_by((pattern, "value.desc")), pattern)
+        self.assertEqual(
+            pattern._resolved_rank_profile(),
+            ("rank_sum", ((pattern, "value", "desc"),)),
+        )
+
+        pattern.rank_by()
+
+        self.assertEqual(pattern._resolved_rank_profile(), (None, ()))
 
     def test_pattern_mask_cache_reuses_same_underlying_price_series(self):
         class _CountingPattern(BasePattern):
@@ -119,6 +149,53 @@ class PatternFilterTests(unittest.TestCase):
             pattern(prices).tolist(),
             [False, False, False, True, False, True],
         )
+
+    def test_additional_patterns_expose_rank_metrics(self):
+        self.assertEqual(Trending(name="trend").on(window=3, trigger="breakout_up").rank_metrics(), {"ma_gap": "desc"})
+        self.assertEqual(Trending(name="trend").on(window=3, trigger="ma_trend_down").rank_metrics(), {"ma_slope": "asc"})
+        self.assertEqual(Disparity(name="disp", window=3).on(threshold=1.0).rank_metrics(), {"disparity": "asc"})
+        self.assertEqual(GoldenCross(name="gc").on(windows=(3, 5, 7)).rank_metrics(), {"alignment_gap": "desc"})
+        self.assertEqual(
+            RelativeStrength(name="rs").on(market="kospi", window=3, trigger="below", threshold=0.0).rank_metrics(),
+            {"excess_return": "asc"},
+        )
+        self.assertEqual(RetestBreakout(name="retest").on(breakout_window=3).rank_metrics(), {"breakout_gap": "desc"})
+        self.assertEqual(PanicRebound(name="panic").on(drawdown_window=3).rank_metrics(), {"panic_depth": "asc"})
+
+    def test_additional_patterns_can_compute_rank_metric_series(self):
+        prices = np.array([100.0, 101.0, 102.0, 100.0, 98.0, 99.0, 101.0, 103.0], dtype=np.float64)
+
+        trend = Trending(name="trend").on(window=3, trigger="breakout_up")
+        trend_series = trend._compute_rank_metric_series("ma_gap", prices, lambda field: None)
+        self.assertEqual(trend_series.shape, prices.shape)
+        self.assertTrue(np.isfinite(trend_series[-1]))
+
+        disparity = Disparity(name="disp", window=3).on(threshold=1.0)
+        disparity_series = disparity._compute_rank_metric_series("disparity", prices, lambda field: None)
+        self.assertEqual(disparity_series.shape, prices.shape)
+        self.assertTrue(np.isfinite(disparity_series[-1]))
+
+        golden = GoldenCross(name="gc").on(windows=(2, 3, 4))
+        golden_series = golden._compute_rank_metric_series("alignment_gap", prices, lambda field: None)
+        self.assertEqual(golden_series.shape, prices.shape)
+        self.assertTrue(np.isfinite(golden_series[-1]))
+
+        market = np.array([100.0, 100.0, 101.0, 101.0, 102.0, 102.0, 103.0, 103.0], dtype=np.float64)
+        rs = RelativeStrength(name="rs").on(market="kospi", window=3, trigger="above", threshold=0.0)
+        rs._set_market_values(market)
+        rs_series = rs._compute_rank_metric_series("excess_return", prices, lambda field: None)
+        self.assertEqual(rs_series.shape, prices.shape)
+        self.assertTrue(np.isfinite(rs_series[-1]))
+
+        retest = RetestBreakout(name="retest").on(breakout_window=3)
+        retest_series = retest._compute_rank_metric_series("breakout_gap", prices, lambda field: None)
+        self.assertEqual(retest_series.shape, prices.shape)
+        self.assertTrue(np.isfinite(retest_series[-1]))
+
+        panic = PanicRebound(name="panic").on(drawdown_window=3, volume_spike=False)
+        panic_series = panic._compute_rank_metric_series("panic_depth", prices, lambda field: None)
+        self.assertEqual(panic_series.shape, prices.shape)
+        self.assertTrue(np.isfinite(panic_series[-1]))
 
     def test_retest_breakout_marks_first_rebound_after_retest(self):
         prices = np.array([10.0, 10.1, 10.2, 10.15, 10.25, 10.3, 10.6, 10.95, 10.35, 10.62, 10.7])

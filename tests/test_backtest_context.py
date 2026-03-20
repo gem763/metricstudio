@@ -103,6 +103,32 @@ class _MaskPattern(BasePattern):
         return self._mask.copy()
 
 
+class _RankMetricPattern(BasePattern):
+    def __init__(self, name: str, mask, source: str = "price", default_order: str = "desc"):
+        super().__init__(name=name)
+        self._mask = np.asarray(mask, dtype=np.bool_)
+        self._source = str(source)
+        self._default_order = str(default_order)
+
+    def _required_stock_fields(self) -> tuple[str, ...]:
+        if self._source == "price":
+            return ()
+        return (self._source,)
+
+    def _base_mask(self, values: np.ndarray) -> np.ndarray:
+        return self._mask.copy()
+
+    def rank_metrics(self) -> dict[str, str]:
+        return {"value": self._default_order}
+
+    def _compute_rank_metric_series(self, metric: str, prices: np.ndarray, get_stock_field):
+        if str(metric) != "value":
+            raise KeyError(metric)
+        if self._source == "price":
+            return np.asarray(prices, dtype=np.float64)
+        return np.asarray(get_stock_field(self._source), dtype=np.float64)
+
+
 class BacktestContextTests(unittest.TestCase):
     def tearDown(self):
         plt.close("all")
@@ -339,6 +365,55 @@ class BacktestContextTests(unittest.TestCase):
         self.assertEqual(policy_ids[0].tolist(), [0, 1, 0, 1])
         self.assertEqual(policy_ids[1].tolist(), [0, 1, 0, 1])
         self.assertEqual(profiles[1], (None, None, None, None))
+
+    def test_build_pattern_mask_matrix_can_apply_rank_sum_profile(self):
+        bt = Backtest.__new__(Backtest)
+        bt.dates = pd.date_range("2025-01-01", periods=4, freq="B").to_numpy()
+        bt.prices = np.asarray(
+            [
+                [100.0, 90.0, 80.0],
+                [100.0, 90.0, 80.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        bt.codes = ["A", "B", "C"]
+        bt.start_idx = 0
+        bt.end_idx = 4
+        bt.regime = None
+        bt._pattern_mask_cache = {}
+        bt._pattern_policy_id_cache = {}
+        bt._pattern_trade_profile_cache = {}
+        bt._pattern_exit_mask_cache = {}
+        bt._pattern_exit_index_cache = {}
+        bt._stock_field_matrix_cache = {
+            "amount": np.asarray(
+                [
+                    [100.0, 10.0, 20.0],
+                    [100.0, 10.0, 20.0],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+        }
+        bt._pattern_nmax_node_cache = {}
+        bt._pattern_nmax_series_cache = {}
+        bt._market_values_cache = {}
+        bt._regime_frame_cache = {}
+
+        price_rank = _RankMetricPattern("price_rank", [True, True, False, False], source="price", default_order="desc")
+        amount_rank = _RankMetricPattern("amount_rank", [True, True, False, False], source="amount", default_order="asc")
+        pattern = (price_rank + amount_rank).rank_by(
+            (price_rank, "value.desc"),
+            (amount_rank, "value.asc"),
+        ).nmax(1)
+
+        mask_matrix = bt._build_pattern_mask_matrix("rank_sum", pattern)
+
+        self.assertEqual(mask_matrix[0].tolist(), [False, True, False])
+        self.assertEqual(mask_matrix[1].tolist(), [False, True, False])
 
     def test_build_pattern_mask_matrix_can_use_market_cap_as_nmax_tiebreaker(self):
         bt = Backtest.__new__(Backtest)

@@ -84,6 +84,30 @@ class Bollinger(BasePattern):
         )
         return self
 
+    def rank_metrics(self) -> dict[str, str]:
+        return {"bandwidth": "asc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("Bollinger는 사용 전에 on(...)으로 설정해야 합니다.")
+        if str(metric).strip().lower() != "bandwidth":
+            raise KeyError(metric)
+
+        series = np.asarray(prices, dtype=np.float64)
+        out = np.full(series.shape[0], np.nan, dtype=np.float64)
+        if self.window <= 0 or series.shape[0] < self.window:
+            return out
+
+        mean, std, valid_end = u.rolling_mean_std(series, self.window)
+        valid = valid_end & np.isfinite(mean) & (mean > 0.0) & np.isfinite(std)
+        out[valid] = (float(self.sigma) * std[valid]) / mean[valid]
+        return out
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
         n = prices.shape[0]

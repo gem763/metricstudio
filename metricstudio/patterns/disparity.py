@@ -46,6 +46,30 @@ class Disparity(BasePattern):
         )
         return self
 
+    def rank_metrics(self) -> dict[str, str]:
+        return {"disparity": "asc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("Disparity는 사용 전에 on(...)으로 설정해야 합니다.")
+        if str(metric).strip().lower() != "disparity":
+            raise KeyError(metric)
+
+        series = np.asarray(prices, dtype=np.float64)
+        out = np.full(series.shape[0], np.nan, dtype=np.float64)
+        if series.shape[0] < self.window:
+            return out
+
+        ma, valid_end = u.rolling_mean(series, self.window)
+        valid = valid_end & np.isfinite(series) & (series > 0.0) & np.isfinite(ma) & (ma > 0.0)
+        out[valid] = series[valid] / ma[valid]
+        return out
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         if self.params is None:
             raise ValueError("Disparity는 사용 전에 on(...)으로 설정해야 합니다.")

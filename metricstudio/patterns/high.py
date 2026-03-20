@@ -38,6 +38,32 @@ class High(BasePattern):
         )
         return self
 
+    def rank_metrics(self) -> dict[str, str]:
+        return {"proximity": "desc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("High는 사용 전에 on(...)으로 설정해야 합니다.")
+        if str(metric).strip().lower() != "proximity":
+            raise KeyError(metric)
+
+        series = np.asarray(prices, dtype=np.float64)
+        out = np.full(series.shape[0], np.nan, dtype=np.float64)
+        high_series = u.rolling_high(series, self.params.window)
+        valid = (
+            np.isfinite(series)
+            & (series > 0.0)
+            & np.isfinite(high_series)
+            & (high_series > 0.0)
+        )
+        out[valid] = series[valid] / high_series[valid]
+        return out
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         if self.params is None:
             raise ValueError("High는 사용 전에 on(...)으로 설정해야 합니다.")

@@ -50,6 +50,45 @@ class Trending(BasePattern):
         )
         return self
 
+    def rank_metrics(self) -> dict[str, str]:
+        if self.params is None:
+            return {}
+        trigger = str(self.params.trigger)
+        if trigger == "breakout_up":
+            return {"ma_gap": "desc"}
+        if trigger == "breakout_down":
+            return {"ma_gap": "asc"}
+        if trigger == "ma_trend_up":
+            return {"ma_slope": "desc"}
+        return {"ma_slope": "asc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("Trending은 사용 전에 on(...)으로 설정해야 합니다.")
+
+        metric_key = str(metric).strip().lower()
+        series = np.asarray(prices, dtype=np.float64)
+        out = np.full(series.shape[0], np.nan, dtype=np.float64)
+        mean, valid_end = u.rolling_mean(series, int(self.params.window))
+
+        if metric_key == "ma_gap":
+            valid = valid_end & np.isfinite(series) & (series > 0.0) & np.isfinite(mean) & (mean > 0.0)
+            out[valid] = series[valid] / mean[valid] - 1.0
+            return out
+
+        if metric_key == "ma_slope":
+            valid = valid_end[1:] & valid_end[:-1] & np.isfinite(mean[1:]) & np.isfinite(mean[:-1]) & (mean[:-1] > 0.0)
+            out_slice = out[1:]
+            out_slice[valid] = mean[1:][valid] / mean[:-1][valid] - 1.0
+            return out
+
+        raise KeyError(metric)
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         if self.params is None:
             raise ValueError("Trending은 사용 전에 on(...)으로 설정해야 합니다.")

@@ -166,7 +166,13 @@ sim = bt.run(
 전제:
 - 반드시 `analyze()`가 먼저 실행되어야 한다.
 - `run()`은 analyze된 패턴 이름을 기준으로 실행된다.
-- analyze 때 연결된 `filter`, pattern-level `trade(...)`, `nmax(...)`도 함께 반영된다.
+- analyze 때 연결된 `filter`, pattern-level `trade(...)`, `rank_by(...)`, `nmax(...)`도 함께 반영된다.
+
+참고:
+- `rank_by(...)`는 후보 수를 직접 줄이지 않는다.
+- 실제 종목 수 제한은 `nmax(...)`가 담당하고, `rank_by(...)`는 `nmax` 초과 후보가 나온 날짜에 어떤 종목을 남길지 정한다.
+- 현재 `rank_by(...)`는 일자별 후보군 안에서 각 metric을 `0~1` 점수로 정규화한 뒤 합산하는 `rank_sum` 방식만 지원한다.
+- 종목 공통 metric은 `("stock", "marketcap.desc")`처럼 줄 수 있다.
 
 ### 2.3 `screen(date, pattern, use_cache=True)`
 
@@ -228,11 +234,22 @@ bt = Backtest(
     univ=univ,
 )
 
+bb = p.Bollinger("bb").on(trigger="breakout_up", bandwidth_max=0.05)
+high52w = p.High("52w").on(window=240, threshold=0.90, stay_days=1)
+uptrend = p.Trending("ma200").on(trigger="ma_trend_up", window=200)
+mfi50 = p.MFI("mfi50").on(trigger="above", threshold=50)
+amt15 = p.AmountSurge("amt15").on(window=20, threshold=1.5)
+
 strat = (
-    p.Bollinger("bb").on(trigger="breakout_up", bandwidth_max=0.05)
-    + p.High("52w").on(window=240, threshold=0.90, stay_days=1)
-    + p.Trending("ma200").on(trigger="ma_trend_up", window=200)
-).named("trend_entry")
+    bb + high52w + uptrend + mfi50 + amt15
+).named("trend_entry").rank_by(
+    ("stock", "marketcap.desc"),
+    (amt15, "ratio.desc"),
+    (bb, "bandwidth.asc"),
+    (high52w, "proximity.desc"),
+    (uptrend, "ma_slope.desc"),
+    (mfi50, "value.desc"),
+).nmax(5)
 
 stats = bt.analyze(strat, filter=flt)
 sim = bt.run(pattern="trend_entry", target_horizon="1M")
@@ -242,7 +259,7 @@ picked = bt.screen("2026-03-12", strat)
 읽는 순서:
 1. `Univ`로 전체 유니버스를 정한다.
 2. `Backtest`를 만든다.
-3. 패턴을 정의하고 필요하면 `.named(...)`, `.trade(...)`, `.nmax(...)`를 붙인다.
+3. 패턴을 정의하고 필요하면 `.named(...)`, `.rank_by(...)`, `.nmax(...)`, `.trade(...)`를 붙인다.
 4. 실행 대상을 더 좁히고 싶으면 `Filter`를 만들어 `analyze(filter=...)`에 넣는다.
 5. 결과를 `run()` 또는 `screen()`으로 이어간다.
 
@@ -253,7 +270,7 @@ picked = bt.screen("2026-03-12", strat)
 - [`패턴 가이드`](%ED%8C%A8%ED%84%B4%20%EA%B0%80%EC%9D%B4%EB%93%9C.md)
 - `BasePattern` 공통 API
 - 패턴 생성자와 `on(...)` 입력
-- `when()`, `market()`, `trim()`, `trade()`, `nmax()`
+- `when()`, `market()`, `trim()`, `trade()`, `rank_by()`, `nmax()`
 - 개별 패턴(`Bollinger`, `MFI`, `High`, `RetestBreakout`, `RelativeStrength` 등)
 
 `stay_days`, `cooldown_days`의 정확한 동작은 [`stay_cooldown_mask 매뉴얼`](stay%EC%99%80%20cooldown.md)을 함께 보면 된다.

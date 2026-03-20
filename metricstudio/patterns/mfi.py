@@ -73,6 +73,33 @@ class MFI(BasePattern):
     def _required_stock_fields(self) -> tuple[str, ...]:
         return ("high", "low", "volume")
 
+    def rank_metrics(self) -> dict[str, str]:
+        return {"value": "desc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("MFI는 사용 전에 on(...)으로 설정해야 합니다.")
+        if str(metric).strip().lower() != "value":
+            raise KeyError(metric)
+
+        close = np.asarray(prices, dtype=np.float64)
+        high = np.asarray(get_stock_field("high"), dtype=np.float64)
+        low = np.asarray(get_stock_field("low"), dtype=np.float64)
+        volume = np.asarray(get_stock_field("volume"), dtype=np.float64)
+        if not (high.shape == low.shape == close.shape == volume.shape):
+            raise ValueError("MFI rank metric 입력 시계열 shape이 일치하지 않습니다.")
+
+        out = np.full(close.shape[0], np.nan, dtype=np.float64)
+        mfi, valid_end = u.money_flow_index(high, low, close, volume, self.window)
+        valid = valid_end & np.isfinite(mfi)
+        out[valid] = mfi[valid]
+        return out
+
     @staticmethod
     def _bullish_failure_swing_mask(
         mfi: np.ndarray,

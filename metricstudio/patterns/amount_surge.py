@@ -44,6 +44,36 @@ class AmountSurge(BasePattern):
     def _required_stock_fields(self) -> tuple[str, ...]:
         return ("amount",)
 
+    def rank_metrics(self) -> dict[str, str]:
+        return {"ratio": "desc"}
+
+    def _compute_rank_metric_series(
+        self,
+        metric: str,
+        prices: np.ndarray,
+        get_stock_field,
+    ) -> np.ndarray:
+        if self.params is None:
+            raise ValueError("AmountSurge는 사용 전에 on(...)으로 설정해야 합니다.")
+        if str(metric).strip().lower() != "ratio":
+            raise KeyError(metric)
+
+        amount = np.asarray(get_stock_field("amount"), dtype=np.float64)
+        out = np.full(amount.shape[0], np.nan, dtype=np.float64)
+        if amount.shape[0] < self.params.window:
+            return out
+
+        mean_amount, valid_end = u.rolling_mean(amount, self.params.window)
+        valid = (
+            valid_end
+            & np.isfinite(amount)
+            & (amount > 0.0)
+            & np.isfinite(mean_amount)
+            & (mean_amount > 0.0)
+        )
+        out[valid] = amount[valid] / mean_amount[valid]
+        return out
+
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         if self.params is None:
             raise ValueError("AmountSurge는 사용 전에 on(...)으로 설정해야 합니다.")
