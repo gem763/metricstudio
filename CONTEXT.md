@@ -1678,6 +1678,11 @@ trend와 같은 `1M~6M` 홀드 감각보다
 - `loser5_mfi35 + Bollinger(loss_cut='mid_stop')`
 - `loser5_mfi35 + Bollinger(loss_cut='trailing_stop')`
 
+주의:
+
+- 위 두 `Bollinger(loss_cut=...)` 비교는 과거 실험 기록이다.
+- 해당 Bollinger exit 옵션은 이후 코드베이스에서 제거되었다.
+
 대표 결과(`당일종가`):
 
 - `1W`
@@ -2859,3 +2864,319 @@ bt.screen("2024-03-14", strat)
 1. 코호트 폭증 통제는 이제 `bt.run(max_cohort_size=...)`가 아니라 패턴의 `.nmax(...)`로 한다
 2. `nmax(..., market_cap=True)`면 시가총액이 선택 1순위고, 기본은 `bandwidth -> amount -> 52주 고가 -> MFI` 순이다
 3. `Univ()`의 리츠 제외는 `dept='리츠'`가 아니라 종목명 기반 예외 처리이며, 차트/노트북 UX는 `stats.plot_with_simulator(...)` 중심으로 정리돼 있다
+
+---
+
+## 22) 2026-03-20 추가 인계: API/문서 정리 + `run()` 단순화 + benchmark 초기화 최적화
+
+이번 쓰레드의 핵심 방향은 두 가지였다.
+
+1. 사용자가 실제 노트북에서 거의 쓰지 않는 옵션과 레거시 흔적을 더 걷어내서 API를 단순화
+2. `nb/실험 2026.03.13.ipynb`의 결과를 바꾸지 않으면서 `Backtest()` 초기화 체감속도를 줄이는 것
+
+가장 중요한 원칙은 끝까지 동일했다.
+
+- 현재 핵심 노트북 `nb/실험 2026.03.13.ipynb`가 깨지면 안 된다
+- 백테스트 결과가 바뀌면 안 된다
+- 따라서 최적화는 “동일성 확인이 가능한 범위”에서만 아주 보수적으로 넣었다
+
+이번 턴에서 실제로 많이 건드린 파일은 대략 아래다.
+
+- `metricstudio/backtest.py`
+- `metricstudio/simulate.py`
+- `metricstudio/stats.py`
+- `metricstudio/dataload.py`
+- `metricstudio/patterns/base.py`
+- `metricstudio/patterns/bollinger.py`
+- `metricstudio/patterns/disparity.py`
+- `metricstudio/patterns/mfi.py`
+- `metricstudio/univ.py`
+- `metricstudio/util.py`
+- `metricstudio/plot.py`
+- `research/notebook_experiment_utils.py`
+- `tests/test_backtest_context.py`
+- `API.md`
+- `패턴 가이드.md`
+- `stay와 cooldown.md`
+- `CONTEXT.md`
+
+### 22.1 `db` / legacy loader 관련 현재 상태
+사용자가 확인을 요청한 뒤,
+`Backtest(..., db=1)` 같은 레거시 경로는 전부 제거했다.
+
+현재 해석:
+
+- `Backtest`에는 더 이상 `db` 인자가 없다
+- 내부는 기본적으로 현재 로더(`db=0`에 해당하던 경로)만 사용한다
+- `dataload.py`도 사실상 단일 로더 구조로 단순화됐다
+
+즉 다음 에이전트는
+`db=1`이나 `legacy DB 조회 분기`를 다시 고려할 필요가 없다.
+
+### 22.2 `stats.py` / dead code 정리 현재 상태
+이번 턴에서 `stats.py` 쪽 unused 개념을 추가로 정리했다.
+
+제거한 것:
+
+- `daily_geom`
+- `_numba_accumulate_occurrences`
+- `occurrence` 기능 전체
+
+중요한 현재 상태:
+
+- `Stats` / `StatsCollection` 핵심 API는 유지
+- `event` / `day` 집계는 유지
+- `to_frame()` / `to_frame_history()`도 유지
+- `plot_compare()`는 사용자가 유지하기로 해서 삭제하지 않았다
+
+즉 다음 에이전트는
+`daily_geom`이나 `occurrence()`가 아직 살아 있다고 가정하면 안 된다.
+
+### 22.3 패턴 생성자 / 문서 / 이름 입력 방식
+패턴 생성 시 `name=`를 매번 쓰는 것이 번거롭다는 맥락에서,
+생성자 API를 더 일관되게 맞췄다.
+
+현재 상태:
+
+- `Bollinger`, `Disparity`, `MFI`도 이제 첫 positional 인자를 `name`으로 받는다
+- 따라서 아래가 된다
+
+```python
+p.Bollinger("볼린저")
+p.Disparity("이격도", window=20)
+p.MFI("mfi", window=14)
+```
+
+기존 스타일도 깨지지 않게 어느 정도 호환은 남겨뒀지만,
+노트북 쪽 표기는 새 스타일로 맞췄다.
+
+즉 `nb/실험 2026.02.12.ipynb`,
+`nb/실험 2026.03.13.ipynb`에서
+패턴 생성자의 `name="..."` 표기는 positional name으로 대부분 정리돼 있다.
+
+### 22.4 문서 구조 현재 상태
+문서도 이번 턴에 크게 정리했다.
+
+현재 역할 분담:
+
+- `패턴 가이드.md`
+  - 패턴별 사용법, 입력변수, 출력 의미
+- `API.md`
+  - `Univ`, `Filter`, `Backtest`, `analyze`, `run`, `screen` 설명
+- `stay와 cooldown.md`
+  - `stay_mask`, `cooldown_mask`, `stay_cooldown_mask` 설명
+
+중요:
+
+- 예전 `매뉴얼.md`는 `stay와 cooldown.md`로 이름을 바꿨다
+- `API.md`는 새로 만들었고,
+  패턴 파트는 `패턴 가이드.md`를 보라고 안내하는 구조다
+- `패턴 가이드.md`와 `stay와 cooldown.md`는 서로 링크돼 있다
+
+즉 다음 에이전트는
+문서를 하나로 합치려 하기보다,
+지금의 분리 구조를 전제로 보는 편이 맞다.
+
+### 22.5 `Univ` / `Filter` 개념 정리
+사용자와 한 번 더 확인한 중요한 결론이 있다.
+
+현재 해석은 아래가 맞다.
+
+- `Univ`는 “무슨 종목을 로드하느냐”
+- `Filter`는 “이미 로드된 유니버스 위에서 어떤 종목만 실행에 포함하느냐”
+
+그래서 `Filter`를 `Backtest()` 생성자로 올리지 않고,
+계속 `bt.analyze(..., filter=flt)`에 두는 쪽으로 합의했다.
+
+이 판단 이유:
+
+- `Backtest()`에 `filter`를 넣으면 `univ`와 같은 층위로 오해하기 쉽다
+- benchmark까지 같이 좁혀진다고 사용자가 오해할 가능성이 있다
+- 현재 의미상 `filter`는 analyzed pattern에 붙는 실행 필터다
+
+즉 다음 에이전트는
+`filter`를 `Backtest()` 초기화 인자로 다시 옮기는 제안을 기본값처럼 하지 않는 편이 좋다.
+
+### 22.6 `Univ()`의 리츠 제외와 노트북 정리
+`Univ()`는 이미 `exclude_reits=True`가 기본값이었다.
+이번 턴에는 라이브러리 동작을 바꾼 것이 아니라,
+노트북에서 중복 명시하던 `exclude_reits=True`를 걷어냈다.
+
+현재 노트북 쪽 해석:
+
+```python
+u.Univ(market=["KOSPI", "KOSDAQ"])
+```
+
+라고 쓰면
+리츠 제외가 기본으로 적용된다고 보면 된다.
+
+### 22.7 `Bollinger`의 청산 옵션 제거
+사용자 요청으로
+`Bollinger.on(..., loss_cut=...)` 계열 청산조건을 전부 제거했다.
+
+현재 상태:
+
+- `loss_cut=None` / `"mid_stop"` / `"trailing_stop"` 같은 옵션은 더 이상 없다
+- 따라서 `Bollinger`는 신호 정의 패턴으로만 남아 있고,
+  별도 내장 청산 로직은 없다
+
+중요:
+
+- 관련 문서와 테스트도 현재 구현 기준으로 맞췄다
+- `CONTEXT.md` 안의 과거 실험 기록은 삭제하지 않고,
+  현재 구현과 다를 수 있다는 맥락으로만 이해해야 한다
+
+### 22.8 `Backtest.run()` 단순화 현재 상태
+사용자 판단에 따라
+`run()`에서 gating / fallback 개념 전체를 제거했다.
+
+제거된 축:
+
+- `fallback_exposure`
+- `gate_geom_min`
+- `gate_arith_min`
+- `gate_rise_min`
+- `gate_use_geom`
+- `gate_use_arith`
+- `gate_use_rise`
+
+그리고 이 개념과 같이 묶여 있던
+`aggregate_lookback`도 제거했다.
+
+따라서 현재 `run()` 해석은 훨씬 단순하다.
+
+- 신규 코호트는 기본적으로 풀 규모로 들어간다
+- 별도의 gate 충족 여부로 편입비를 줄이는 로직은 없다
+- `aggregate_lookback` 기반 진단 컬럼도 더 이상 없다
+
+즉 다음 에이전트는
+`pattern_arith_mean`, `all_stock_geom_mean` 같은 옛 진단 컬럼을
+`Simulator.result`에서 기대하면 안 된다.
+
+### 22.9 현재 `run()`에서 남아 있는 실전 옵션 감각
+지금 사용자 노트북 기준으로 `run()`에서 핵심적으로 보는 축은 대략 아래다.
+
+- `pattern`
+- `target_horizon`
+- `trade_price_mode`
+- 필요하면 `stop_loss_pct`
+- 필요하면 `take_profit_pct`
+- 필요하면 `allow_reentry`
+- 필요하면 `min_cohort_size`
+
+즉 다음 세션에서 `run()`을 더 손대더라도,
+이미 제거된 gating/fallback을 되살리는 방향은 사용자 의도와 어긋날 가능성이 크다.
+
+### 22.10 `Backtest()` benchmark 초기화가 느렸던 원인과 현재 최적화
+사용자가 바로 체감한 병목은 이것이었다.
+
+- `Backtest(start, end, benchmark=AllStockPattern(...), by="day", univ=...)`
+  초기화가 두 번째 실행에도 약 `6~7초`
+- 첫 실행은 대략 `17초` 가까이 걸림
+
+원인 정리:
+
+1. 첫 실행은 종가 wide table을 메모리에 올리는 비용이 크다
+2. benchmark가 `AllStockPattern` + `by="day"` + no trim인데도,
+   내부적으로 trim용 날짜 집계 커널을 타고 있었다
+3. 그 trim 커널은 매 날짜/매 horizon마다 return을 정렬한다
+
+이번 턴에서 넣은 최적화는 두 가지다.
+
+1. `AllStockPattern` + `by="day"` + no trim + no `nmax` 전용 fast path 추가
+2. 동일 benchmark base stats를 `Backtest` 인스턴스 간 재사용하는 cache 추가
+
+중요:
+
+- fast path는 아주 좁은 조건에서만 탄다
+- 결과가 바뀌지 않는 범위만 노렸다
+- generic path 전체를 갈아엎지 않았다
+
+현재 관련 구현 포인트:
+
+- benchmark base cache: `metricstudio/backtest.py`
+- default all-stock fast path: `metricstudio/backtest.py`
+- progress 문구도 `trim` 대신 `day`로 보이게 정리됨
+
+### 22.11 benchmark 최적화 결과 동일성 검증
+이 부분이 가장 중요하다.
+사용자가 “속도는 빨라져도 기존 백테스트 결과가 바뀌면 안 된다”고 여러 번 강조했다.
+
+그래서 실제로 아래를 확인했다.
+
+1. 테스트 추가
+   - `AllStockPattern` fast accumulator가
+     기존 `trim_q=0` 경로와 같은 결과를 내는지 unit test 추가
+2. 전체 테스트
+   - `python -m pytest -q`
+   - 최종 `44 passed`
+3. 실데이터 비교
+   - `2000-01-01 ~ 2026-02-28`
+   - `KOSPI + KOSDAQ`
+   - `AllStockPattern`
+   - `by="day"`
+   - `counts`, `sum_ret`, `sum_log`, `pos_counts`,
+     `geom_invalid`, `daily_arith`, `daily_rise`
+     전부 기존 경로와 동일함을 확인
+
+즉 다음 에이전트는
+이번 benchmark 최적화는 “속도 개선이지만 결과 동일성도 같이 확인된 변경”으로 이해해도 된다.
+
+### 22.12 benchmark 초기화 속도 메모
+실측 메모를 남기면 아래 정도다.
+
+- 최적화 전 warm benchmark init: 대략 `6.7 ~ 7.5초`
+- 최적화 후 같은 Python 세션에서 동일 benchmark 재초기화:
+  `0.002초`, `0.000초` 수준
+
+단, 중요한 주의:
+
+- 이 cache는 Python 프로세스 메모리 안에 있다
+- 즉 노트북 커널을 새로 띄우거나,
+  집 맥북에서 새 세션을 열면 첫 benchmark 계산은 다시 돈다
+- 첫 실행이 아예 공짜가 된 것은 아니다
+
+그래도 같은 세션 안에서 반복적으로 `Backtest()`를 다시 만드는 작업은
+체감이 크게 줄었다.
+
+### 22.13 현재 핵심 노트북 상태 메모
+`nb/실험 2026.03.13.ipynb` 기준으로는 아래를 기억하면 된다.
+
+- `Univ(..., exclude_reits=True)` 명시는 제거됨
+- 패턴 생성자 `name="..."` 표기도 대부분 positional name으로 정리됨
+- benchmark progress는 이제 `trim`이 아니라 `day`로 보인다
+- `filter`는 여전히 `bt.analyze(..., filter=flt)`에 넣는 구조다
+
+즉 다음 에이전트가 노트북을 읽을 때
+예전 습관대로 `name=`이나 `exclude_reits=True`를 계속 쓰지 않아도 된다.
+
+### 22.14 환경 메모
+이번 턴에서 확인한 환경 관련 상태:
+
+- `metricstudio` 가상환경에 `pytest` 설치 완료
+- 현재 테스트 기준 `44 passed`
+
+즉 다음 세션에서는
+`pytest`가 없다고 가정할 필요가 없다.
+
+### 22.15 다음 세션에서 이어갈 때 가장 중요한 주의사항
+다음 에이전트가 특히 조심해야 할 포인트는 아래다.
+
+1. benchmark 성능 최적화를 더 밀더라도,
+   반드시 결과 동일성 검증을 같이 해야 한다
+2. `filter`를 `Backtest()` 생성자로 올리는 방향은
+   사용자 의도와 어긋날 가능성이 크다
+3. 이미 제거된 `gate_*`, `fallback_exposure`, `aggregate_lookback`,
+   `Bollinger.loss_cut`을 되살리는 방향은 현재 사용자 의도와 다르다
+4. public처럼 남겨 둔 API 중에는
+   저장소 내부에서 안 써도 외부 노트북에서 다시 쓸 가능성이 있으므로,
+   “repo 내부 미사용”만으로 바로 삭제하지 않는 편이 안전하다
+
+### 22.16 이번 쓰레드의 한 줄 요약
+이번 턴의 요약은 아래 네 줄이면 충분하다.
+
+1. `run()`은 이제 gating/fallback 없는 더 단순한 API다
+2. 패턴 문서와 API 문서를 분리했고, `stay와 cooldown.md`로 문서명을 정리했다
+3. `Bollinger` 내장 청산과 `stats.py`의 몇몇 dead feature를 제거했다
+4. `Backtest(..., benchmark=AllStockPattern(...), by="day")` 초기화는 결과를 유지한 채 훨씬 빨라졌다

@@ -8,9 +8,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from metricstudio.backtest import Backtest
+from metricstudio.backtest import (
+    TRIM_MODE_REMOVE,
+    Backtest,
+    _numba_accumulate_all_stock_window,
+    _numba_accumulate_trim_for_date,
+    _pattern_cache_signature,
+)
 from metricstudio.univ import Univ
-from metricstudio.patterns import BasePattern, Bollinger, Disparity, MFI
+from metricstudio.patterns import AllStockPattern, BasePattern, Bollinger, Disparity, MFI
 from metricstudio.regime import Regime
 from metricstudio.simulate import Simulator
 from metricstudio.stats import Stats, StatsCollection
@@ -184,6 +190,10 @@ class BacktestContextTests(unittest.TestCase):
         self.assertEqual(disparity.window, 40)
         self.assertEqual(mfi.name, "mfi")
         self.assertEqual(mfi.window, 10)
+
+    def test_bollinger_on_no_longer_accepts_loss_cut(self):
+        with self.assertRaises(TypeError):
+            Bollinger("bb").on(loss_cut="mid_stop")
 
     def test_apply_default_regime_wraps_pattern_without_attached_regime(self):
         bt = Backtest.__new__(Backtest)
@@ -488,8 +498,6 @@ class BacktestContextTests(unittest.TestCase):
         sim.pattern = "demo"
         sim.target_horizon = "1M"
         sim.target_horizon_days = 20
-        sim.aggregate_lookback = "1Y"
-        sim.fallback_exposure = 0.5
         sim.max_weight_per_stock = float("nan")
         sim.run_years = 1.0
         sim.total_return = 0.05
@@ -533,8 +541,6 @@ class BacktestContextTests(unittest.TestCase):
         sim.pattern = "demo"
         sim.target_horizon = "1M"
         sim.target_horizon_days = 20
-        sim.aggregate_lookback = "1Y"
-        sim.fallback_exposure = 0.5
         sim.max_weight_per_stock = float("nan")
         sim.run_years = 1.0
         sim.total_return = 0.05
@@ -576,7 +582,6 @@ class BacktestContextTests(unittest.TestCase):
             pattern="turnover",
             target_horizon="1M",
             target_horizon_days=3,
-            aggregate_lookback="1Y",
             pattern_mask=pattern_mask,
             pattern_policy_id_matrix=None,
             policy_horizon_days=np.asarray([3], dtype=np.int32),
@@ -585,19 +590,6 @@ class BacktestContextTests(unittest.TestCase):
             policy_cohort_scale=np.asarray([1.0], dtype=np.float64),
             pattern_exit_mask=np.zeros((4, 1), dtype=np.bool_),
             pattern_dynamic_exit_index=None,
-            pattern_arith_series=np.zeros(4, dtype=np.float64),
-            pattern_geom_series=np.zeros(4, dtype=np.float64),
-            pattern_rise_series=np.ones(4, dtype=np.float64),
-            all_stock_arith_series=np.zeros(4, dtype=np.float64),
-            all_stock_geom_series=np.zeros(4, dtype=np.float64),
-            all_stock_rise_series=np.ones(4, dtype=np.float64),
-            fallback_exposure=0.5,
-            gate_geom_min=0.0,
-            gate_arith_min=0.0,
-            gate_rise_min=0.5,
-            gate_use_geom=False,
-            gate_use_arith=False,
-            gate_use_rise=False,
             stop_loss_pct=None,
             take_profit_pct=None,
             execution_lag_days=0,
@@ -631,7 +623,6 @@ class BacktestContextTests(unittest.TestCase):
             pattern="router",
             target_horizon="1M",
             target_horizon_days=3,
-            aggregate_lookback="1Y",
             pattern_mask=pattern_mask,
             pattern_policy_id_matrix=pattern_policy_id_matrix,
             policy_horizon_days=np.asarray([3, 1, 3], dtype=np.int32),
@@ -640,19 +631,6 @@ class BacktestContextTests(unittest.TestCase):
             policy_cohort_scale=np.asarray([1.0, 1.0, 1.0], dtype=np.float64),
             pattern_exit_mask=np.zeros((5, 2), dtype=np.bool_),
             pattern_dynamic_exit_index=None,
-            pattern_arith_series=np.zeros(5, dtype=np.float64),
-            pattern_geom_series=np.zeros(5, dtype=np.float64),
-            pattern_rise_series=np.ones(5, dtype=np.float64),
-            all_stock_arith_series=np.zeros(5, dtype=np.float64),
-            all_stock_geom_series=np.zeros(5, dtype=np.float64),
-            all_stock_rise_series=np.ones(5, dtype=np.float64),
-            fallback_exposure=0.5,
-            gate_geom_min=0.0,
-            gate_arith_min=0.0,
-            gate_rise_min=0.5,
-            gate_use_geom=False,
-            gate_use_arith=False,
-            gate_use_rise=False,
             stop_loss_pct=None,
             take_profit_pct=None,
             execution_lag_days=0,
@@ -692,7 +670,6 @@ class BacktestContextTests(unittest.TestCase):
             pattern="router",
             target_horizon="1M",
             target_horizon_days=3,
-            aggregate_lookback="1Y",
             pattern_mask=pattern_mask,
             pattern_policy_id_matrix=pattern_policy_id_matrix,
             policy_horizon_days=np.asarray([3, 3, 3], dtype=np.int32),
@@ -701,19 +678,6 @@ class BacktestContextTests(unittest.TestCase):
             policy_cohort_scale=np.asarray([1.0, 1.0, 1.0], dtype=np.float64),
             pattern_exit_mask=np.zeros((4, 2), dtype=np.bool_),
             pattern_dynamic_exit_index=None,
-            pattern_arith_series=np.zeros(4, dtype=np.float64),
-            pattern_geom_series=np.zeros(4, dtype=np.float64),
-            pattern_rise_series=np.ones(4, dtype=np.float64),
-            all_stock_arith_series=np.zeros(4, dtype=np.float64),
-            all_stock_geom_series=np.zeros(4, dtype=np.float64),
-            all_stock_rise_series=np.ones(4, dtype=np.float64),
-            fallback_exposure=0.5,
-            gate_geom_min=0.0,
-            gate_arith_min=0.0,
-            gate_rise_min=0.5,
-            gate_use_geom=False,
-            gate_use_arith=False,
-            gate_use_rise=False,
             stop_loss_pct=None,
             take_profit_pct=None,
             execution_lag_days=0,
@@ -743,7 +707,6 @@ class BacktestContextTests(unittest.TestCase):
             pattern="cap_test",
             target_horizon="1M",
             target_horizon_days=3,
-            aggregate_lookback="1Y",
             pattern_mask=pattern_mask,
             pattern_policy_id_matrix=None,
             policy_horizon_days=np.asarray([3], dtype=np.int32),
@@ -752,19 +715,6 @@ class BacktestContextTests(unittest.TestCase):
             policy_cohort_scale=np.asarray([1.0], dtype=np.float64),
             pattern_exit_mask=np.zeros((4, 3), dtype=np.bool_),
             pattern_dynamic_exit_index=None,
-            pattern_arith_series=np.zeros(4, dtype=np.float64),
-            pattern_geom_series=np.zeros(4, dtype=np.float64),
-            pattern_rise_series=np.ones(4, dtype=np.float64),
-            all_stock_arith_series=np.zeros(4, dtype=np.float64),
-            all_stock_geom_series=np.zeros(4, dtype=np.float64),
-            all_stock_rise_series=np.ones(4, dtype=np.float64),
-            fallback_exposure=0.5,
-            gate_geom_min=0.0,
-            gate_arith_min=0.0,
-            gate_rise_min=0.5,
-            gate_use_geom=False,
-            gate_use_arith=False,
-            gate_use_rise=False,
             stop_loss_pct=None,
             take_profit_pct=None,
             execution_lag_days=0,
@@ -797,7 +747,6 @@ class BacktestContextTests(unittest.TestCase):
             pattern="router",
             target_horizon="1M",
             target_horizon_days=3,
-            aggregate_lookback="1Y",
             pattern_mask=pattern_mask,
             pattern_policy_id_matrix=pattern_policy_id_matrix,
             policy_horizon_days=np.asarray([3, 3, 3], dtype=np.int32),
@@ -806,19 +755,6 @@ class BacktestContextTests(unittest.TestCase):
             policy_cohort_scale=np.asarray([1.0, 1.0, 0.5], dtype=np.float64),
             pattern_exit_mask=np.zeros((4, 2), dtype=np.bool_),
             pattern_dynamic_exit_index=None,
-            pattern_arith_series=np.zeros(4, dtype=np.float64),
-            pattern_geom_series=np.zeros(4, dtype=np.float64),
-            pattern_rise_series=np.ones(4, dtype=np.float64),
-            all_stock_arith_series=np.zeros(4, dtype=np.float64),
-            all_stock_geom_series=np.zeros(4, dtype=np.float64),
-            all_stock_rise_series=np.ones(4, dtype=np.float64),
-            fallback_exposure=0.5,
-            gate_geom_min=0.0,
-            gate_arith_min=0.0,
-            gate_rise_min=0.5,
-            gate_use_geom=False,
-            gate_use_arith=False,
-            gate_use_rise=False,
             stop_loss_pct=None,
             take_profit_pct=None,
             execution_lag_days=0,
@@ -831,6 +767,96 @@ class BacktestContextTests(unittest.TestCase):
         cohort_values = holdings.groupby("cohort_id")["cohort_value"].first().sort_index()
         self.assertEqual(cohort_values.index.tolist(), [1, 2])
         self.assertTrue(np.isclose(cohort_values.iloc[0] / cohort_values.iloc[1], 2.0, atol=0.05))
+
+    def test_all_stock_fast_accumulator_matches_trim_zero_daily(self):
+        prices = np.asarray(
+            [
+                [10.0, 20.0, np.nan],
+                [11.0, 18.0, 30.0],
+                [12.0, 21.0, 27.0],
+                [13.0, np.nan, 29.0],
+                [14.0, 25.0, 31.0],
+            ],
+            dtype=np.float64,
+        )
+        horizon_offsets = np.asarray([1, 2], dtype=np.int64)
+        num_h = len(horizon_offsets)
+        num_dates = prices.shape[0]
+
+        fast_counts = np.zeros((num_h, num_dates), dtype=np.int64)
+        fast_sum_ret = np.zeros((num_h, num_dates), dtype=np.float64)
+        fast_sum_log = np.zeros((num_h, num_dates), dtype=np.float64)
+        fast_pos_counts = np.zeros((num_h, num_dates), dtype=np.int64)
+        fast_geom_invalid = np.zeros((num_h, num_dates), dtype=np.bool_)
+        fast_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+        fast_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+
+        ref_counts = np.zeros((num_h, num_dates), dtype=np.int64)
+        ref_sum_ret = np.zeros((num_h, num_dates), dtype=np.float64)
+        ref_sum_log = np.zeros((num_h, num_dates), dtype=np.float64)
+        ref_pos_counts = np.zeros((num_h, num_dates), dtype=np.int64)
+        ref_geom_invalid = np.zeros((num_h, num_dates), dtype=np.bool_)
+        ref_daily_arith = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+        ref_daily_rise = np.full((num_h, num_dates), np.nan, dtype=np.float64)
+
+        _numba_accumulate_all_stock_window(
+            prices,
+            0,
+            num_dates,
+            horizon_offsets,
+            fast_counts,
+            fast_sum_ret,
+            fast_sum_log,
+            fast_pos_counts,
+            fast_geom_invalid,
+            fast_daily_arith,
+            fast_daily_rise,
+            True,
+        )
+
+        exit_mask = np.zeros((num_dates, prices.shape[1]), dtype=np.bool_)
+        dynamic_exit_index = np.full((1, 1), -1, dtype=np.int32)
+        for date_idx in range(num_dates):
+            mask_row = np.isfinite(prices[date_idx]) & (prices[date_idx] > 0.0)
+            _numba_accumulate_trim_for_date(
+                prices,
+                mask_row,
+                date_idx,
+                horizon_offsets,
+                exit_mask,
+                False,
+                dynamic_exit_index,
+                0,
+                False,
+                0.0,
+                TRIM_MODE_REMOVE,
+                ref_counts,
+                ref_sum_ret,
+                ref_sum_log,
+                ref_pos_counts,
+                ref_geom_invalid,
+                ref_daily_arith,
+                ref_daily_rise,
+            )
+
+        np.testing.assert_array_equal(fast_counts, ref_counts)
+        np.testing.assert_allclose(fast_sum_ret, ref_sum_ret)
+        np.testing.assert_allclose(fast_sum_log, ref_sum_log)
+        np.testing.assert_array_equal(fast_pos_counts, ref_pos_counts)
+        np.testing.assert_array_equal(fast_geom_invalid, ref_geom_invalid)
+        np.testing.assert_allclose(fast_daily_arith, ref_daily_arith, equal_nan=True)
+        np.testing.assert_allclose(fast_daily_rise, ref_daily_rise, equal_nan=True)
+
+    def test_pattern_cache_signature_ignores_name_but_reflects_config(self):
+        left = AllStockPattern("a")
+        right = AllStockPattern("b")
+        self.assertEqual(_pattern_cache_signature(left), _pattern_cache_signature(right))
+
+        trimmed = AllStockPattern("c").trim(0.1)
+        self.assertNotEqual(_pattern_cache_signature(left), _pattern_cache_signature(trimmed))
+
+        capped = AllStockPattern("d").nmax(10)
+        self.assertNotEqual(_pattern_cache_signature(left), _pattern_cache_signature(capped))
 
 if __name__ == "__main__":
     unittest.main()

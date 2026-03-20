@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Callable, Dict, List, Tuple
-import re
 
 import numpy as np
 import pandas as pd
@@ -50,6 +50,7 @@ _REGIME_FRAME_TABLE_CACHE: Dict[
     ],
     pd.DataFrame,
 ] = {}
+_BASE_STATS_CACHE: Dict[tuple[object, ...], Stats] = {}
 
 
 @njit(cache=True)
@@ -278,6 +279,77 @@ def _numba_accumulate_for_date(
             daily_rise[h_idx, date_idx] = kept_pos / kept_count
 
 
+@njit(cache=True)
+def _numba_accumulate_all_stock_window(
+    prices,
+    start_idx,
+    end_idx,
+    horizon_offsets,
+    counts,
+    sum_ret,
+    sum_log,
+    pos_counts,
+    geom_invalid,
+    daily_arith,
+    daily_rise,
+    write_daily,
+):
+    """
+    전체 종목 기본 패턴(no filter/no exit)의 날짜 구간 집계를 한 번에 누적한다.
+    """
+
+    num_dates = prices.shape[0]
+    num_codes = prices.shape[1]
+    num_h = len(horizon_offsets)
+
+    for date_idx in range(start_idx, end_idx):
+        for h_idx in range(num_h):
+            step = int(horizon_offsets[h_idx])
+            fwd_idx = date_idx + step
+            if fwd_idx >= num_dates:
+                continue
+
+            kept_count = 0
+            kept_pos = 0
+            kept_sum_ret = 0.0
+            kept_sum_log = 0.0
+            has_geom_invalid = False
+
+            for code_idx in range(num_codes):
+                base = prices[date_idx, code_idx]
+                if not np.isfinite(base) or base <= 0.0:
+                    continue
+
+                fwd = prices[fwd_idx, code_idx]
+                if not np.isfinite(fwd) or fwd <= 0.0:
+                    continue
+
+                ret = fwd / base - 1.0
+                kept_count += 1
+                kept_sum_ret += ret
+                if ret > 0.0:
+                    kept_pos += 1
+                if ret <= -1.0:
+                    has_geom_invalid = True
+                else:
+                    kept_sum_log += np.log1p(ret)
+
+            if kept_count == 0:
+                continue
+
+            counts[h_idx, date_idx] = kept_count
+            pos_counts[h_idx, date_idx] = kept_pos
+            sum_ret[h_idx, date_idx] = kept_sum_ret
+            if has_geom_invalid:
+                geom_invalid[h_idx, date_idx] = True
+            else:
+                sum_log[h_idx, date_idx] = kept_sum_log
+
+            if write_daily:
+                daily_arith[h_idx, date_idx] = kept_sum_ret / kept_count
+                daily_rise[h_idx, date_idx] = kept_pos / kept_count
+
+
 def _infer_pattern_label(pattern_fn: BasePattern, idx: int) -> str:
     """
     패턴 표시 이름을 결정한다.
@@ -348,33 +420,76 @@ def _normalize_analyze_by(mode: str | None) -> str:
     raise ValueError("by는 'event' 또는 'day'여야 합니다.")
 
 
-def _parse_lookback_window(lookback: int | str) -> int:
-    """
-    lookback 입력(정수/문자열)을 거래일 수로 변환한다.
-    """
+def _callable_cache_key(fn) -> tuple[object, ...] | None:
+    if fn is None:
+        return None
 
-    if isinstance(lookback, (int, np.integer)):
-        if lookback <= 0:
-            raise ValueError("lookback은 1 이상이어야 합니다.")
-        return int(lookback)
+    defaults = getattr(fn, "__defaults__", None)
+    kwdefaults = getattr(fn, "__kwdefaults__", None)
+    closure = getattr(fn, "__closure__", None)
+    code = getattr(fn, "__code__", None)
+    closure_values = None
+    if closure is not None:
+        closure_values = tuple(_freeze_cache_value(cell.cell_contents) for cell in closure)
+    return (
+        "callable",
+        getattr(fn, "__module__", type(fn).__module__),
+        getattr(fn, "__qualname__", type(fn).__qualname__),
+        None if code is None else (code.co_filename, code.co_firstlineno, code.co_name),
+        _freeze_cache_value(defaults),
+        _freeze_cache_value(kwdefaults),
+        closure_values,
+    )
 
-    text = str(lookback).strip().upper()
-    m = re.fullmatch(r"(\d+)([DWMY])", text)
-    if m is None:
-        raise ValueError("lookback은 양의 정수 또는 '20D'/'12W'/'6M'/'1Y' 형식이어야 합니다.")
-    value = int(m.group(1))
-    unit = m.group(2)
-    if value <= 0:
-        raise ValueError("lookback 값은 1 이상이어야 합니다.")
-    if unit == "D":
+
+def _freeze_cache_value(value):
+    if value is None or isinstance(value, (str, int, bool)):
         return value
-    if unit == "W":
-        return value * 5
-    if unit == "M":
-        return value * 21
-    if unit == "Y":
-        return value * TRADING_DAYS_PER_YEAR
-    raise ValueError("지원하지 않는 lookback 단위입니다. D/W/M/Y만 사용 가능합니다.")
+    if isinstance(value, float):
+        if np.isnan(value):
+            return ("float", "nan")
+        return ("float", float(value))
+    if isinstance(value, np.generic):
+        return _freeze_cache_value(value.item())
+    if isinstance(value, SimpleNamespace):
+        return tuple((key, _freeze_cache_value(val)) for key, val in sorted(vars(value).items()))
+    if isinstance(value, Regime):
+        return ("regime", value.cache_key())
+    if isinstance(value, BasePattern):
+        return _pattern_cache_signature(value)
+    if isinstance(value, dict):
+        return tuple((str(key), _freeze_cache_value(val)) for key, val in sorted(value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_cache_value(item) for item in value)
+    if callable(value):
+        return _callable_cache_key(value)
+    return (type(value).__qualname__, repr(value))
+
+
+def _pattern_cache_signature(pattern_fn: BasePattern) -> tuple[object, ...]:
+    left = getattr(pattern_fn, "left", None)
+    right = getattr(pattern_fn, "right", None)
+    child = getattr(pattern_fn, "pattern", None)
+    regimes = tuple(
+        regime.cache_key()
+        for regime in getattr(pattern_fn, "_regimes", ())
+        if isinstance(regime, Regime)
+    )
+    return (
+        type(pattern_fn).__qualname__,
+        ("trim_quantile", _freeze_cache_value(getattr(pattern_fn, "trim_quantile", None))),
+        ("trim_method", _freeze_cache_value(getattr(pattern_fn, "trim_method", None))),
+        ("market_name", _freeze_cache_value(getattr(pattern_fn, "market_name", None))),
+        ("market_field", _freeze_cache_value(getattr(pattern_fn, "market_field", None))),
+        ("params", _freeze_cache_value(getattr(pattern_fn, "params", None))),
+        ("post_mask", _callable_cache_key(getattr(pattern_fn, "_post_mask_fn", None))),
+        ("trade_profile", _freeze_cache_value(pattern_fn._trade_profile())),
+        ("nmax_profile", _freeze_cache_value(pattern_fn._resolved_nmax_profile())),
+        ("regimes", regimes),
+        ("left", _pattern_cache_signature(left) if isinstance(left, BasePattern) else None),
+        ("right", _pattern_cache_signature(right) if isinstance(right, BasePattern) else None),
+        ("pattern", _pattern_cache_signature(child) if isinstance(child, BasePattern) else None),
+    )
 
 
 class Backtest:
@@ -431,7 +546,6 @@ class Backtest:
         self._pattern_trade_profile_cache: Dict[
             tuple[str, bool], Dict[int, tuple[object | None, float | None, float | None, float | None]]
         ] = {}
-        self._all_stock_metric_cache: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._all_opportunity_count_cache: np.ndarray | None = None
         self._stock_field_matrix_cache: Dict[str, np.ndarray] = {}
         self._pattern_nmax_node_cache: Dict[
@@ -443,17 +557,22 @@ class Backtest:
         self._vwap_matrix: np.ndarray | None = None
         if self.benchmark is not None:
             base_name = _infer_pattern_label(self.benchmark, 0)
-            self._invalidate_runtime_cache(base_name)
             base_trim_q, base_trim_method = _infer_pattern_trim_config(self.benchmark)
-            self._base_stats[base_name] = self._run_pattern(
-                self.benchmark,
-                trim_quantile=base_trim_q,
-                trim_method=base_trim_method,
-                progress_label=base_name,
-                aggregation_mode=self.by,
-                filter_obj=None,
-                cache_name=base_name,
-            )
+            base_cache_key = self._base_stats_cache_key(self.benchmark, self.by)
+            if base_cache_key in _BASE_STATS_CACHE:
+                self._base_stats[base_name] = _BASE_STATS_CACHE[base_cache_key]
+            else:
+                self._invalidate_runtime_cache(base_name)
+                self._base_stats[base_name] = self._run_pattern(
+                    self.benchmark,
+                    trim_quantile=base_trim_q,
+                    trim_method=base_trim_method,
+                    progress_label=base_name,
+                    aggregation_mode=self.by,
+                    filter_obj=None,
+                    cache_name=base_name,
+                )
+                _BASE_STATS_CACHE[base_cache_key] = self._base_stats[base_name]
             self._analyzed_patterns[base_name] = self.benchmark
             self._analyzed_stats[base_name] = self._base_stats[base_name]
             self._analyzed_filters[base_name] = None
@@ -482,6 +601,23 @@ class Backtest:
             type(pattern_fn) is AllStockPattern
             and pattern_fn.market_name is None
             and pattern_fn._post_mask_fn is AllStockPattern._post_mask_base
+        )
+
+    def _base_stats_cache_key(
+        self,
+        pattern_fn: BasePattern,
+        aggregation_mode: str,
+    ) -> tuple[object, ...]:
+        dates = self.dates
+        return (
+            self.univ.cache_key(),
+            int(len(dates)),
+            str(pd.Timestamp(dates[0]).date()) if len(dates) > 0 else "empty",
+            str(pd.Timestamp(dates[-1]).date()) if len(dates) > 0 else "empty",
+            int(self.start_idx),
+            int(self.end_idx),
+            str(_normalize_analyze_by(aggregation_mode)),
+            _pattern_cache_signature(pattern_fn),
         )
 
     def _get_market_values(self, market: str, field: str) -> np.ndarray:
@@ -938,6 +1074,64 @@ class Backtest:
         )
         return stats
 
+    def _run_pattern_default_price_fast(
+        self,
+        pattern_fn: BasePattern,
+        progress_label: str,
+        aggregation_mode: str,
+        cache_name: str | None = None,
+    ) -> Stats:
+        """
+        전체 종목 기본 패턴(no trim/no filter/no exit)을 빠르게 집계한다.
+        """
+
+        agg_mode = _normalize_analyze_by(aggregation_mode)
+        write_daily = agg_mode == AGG_MODE_DAY
+        stats = Stats.create_daily(self.dates, HORIZONS) if write_daily else Stats.create(self.dates, HORIZONS)
+        stats.eval_start_idx = self.start_idx
+        stats.eval_end_idx = self.end_idx
+        eval_len = max(0, self.end_idx - self.start_idx)
+        if cache_name is not None:
+            mask_matrix = self._build_mask_matrix(pattern_fn, eval_len)
+            self._store_runtime_cache(cache_name, mask_matrix=mask_matrix)
+        if eval_len <= 0:
+            return stats
+
+        if write_daily:
+            daily_arith = stats.daily_arith
+            daily_rise = stats.daily_rise
+            if daily_arith is None or daily_rise is None:
+                raise ValueError("daily 집계에는 daily 통계 버퍼가 필요합니다.")
+            progress_desc = f"{progress_label} | day"
+        else:
+            daily_arith = np.full((1, 1), np.nan, dtype=np.float64)
+            daily_rise = np.full((1, 1), np.nan, dtype=np.float64)
+            progress_desc = f"{progress_label} | dates"
+
+        chunk_size = 256
+        progress_bar = _progress(total=eval_len, desc=progress_desc)
+        try:
+            for chunk_start in range(self.start_idx, self.end_idx, chunk_size):
+                chunk_end = min(self.end_idx, chunk_start + chunk_size)
+                _numba_accumulate_all_stock_window(
+                    self.prices,
+                    chunk_start,
+                    chunk_end,
+                    self.horizon_offsets,
+                    stats.counts,
+                    stats.sum_ret,
+                    stats.sum_log,
+                    stats.pos_counts,
+                    stats.geom_invalid,
+                    daily_arith,
+                    daily_rise,
+                    write_daily,
+                )
+                progress_bar.update(chunk_end - chunk_start)
+        finally:
+            progress_bar.close()
+        return stats
+
     def _build_mask_matrix(
         self,
         pattern_fn: BasePattern,
@@ -1162,7 +1356,8 @@ class Backtest:
 
         iterator = range(mask_matrix.shape[0])
         if progress_bar is None:
-            iterator = _progress(iterator, desc=f"{progress_label} | trim")
+            progress_mode = "trim" if trim_q > 0.0 else "day"
+            iterator = _progress(iterator, desc=f"{progress_label} | {progress_mode}")
 
         if dynamic_exit_index is None:
             dynamic_exit_index = np.full((1, 1), -1, dtype=np.int32)
@@ -1213,7 +1408,8 @@ class Backtest:
 
         iterator = range(mask_matrix.shape[0])
         if progress_bar is None:
-            iterator = _progress(iterator, desc=f"{progress_label} | trim")
+            progress_mode = "trim" if trim_q > 0.0 else "day"
+            iterator = _progress(iterator, desc=f"{progress_label} | {progress_mode}")
 
         if dynamic_exit_index is None:
             dynamic_exit_index = np.full((1, 1), -1, dtype=np.int32)
@@ -1629,6 +1825,18 @@ class Backtest:
                 cache_name=cache_name,
             )
 
+        if (
+            (trim_q is None or trim_q <= 0.0)
+            and self._is_default_price_pattern(pattern_fn)
+            and pattern_fn._resolved_max_cohort_size() is None
+        ):
+            return self._run_pattern_default_price_fast(
+                pattern_fn,
+                progress_label=progress_label,
+                aggregation_mode=agg_mode,
+                cache_name=cache_name,
+            )
+
         if agg_mode == AGG_MODE_EVENT:
             if trim_q is None or trim_q <= 0.0:
                 return self._run_pattern_normal(
@@ -1868,98 +2076,6 @@ class Backtest:
         self._pattern_trade_profile_cache[cache_key] = dict(id_to_profile)
         return policy_id_matrix, dict(id_to_profile)
 
-    def _all_stock_history_metrics(
-        self,
-        horizon_days: int,
-        lookback_window: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        전체 종목 기준 horizon 산술/기하/상승확률 히스토리를 계산한다.
-        """
-
-        cache_key = (int(horizon_days), int(lookback_window))
-        if cache_key in self._all_stock_metric_cache:
-            return self._all_stock_metric_cache[cache_key]
-
-        prices = self.prices
-        num_dates, _ = prices.shape
-        counts = np.zeros(num_dates, dtype=np.float64)
-        sum_ret = np.zeros(num_dates, dtype=np.float64)
-        sum_log = np.zeros(num_dates, dtype=np.float64)
-        pos_counts = np.zeros(num_dates, dtype=np.float64)
-        invalid = np.zeros(num_dates, dtype=np.bool_)
-
-        for i in range(0, max(0, num_dates - horizon_days)):
-            base = prices[i]
-            fwd = prices[i + horizon_days]
-            valid = np.isfinite(base) & np.isfinite(fwd) & (base > 0.0) & (fwd > 0.0)
-            if not np.any(valid):
-                continue
-
-            ret = fwd[valid] / base[valid] - 1.0
-            cnt = ret.shape[0]
-            if cnt <= 0:
-                continue
-
-            counts[i] = float(cnt)
-            sum_ret[i] = float(ret.sum())
-            pos_counts[i] = float(np.sum(ret > 0.0))
-            if np.any(ret <= -1.0):
-                invalid[i] = True
-            else:
-                sum_log[i] = float(np.log1p(ret).sum())
-
-        window = int(max(1, lookback_window))
-        roll_counts = (
-            pd.Series(counts).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
-        )
-        roll_sum_ret = (
-            pd.Series(sum_ret).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
-        )
-        roll_sum_log = (
-            pd.Series(sum_log).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
-        )
-        roll_pos = (
-            pd.Series(pos_counts).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
-        )
-        roll_invalid = (
-            pd.Series(invalid.astype(np.float64))
-            .rolling(window=window, min_periods=1)
-            .sum()
-            .to_numpy(dtype=np.float64)
-            > 0.0
-        )
-
-        arith_base = np.full(num_dates, np.nan, dtype=np.float64)
-        geom_base = np.full(num_dates, np.nan, dtype=np.float64)
-        rise_base = np.full(num_dates, np.nan, dtype=np.float64)
-
-        valid = roll_counts > 0.0
-        arith_base[valid] = roll_sum_ret[valid] / roll_counts[valid]
-        rise_base[valid] = roll_pos[valid] / roll_counts[valid]
-        valid_geom = valid & (~roll_invalid)
-        geom_base[valid_geom] = np.exp(roll_sum_log[valid_geom] / roll_counts[valid_geom]) - 1.0
-
-        support = np.arange(num_dates) >= (window - 1)
-        arith_base[~support] = np.nan
-        geom_base[~support] = np.nan
-        rise_base[~support] = np.nan
-
-        def _asof_shift(series: np.ndarray) -> np.ndarray:
-            shifted = np.full(num_dates, np.nan, dtype=np.float64)
-            if horizon_days > 0:
-                if horizon_days < num_dates:
-                    shifted[horizon_days:] = series[:-horizon_days]
-            else:
-                shifted[:] = series
-            return shifted
-
-        arith_asof = _asof_shift(arith_base)
-        geom_asof = _asof_shift(geom_base)
-        rise_asof = _asof_shift(rise_base)
-        self._all_stock_metric_cache[cache_key] = (arith_asof, geom_asof, rise_asof)
-        return arith_asof, geom_asof, rise_asof
-
     def _all_stock_opportunity_counts(self) -> np.ndarray:
         """
         horizon별 전체 종목의 유효 event 기회 수를 일자축으로 반환한다.
@@ -2115,15 +2231,7 @@ class Backtest:
         end=None,
         pattern: str = "",
         target_horizon: str | int = "1M",
-        aggregate_lookback: int | str = TRADING_DAYS_PER_YEAR,
         trade_price_mode: str = "익일VWAP",
-        fallback_exposure: float = 0.5,
-        gate_geom_min: float = 0.0,
-        gate_arith_min: float = 0.0,
-        gate_rise_min: float = 0.5,
-        gate_use_geom: bool = False,
-        gate_use_arith: bool = False,
-        gate_use_rise: bool = False,
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
         allow_reentry: bool = True,
@@ -2139,9 +2247,7 @@ class Backtest:
                 f"analyze() 결과에서 pattern '{pattern}'을 찾을 수 없습니다. "
                 f"사용 가능: {available}"
             )
-
         horizon_label, horizon_days = self._resolve_horizon(target_horizon)
-        lookback_window = _parse_lookback_window(aggregate_lookback)
 
         run_start = pd.Timestamp(self.start if start is None else start)
         run_end = pd.Timestamp(self.end if end is None else end)
@@ -2154,9 +2260,8 @@ class Backtest:
         if end_idx - start_idx < 2:
             raise ValueError("run 구간에 최소 2개 이상의 거래일이 필요합니다.")
 
-        # 2) 패턴/시장 통계 시계열 준비
+        # 2) 패턴 실행 준비
         pattern_fn = self._analyzed_patterns[pattern]
-        pattern_stats = self._analyzed_stats[pattern]
         pattern_filter = self._pattern_filter(pattern)
         max_cohort_size = pattern_fn._resolved_max_cohort_size()
         pattern_mask = self._build_pattern_mask_matrix(
@@ -2182,28 +2287,6 @@ class Backtest:
                 horizon_days,
             )
 
-        pattern_hist = pattern_stats.to_frame_history(
-            horizon=horizon_label,
-            start=None,
-            end=None,
-            history_window=lookback_window,
-            min_count=1,
-            require_full_window=True,
-        )
-        pattern_arith_series = (
-            pattern_hist["arith_mean"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
-        )
-        pattern_geom_series = (
-            pattern_hist["geom_mean"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
-        )
-        pattern_rise_series = (
-            pattern_hist["rise_prob"].reindex(pd.DatetimeIndex(self.dates)).to_numpy(dtype=np.float64)
-        )
-        (
-            all_stock_arith_series,
-            all_stock_geom_series,
-            all_stock_rise_series,
-        ) = self._all_stock_history_metrics(horizon_days, lookback_window)
         if self.code_names:
             code_names = dict(self.code_names)
         else:
@@ -2253,7 +2336,6 @@ class Backtest:
             pattern=pattern,
             target_horizon=horizon_label,
             target_horizon_days=horizon_days,
-            aggregate_lookback=aggregate_lookback,
             pattern_mask=pattern_mask,
             pattern_policy_id_matrix=pattern_policy_id_matrix,
             policy_horizon_days=policy_horizon_days,
@@ -2262,19 +2344,6 @@ class Backtest:
             policy_cohort_scale=policy_cohort_scale,
             pattern_exit_mask=pattern_exit_mask,
             pattern_dynamic_exit_index=pattern_dynamic_exit_index,
-            pattern_arith_series=pattern_arith_series,
-            pattern_geom_series=pattern_geom_series,
-            pattern_rise_series=pattern_rise_series,
-            all_stock_arith_series=all_stock_arith_series,
-            all_stock_geom_series=all_stock_geom_series,
-            all_stock_rise_series=all_stock_rise_series,
-            fallback_exposure=fallback_exposure,
-            gate_geom_min=gate_geom_min,
-            gate_arith_min=gate_arith_min,
-            gate_rise_min=gate_rise_min,
-            gate_use_geom=gate_use_geom,
-            gate_use_arith=gate_use_arith,
-            gate_use_rise=gate_use_rise,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
             execution_lag_days=execution_lag_days,

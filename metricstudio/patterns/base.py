@@ -184,15 +184,6 @@ class BasePattern:
         return self
 
     @staticmethod
-    def _normalize_loss_cut(loss_cut: str | None) -> str | None:
-        if loss_cut is None:
-            return None
-        loss_cut_text = str(loss_cut).strip().lower().replace("-", "_").replace(" ", "_")
-        if loss_cut_text not in {"mid_stop", "trailing_stop"}:
-            raise ValueError("loss_cut은 현재 'mid_stop' 또는 'trailing_stop'만 지원합니다.")
-        return loss_cut_text
-
-    @staticmethod
     def _normalize_trim_quantile(quantile: float) -> float:
         value = float(quantile)
         if not np.isfinite(value) or value < 0.0 or value >= 0.5:

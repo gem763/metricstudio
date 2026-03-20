@@ -32,14 +32,6 @@ class Simulator:
     pattern: str | None = field(default=None, init=False)
     target_horizon: str | None = field(default=None, init=False)
     target_horizon_days: int | None = field(default=None, init=False)
-    aggregate_lookback: int | str | None = field(default=None, init=False)
-    fallback_exposure: float | None = field(default=None, init=False)
-    gate_geom_min: float | None = field(default=None, init=False)
-    gate_arith_min: float | None = field(default=None, init=False)
-    gate_rise_min: float | None = field(default=None, init=False)
-    gate_use_geom: bool | None = field(default=None, init=False)
-    gate_use_arith: bool | None = field(default=None, init=False)
-    gate_use_rise: bool | None = field(default=None, init=False)
     stop_loss_pct: float | None = field(default=None, init=False)
     take_profit_pct: float | None = field(default=None, init=False)
     execution_lag_days: int | None = field(default=None, init=False)
@@ -135,34 +127,6 @@ class Simulator:
         if value <= 0.0 or value >= 1.0:
             raise ValueError("stop_loss_pct는 0~1(소수) 또는 1~100(%) 범위여야 합니다.")
         return value
-
-    @staticmethod
-    def _normalize_return_gate_min(value: float, name: str) -> float:
-        """
-        산술/기하 수익률 최소 기준값을 정규화한다.
-        """
-
-        out = float(value)
-        if not np.isfinite(out):
-            raise ValueError(f"{name}는 유한한 숫자여야 합니다.")
-        if out <= -1.0:
-            raise ValueError(f"{name}는 -1보다 커야 합니다.")
-        return out
-
-    @staticmethod
-    def _normalize_rise_gate_min(value: float) -> float:
-        """
-        상승확률 최소 기준값을 소수 비율(예: 0.55=55%)로 정규화한다.
-        """
-
-        out = float(value)
-        if not np.isfinite(out):
-            raise ValueError("gate_rise_min은 유한한 숫자여야 합니다.")
-        if out > 1.0:
-            out = out / 100.0
-        if out < 0.0 or out > 1.0:
-            raise ValueError("gate_rise_min은 0~1(소수) 또는 0~100(%) 범위여야 합니다.")
-        return out
 
     @staticmethod
     def _normalize_take_profit_pct(take_profit_pct: float | None) -> float | None:
@@ -325,20 +289,6 @@ class Simulator:
             "pattern": str(self.pattern),
             "target_horizon": str(self.target_horizon),
             "target_horizon_days": float(self.target_horizon_days),
-            "aggregate_lookback": str(self.aggregate_lookback),
-            "fallback_exposure": float(self.fallback_exposure),
-            "gate_geom_min": float(self.gate_geom_min)
-            if self.gate_geom_min is not None
-            else float("nan"),
-            "gate_arith_min": float(self.gate_arith_min)
-            if self.gate_arith_min is not None
-            else float("nan"),
-            "gate_rise_min": float(self.gate_rise_min)
-            if self.gate_rise_min is not None
-            else float("nan"),
-            "gate_use_geom": bool(self.gate_use_geom) if self.gate_use_geom is not None else False,
-            "gate_use_arith": bool(self.gate_use_arith) if self.gate_use_arith is not None else False,
-            "gate_use_rise": bool(self.gate_use_rise) if self.gate_use_rise is not None else False,
             "stop_loss_pct": float(self.stop_loss_pct) if self.stop_loss_pct is not None else float("nan"),
             "take_profit_pct": float(self.take_profit_pct)
             if self.take_profit_pct is not None
@@ -418,7 +368,6 @@ class Simulator:
         pattern: str,
         target_horizon: str,
         target_horizon_days: int,
-        aggregate_lookback: int | str,
         pattern_mask: np.ndarray,
         pattern_policy_id_matrix: np.ndarray | None,
         policy_horizon_days: np.ndarray | None,
@@ -427,19 +376,6 @@ class Simulator:
         policy_cohort_scale: np.ndarray | None,
         pattern_exit_mask: np.ndarray | None,
         pattern_dynamic_exit_index: np.ndarray | None,
-        pattern_arith_series: np.ndarray,
-        pattern_geom_series: np.ndarray,
-        pattern_rise_series: np.ndarray,
-        all_stock_arith_series: np.ndarray,
-        all_stock_geom_series: np.ndarray,
-        all_stock_rise_series: np.ndarray,
-        fallback_exposure: float = 0.5,
-        gate_geom_min: float = 0.0,
-        gate_arith_min: float = 0.0,
-        gate_rise_min: float = 0.5,
-        gate_use_geom: bool = False,
-        gate_use_arith: bool = False,
-        gate_use_rise: bool = False,
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
         execution_lag_days: int = 1,
@@ -449,13 +385,11 @@ class Simulator:
         max_cohort_size: int | None = None,
     ) -> Simulator:
         """
-        코호트별 fallback을 적용한 포트폴리오 시뮬레이션.
+        패턴 신호를 코호트 포트폴리오로 시뮬레이션한다.
 
         - 기본 코호트 크기: 전체자산의 1/horizon
-        - 진입일 신호 기준으로 코호트 단위만 100% 또는 fallback_exposure 배정
-        - 게이트 조건: 활성화된 지표(geom/arith/rise) 각각에 대해
-          pattern_metric > max(metric_min, market_metric)
-        - gate_use_geom/gate_use_arith/gate_use_rise 중 최소 1개는 True여야 함
+        - 선택된 신규 코호트는 기본적으로 100% 크기로 진입
+        - branch별 `policy_cohort_scale`이 있으면 그 비율을 추가 적용
         - 종목별 비중 상한은 적용하지 않음(동등비중)
         """
 
@@ -468,18 +402,6 @@ class Simulator:
         if lag_days not in {0, 1}:
             raise ValueError("execution_lag_days는 0(당일) 또는 1(익일)만 지원합니다.")
 
-        fallback_exposure_value = float(fallback_exposure)
-        gate_geom_min_value = self._normalize_return_gate_min(
-            gate_geom_min, "gate_geom_min"
-        )
-        gate_arith_min_value = self._normalize_return_gate_min(
-            gate_arith_min, "gate_arith_min"
-        )
-        gate_rise_min_value = self._normalize_rise_gate_min(gate_rise_min)
-        gate_use_geom_value = bool(gate_use_geom)
-        gate_use_arith_value = bool(gate_use_arith)
-        gate_use_rise_value = bool(gate_use_rise)
-        use_gate = gate_use_geom_value or gate_use_arith_value or gate_use_rise_value
         stop_loss_value = self._normalize_stop_loss_pct(stop_loss_pct)
         take_profit_value = self._normalize_take_profit_pct(take_profit_pct)
         allow_reentry_value = bool(allow_reentry)
@@ -535,12 +457,6 @@ class Simulator:
         selected_count = np.full(len(self.dates), np.nan, dtype=np.float64)
         active_count = np.full(len(self.dates), np.nan, dtype=np.float64)
         turnover = np.full(len(self.dates), np.nan, dtype=np.float64)
-        pattern_arith_out = np.full(len(self.dates), np.nan, dtype=np.float64)
-        all_arith_out = np.full(len(self.dates), np.nan, dtype=np.float64)
-        pattern_geom_out = np.full(len(self.dates), np.nan, dtype=np.float64)
-        all_geom_out = np.full(len(self.dates), np.nan, dtype=np.float64)
-        pattern_rise_out = np.full(len(self.dates), np.nan, dtype=np.float64)
-        all_rise_out = np.full(len(self.dates), np.nan, dtype=np.float64)
 
         wealth[start_idx] = 1.0
         turnover[start_idx] = 0.0
@@ -714,43 +630,9 @@ class Simulator:
                 next_active.append(bucket)
             active_buckets = next_active
 
-            # 3) 신규 코호트 진입(신호일 t에서 코호트별 fallback 여부 결정)
+            # 3) 신규 코호트 진입
             if selected.size > 0:
                 curr_wealth = self._portfolio_value(cash, active_buckets)
-
-                pattern_arith = pattern_arith_series[signal_idx]
-                market_arith = all_stock_arith_series[signal_idx]
-                pattern_geom = pattern_geom_series[signal_idx]
-                market_geom = all_stock_geom_series[signal_idx]
-                pattern_rise = pattern_rise_series[signal_idx]
-                market_rise = all_stock_rise_series[signal_idx]
-                has_metrics = (
-                    np.isfinite(pattern_arith)
-                    and np.isfinite(market_arith)
-                    and np.isfinite(pattern_geom)
-                    and np.isfinite(market_geom)
-                    and np.isfinite(pattern_rise)
-                    and np.isfinite(market_rise)
-                )
-                if not use_gate:
-                    full_cohort = True
-                else:
-                    full_cohort = (
-                        has_metrics
-                        and (
-                            (not gate_use_geom_value)
-                            or (pattern_geom > max(gate_geom_min_value, market_geom))
-                        )
-                        and (
-                            (not gate_use_arith_value)
-                            or (pattern_arith > max(gate_arith_min_value, market_arith))
-                        )
-                        and (
-                            (not gate_use_rise_value)
-                            or (pattern_rise > max(gate_rise_min_value, market_rise))
-                        )
-                    )
-                cohort_scale = 1.0 if full_cohort else fallback_exposure_value
 
                 group_orders: list[tuple[np.ndarray, int, float | None, float | None, float]] = []
                 target_total = 0.0
@@ -780,7 +662,6 @@ class Simulator:
                     target_gross = (
                         curr_wealth
                         * (1.0 / float(group_horizon_days))
-                        * cohort_scale
                         * group_cohort_scale
                     )
                     if target_gross <= 0.0:
@@ -859,12 +740,6 @@ class Simulator:
             exposure[t] = invested_value / next_wealth if next_wealth > 0.0 else np.nan
             selected_count[t] = float(actual_selected)
             active_count[t] = float(total_active)
-            pattern_arith_out[t] = pattern_arith_series[signal_idx]
-            all_arith_out[t] = all_stock_arith_series[signal_idx]
-            pattern_geom_out[t] = pattern_geom_series[signal_idx]
-            all_geom_out[t] = all_stock_geom_series[signal_idx]
-            pattern_rise_out[t] = pattern_rise_series[signal_idx]
-            all_rise_out[t] = all_stock_rise_series[signal_idx]
             snapshots[t + 1] = self._clone_active_buckets(active_buckets)
 
         final_invested = 0.0
@@ -879,12 +754,6 @@ class Simulator:
         exposure[end_idx - 1] = final_invested / final_wealth if final_wealth > 0.0 else np.nan
         selected_count[end_idx - 1] = 0.0
         active_count[end_idx - 1] = float(final_active)
-        pattern_arith_out[end_idx - 1] = pattern_arith_series[end_idx - 1]
-        all_arith_out[end_idx - 1] = all_stock_arith_series[end_idx - 1]
-        pattern_geom_out[end_idx - 1] = pattern_geom_series[end_idx - 1]
-        all_geom_out[end_idx - 1] = all_stock_geom_series[end_idx - 1]
-        pattern_rise_out[end_idx - 1] = pattern_rise_series[end_idx - 1]
-        all_rise_out[end_idx - 1] = all_stock_rise_series[end_idx - 1]
 
         out_index = pd.DatetimeIndex(self.dates[start_idx:end_idx])
         out = pd.DataFrame(
@@ -893,12 +762,6 @@ class Simulator:
                 "exposure": exposure[start_idx:end_idx],
                 "selected_count": selected_count[start_idx:end_idx],
                 "active_count": active_count[start_idx:end_idx],
-                "pattern_arith_mean": pattern_arith_out[start_idx:end_idx],
-                "all_stock_arith_mean": all_arith_out[start_idx:end_idx],
-                "pattern_geom_mean": pattern_geom_out[start_idx:end_idx],
-                "all_stock_geom_mean": all_geom_out[start_idx:end_idx],
-                "pattern_rise_prob": pattern_rise_out[start_idx:end_idx],
-                "all_stock_rise_prob": all_rise_out[start_idx:end_idx],
             },
             index=out_index,
         )
@@ -978,14 +841,6 @@ class Simulator:
         out.attrs["pattern"] = pattern
         out.attrs["target_horizon"] = target_horizon
         out.attrs["target_horizon_days"] = horizon_days
-        out.attrs["aggregate_lookback"] = str(aggregate_lookback)
-        out.attrs["fallback_exposure"] = fallback_exposure_value
-        out.attrs["gate_geom_min"] = gate_geom_min_value
-        out.attrs["gate_arith_min"] = gate_arith_min_value
-        out.attrs["gate_rise_min"] = gate_rise_min_value
-        out.attrs["gate_use_geom"] = bool(gate_use_geom_value)
-        out.attrs["gate_use_arith"] = bool(gate_use_arith_value)
-        out.attrs["gate_use_rise"] = bool(gate_use_rise_value)
         out.attrs["stop_loss_pct"] = stop_loss_value if stop_loss_value is not None else float("nan")
         out.attrs["take_profit_pct"] = (
             take_profit_value if take_profit_value is not None else float("nan")
@@ -1010,14 +865,6 @@ class Simulator:
         self.pattern = pattern
         self.target_horizon = target_horizon
         self.target_horizon_days = horizon_days
-        self.aggregate_lookback = aggregate_lookback
-        self.fallback_exposure = fallback_exposure_value
-        self.gate_geom_min = gate_geom_min_value
-        self.gate_arith_min = gate_arith_min_value
-        self.gate_rise_min = gate_rise_min_value
-        self.gate_use_geom = bool(gate_use_geom_value)
-        self.gate_use_arith = bool(gate_use_arith_value)
-        self.gate_use_rise = bool(gate_use_rise_value)
         self.stop_loss_pct = stop_loss_value
         self.take_profit_pct = take_profit_value
         self.execution_lag_days = lag_days

@@ -156,10 +156,7 @@ sim = bt.run(
 핵심 입력:
 - `pattern`: `analyze()` 결과에 들어 있는 패턴 이름
 - `target_horizon`: 목표 보유기간. 예: `"1W"`, `"1M"`, `20`
-- `aggregate_lookback`: 패턴 히스토리 통계를 집계할 lookback
 - `trade_price_mode`: `"당일종가"`, `"익일종가"`, `"익일VWAP"`
-- `fallback_exposure`: 게이트 미충족 시 기본 노출
-- `gate_*`: geom/arith/rise 기준 게이트 옵션
 - `stop_loss_pct`, `take_profit_pct`: 기본 손절/익절
 - `allow_reentry`, `min_cohort_size`: 포지션 운용 옵션
 

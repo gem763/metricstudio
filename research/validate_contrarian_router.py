@@ -2,7 +2,7 @@
 contrarian 패턴을 trend 기준과 함께 재검증한다.
 
 비교 범위:
-- contrarian 레짐 inside에서 trend vs contra vs contra+exit
+- contrarian 레짐 inside에서 trend vs contra
 - 완화된 regime switch router
 """
 
@@ -60,11 +60,6 @@ def _build_contra_pattern(name: str, regime: Regime | None = None):
     return pattern.named(name)
 
 
-def _build_contra_with_exit(name: str, loss_cut: str):
-    stop = Bollinger(name=f"bollinger_{loss_cut}").on(loss_cut=loss_cut)
-    return (_build_contra_pattern(name) + stop).named(name)
-
-
 def build_contrarian_horizon_summary() -> pd.DataFrame:
     contrarian = Regime().on(kind="contrarian", market="kospi")
     bt = build_default_backtest(
@@ -75,8 +70,6 @@ def build_contrarian_horizon_summary() -> pd.DataFrame:
     patterns = [
         _build_trend_pattern("trend_amount1.5x"),
         _build_contra_pattern("loser5_mfi35"),
-        _build_contra_with_exit("loser5_mfi35_midstop", "mid_stop"),
-        _build_contra_with_exit("loser5_mfi35_trail", "trailing_stop"),
     ]
     bt.analyze(*patterns)
 
@@ -86,8 +79,6 @@ def build_contrarian_horizon_summary() -> pd.DataFrame:
             "benchmark",
             "trend_amount1.5x",
             "loser5_mfi35",
-            "loser5_mfi35_midstop",
-            "loser5_mfi35_trail",
         ]:
             sim = bt.run(
                 pattern=pattern_name,

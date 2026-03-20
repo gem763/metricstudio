@@ -13,7 +13,7 @@ from metricstudio.patterns.base import BasePattern
 
 class Bollinger(BasePattern):
     """
-    볼린저밴드 squeeze/breakout 계열 패턴과 선택적 exit 규칙.
+    볼린저밴드 squeeze/breakout 계열 패턴.
     """
 
     def __init__(self, *args, **kwargs):
@@ -45,10 +45,9 @@ class Bollinger(BasePattern):
         breakout_cooldown_days: int = 0,
         near_tolerance: float = 0.03,
         near_stay_days: int = 1,
-        loss_cut: Literal["mid_stop", "trailing_stop"] | None = None,
     ):
         """
-        밴드 폭, 돌파/근접 조건, 선택적 loss cut 규칙을 설정한다.
+        밴드 폭, 돌파/근접 조건을 설정한다.
         """
 
         trigger_text = None if trigger is None else str(trigger).lower()
@@ -82,39 +81,8 @@ class Bollinger(BasePattern):
             breakout_cooldown_days=int(max(0, breakout_cooldown_days)),
             near_tolerance=float(near_tolerance),
             near_stay_days=int(max(1, near_stay_days)),
-            loss_cut=self._normalize_loss_cut(loss_cut),
         )
         return self
-
-    def _required_stock_fields(self) -> tuple[str, ...]:
-        if self.params is None:
-            return ()
-        loss_cut = getattr(self.params, "loss_cut", None)
-        if loss_cut == "trailing_stop":
-            return ("high", "low")
-        return ()
-
-    def _get_trailing_atr(
-        self,
-        prices: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        high = self._get_stock_values("high")
-        low = self._get_stock_values("low")
-        if high.shape != prices.shape or low.shape != prices.shape:
-            raise ValueError("Bollinger trailing_stop 입력 시계열 shape이 일치하지 않습니다.")
-
-        cache_key = (
-            self._array_cache_token(prices),
-            self._array_cache_token(high),
-            self._array_cache_token(low),
-        )
-        cached_key = getattr(self, "_cached_trailing_atr_key", None)
-        cached_value = getattr(self, "_cached_trailing_atr_value", None)
-        if cached_key != cache_key or cached_value is None:
-            cached_value = u.average_true_range(high, low, prices, self.window)
-            self._cached_trailing_atr_key = cache_key
-            self._cached_trailing_atr_value = cached_value
-        return cached_value
 
     def _base_mask(self, values: np.ndarray) -> np.ndarray:
         prices = np.asarray(values, dtype=np.float64)
@@ -186,61 +154,6 @@ class Bollinger(BasePattern):
             return band_mask
 
         raise ValueError(f"지원하지 않는 trigger 종류입니다: {trigger}")
-
-    def _exit_mask(self, values: np.ndarray) -> np.ndarray:
-        prices = np.asarray(values, dtype=np.float64)
-        out = np.zeros(prices.shape[0], dtype=np.bool_)
-        if self.params is None:
-            raise ValueError("Bollinger는 사용 전에 on(...)으로 설정해야 합니다.")
-
-        loss_cut = getattr(self.params, "loss_cut", None)
-        if loss_cut is None:
-            return out
-        if loss_cut == "mid_stop":
-            if self.window <= 0 or prices.shape[0] < self.window:
-                return out
-
-            mean, valid_end = u.rolling_mean(prices, self.window)
-            valid = valid_end & np.isfinite(prices) & (prices > 0.0) & np.isfinite(mean)
-            out[valid] = prices[valid] < mean[valid]
-            return out
-        if loss_cut == "trailing_stop":
-            return out
-        raise ValueError(f"지원하지 않는 Bollinger loss_cut 입니다: {loss_cut}")
-
-    def has_exit_rule(self) -> bool:
-        return self.params is not None and getattr(self.params, "loss_cut", None) is not None
-
-    def has_entry_dependent_exit(self) -> bool:
-        return self.params is not None and getattr(self.params, "loss_cut", None) == "trailing_stop"
-
-    def first_exit_index(
-        self,
-        values: np.ndarray,
-        entry_idx: int,
-        last_idx: int,
-    ) -> int:
-        prices = np.asarray(values, dtype=np.float64)
-        if self.params is None:
-            raise ValueError("Bollinger는 사용 전에 on(...)으로 설정해야 합니다.")
-
-        loss_cut = getattr(self.params, "loss_cut", None)
-        if loss_cut != "trailing_stop":
-            return super().first_exit_index(prices, entry_idx, last_idx)
-        if self.window <= 0 or prices.shape[0] <= self.window:
-            return -1
-
-        atr, atr_valid_end = self._get_trailing_atr(prices)
-        return int(
-            u.trailing_stop_first_exit_index(
-                prices,
-                atr,
-                atr_valid_end,
-                int(entry_idx),
-                int(last_idx),
-                3.0,
-            )
-        )
 
 
 __all__ = ["Bollinger"]
