@@ -10,7 +10,7 @@ import pandas as pd
 
 from metricstudio.backtest import Backtest
 from metricstudio.univ import Univ
-from metricstudio.patterns import BasePattern, MFI
+from metricstudio.patterns import BasePattern, Bollinger, Disparity, MFI
 from metricstudio.regime import Regime
 from metricstudio.simulate import Simulator
 from metricstudio.stats import Stats, StatsCollection
@@ -159,6 +159,31 @@ class BacktestContextTests(unittest.TestCase):
 
         self.assertIs(renamed, pattern)
         self.assertEqual(pattern.name, "after")
+
+    def test_name_first_constructor_is_supported_for_windowed_patterns(self):
+        bollinger = Bollinger("bb", 30, 1.5)
+        disparity = Disparity("disp", 40)
+        mfi = MFI("mfi", 10)
+
+        self.assertEqual(bollinger.name, "bb")
+        self.assertEqual(bollinger.window, 30)
+        self.assertEqual(bollinger.sigma, 1.5)
+        self.assertEqual(disparity.name, "disp")
+        self.assertEqual(disparity.window, 40)
+        self.assertEqual(mfi.name, "mfi")
+        self.assertEqual(mfi.window, 10)
+
+    def test_legacy_window_first_constructor_style_remains_supported(self):
+        bollinger = Bollinger(30, name="bb")
+        disparity = Disparity(40, name="disp")
+        mfi = MFI(10, name="mfi")
+
+        self.assertEqual(bollinger.name, "bb")
+        self.assertEqual(bollinger.window, 30)
+        self.assertEqual(disparity.name, "disp")
+        self.assertEqual(disparity.window, 40)
+        self.assertEqual(mfi.name, "mfi")
+        self.assertEqual(mfi.window, 10)
 
     def test_apply_default_regime_wraps_pattern_without_attached_regime(self):
         bt = Backtest.__new__(Backtest)

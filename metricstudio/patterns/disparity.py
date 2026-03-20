@@ -15,11 +15,13 @@ class Disparity(BasePattern):
     이동평균 대비 이격도(disparity) 기반 역추세 패턴.
     """
 
-    def __init__(
-        self,
-        window: int = 20,
-        name: str | None = None,
-    ):
+    def __init__(self, *args, **kwargs):
+        name, window = self._resolve_name_window_init_args(
+            args,
+            kwargs,
+            default_window=20,
+            class_name=self.__class__.__name__,
+        )
         super().__init__(name=name)
         self.window = int(window)
 

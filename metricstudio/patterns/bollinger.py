@@ -16,12 +16,14 @@ class Bollinger(BasePattern):
     볼린저밴드 squeeze/breakout 계열 패턴과 선택적 exit 규칙.
     """
 
-    def __init__(
-        self,
-        window: int = 20,
-        sigma: float = 2.0,
-        name: str | None = None,
-    ):
+    def __init__(self, *args, **kwargs):
+        name, window, sigma = self._resolve_name_window_sigma_init_args(
+            args,
+            kwargs,
+            default_window=20,
+            default_sigma=2.0,
+            class_name=self.__class__.__name__,
+        )
         super().__init__(name=name)
         self.window = int(window)
         self.sigma = float(sigma)

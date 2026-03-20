@@ -442,7 +442,7 @@ def cooldown_mask(mask: np.ndarray, cooldown: int) -> np.ndarray:
     신호 발생 후 cooldown 기간 동안 재발생을 차단한다.
 
     입력 mask를 제자리(in-place)로 수정한다.
-    자세한 예시는 저장소 루트 `매뉴얼.md` 참고.
+    자세한 예시는 저장소 루트 `stay와 cooldown.md` 참고.
     """
     if cooldown <= 0:
         return mask
@@ -461,7 +461,7 @@ def cooldown_mask(mask: np.ndarray, cooldown: int) -> np.ndarray:
 def stay_mask(condition: np.ndarray, stay_days: int) -> np.ndarray:
     """
     condition이 stay_days일 이상 연속일 때만 True를 남긴다.
-    자세한 예시는 저장소 루트 `매뉴얼.md` 참고.
+    자세한 예시는 저장소 루트 `stay와 cooldown.md` 참고.
     """
     if stay_days <= 1:
         return condition.copy()
@@ -492,7 +492,7 @@ def stay_cooldown_mask(
 
     - stay_days: condition이 연속으로 유지되어야 하는 최소 일수(s)
     - cooldown_days: 이전 출현과의 최소 간격(c)
-    - 자세한 설명과 사례: 저장소 루트 `매뉴얼.md`
+    - 자세한 설명과 사례: 저장소 루트 `stay와 cooldown.md`
     """
     sustained = stay_mask(condition, stay_days)
     return cooldown_mask(sustained, cooldown_days)

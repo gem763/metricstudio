@@ -1,6 +1,7 @@
 # stay_cooldown_mask 매뉴얼
 
 관련 문서:
+- [API](API.md)
 - [패턴 가이드](패턴%20가이드.md)
 
 이 문서는 `metricstudio/util.py`의 `stay_mask`, `cooldown_mask`, `stay_cooldown_mask` 동작을 설명한다.

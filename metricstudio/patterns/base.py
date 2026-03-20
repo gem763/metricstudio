@@ -54,6 +54,105 @@ class BasePattern:
             raise ValueError("pattern name은 비어 있을 수 없습니다.")
         return text
 
+    @staticmethod
+    def _resolve_name_window_init_args(
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        *,
+        default_window: int,
+        class_name: str,
+    ) -> tuple[object | None, object]:
+        params = dict(kwargs)
+        has_name = "name" in params
+        has_window = "window" in params
+        name = params.pop("name", None)
+        window = params.pop("window", default_window)
+        if params:
+            unexpected = next(iter(params))
+            raise TypeError(f"{class_name}() got an unexpected keyword argument '{unexpected}'")
+        if len(args) > 2:
+            raise TypeError(f"{class_name}() takes at most 2 positional arguments but {len(args)} were given")
+        if not args:
+            return name, window
+
+        first = args[0]
+        if isinstance(first, str) or first is None:
+            if has_name:
+                raise TypeError(f"{class_name}() got multiple values for argument 'name'")
+            name = first
+            if len(args) == 2:
+                if has_window:
+                    raise TypeError(f"{class_name}() got multiple values for argument 'window'")
+                window = args[1]
+            return name, window
+
+        if has_window:
+            raise TypeError(f"{class_name}() got multiple values for argument 'window'")
+        window = first
+        if len(args) == 2:
+            if has_name:
+                raise TypeError(f"{class_name}() got multiple values for argument 'name'")
+            name = args[1]
+        return name, window
+
+    @staticmethod
+    def _resolve_name_window_sigma_init_args(
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        *,
+        default_window: int,
+        default_sigma: float,
+        class_name: str,
+    ) -> tuple[object | None, object, object]:
+        params = dict(kwargs)
+        has_name = "name" in params
+        has_window = "window" in params
+        has_sigma = "sigma" in params
+        name = params.pop("name", None)
+        window = params.pop("window", default_window)
+        sigma = params.pop("sigma", default_sigma)
+        if params:
+            unexpected = next(iter(params))
+            raise TypeError(f"{class_name}() got an unexpected keyword argument '{unexpected}'")
+        if len(args) > 3:
+            raise TypeError(f"{class_name}() takes at most 3 positional arguments but {len(args)} were given")
+        if not args:
+            return name, window, sigma
+
+        first = args[0]
+        if isinstance(first, str) or first is None:
+            if has_name:
+                raise TypeError(f"{class_name}() got multiple values for argument 'name'")
+            name = first
+            if len(args) >= 2:
+                if has_window:
+                    raise TypeError(f"{class_name}() got multiple values for argument 'window'")
+                window = args[1]
+            if len(args) == 3:
+                if has_sigma:
+                    raise TypeError(f"{class_name}() got multiple values for argument 'sigma'")
+                sigma = args[2]
+            return name, window, sigma
+
+        if has_window:
+            raise TypeError(f"{class_name}() got multiple values for argument 'window'")
+        window = first
+        if len(args) >= 2:
+            second = args[1]
+            if len(args) == 2 and (isinstance(second, str) or second is None):
+                if has_name:
+                    raise TypeError(f"{class_name}() got multiple values for argument 'name'")
+                name = second
+                return name, window, sigma
+            if has_sigma:
+                raise TypeError(f"{class_name}() got multiple values for argument 'sigma'")
+            sigma = second
+        if len(args) == 3:
+            if has_name:
+                raise TypeError(f"{class_name}() got multiple values for argument 'name'")
+            name = args[2]
+        return name, window, sigma
+
     def named(self, value: str | None):
         """
         표시/집계에 사용할 패턴 이름을 지정한다.

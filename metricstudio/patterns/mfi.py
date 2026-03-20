@@ -16,11 +16,13 @@ class MFI(BasePattern):
     Money Flow Index 기반 과매도/반등 패턴.
     """
 
-    def __init__(
-        self,
-        window: int = 14,
-        name: str | None = None,
-    ):
+    def __init__(self, *args, **kwargs):
+        name, window = self._resolve_name_window_init_args(
+            args,
+            kwargs,
+            default_window=14,
+            class_name=self.__class__.__name__,
+        )
         super().__init__(name=name)
         self.window = int(window)
 
