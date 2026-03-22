@@ -234,7 +234,9 @@ class DataLoader:
         with duckdb.connect(database=":memory:") as con:
             _configure_duckdb_connection(con)
             con.execute(
-                "CREATE VIEW adjusted_stock AS SELECT * FROM read_parquet(" + _quote_sql_text(parquet_glob) + ")"
+                "CREATE VIEW adjusted_stock AS SELECT * FROM read_parquet("
+                + _quote_sql_text(parquet_glob)
+                + ", union_by_name=true)"
             )
             return con.execute(str(query)).df()
 

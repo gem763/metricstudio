@@ -573,7 +573,7 @@ class BacktestContextTests(unittest.TestCase):
         sim.pattern = "demo"
         sim.target_horizon = "1M"
         sim.target_horizon_days = 20
-        sim.max_weight_per_stock = float("nan")
+        sim.max_weight_per_stock_in_cohort = float("nan")
         sim.run_years = 1.0
         sim.total_return = 0.05
         sim.cagr = 0.05
@@ -616,7 +616,7 @@ class BacktestContextTests(unittest.TestCase):
         sim.pattern = "demo"
         sim.target_horizon = "1M"
         sim.target_horizon_days = 20
-        sim.max_weight_per_stock = float("nan")
+        sim.max_weight_per_stock_in_cohort = float("nan")
         sim.run_years = 1.0
         sim.total_return = 0.05
         sim.cagr = 0.05
@@ -801,6 +801,91 @@ class BacktestContextTests(unittest.TestCase):
 
         self.assertEqual(len(sim.port_at(dates[1])), 2)
         self.assertTrue(np.isclose(sim.summary()["max_cohort_size"], 2.0))
+
+    def test_simulator_keeps_full_cohort_budget_with_partial_fill(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        prices = np.ones((4, 1), dtype=np.float64)
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A"],
+            buy_fee=0.0,
+            sell_fee=0.0,
+        )
+
+        pattern_mask = np.zeros((4, 1), dtype=np.bool_)
+        pattern_mask[1, 0] = True
+
+        sim.run(
+            start_idx=0,
+            end_idx=4,
+            pattern="partial_fill",
+            target_horizon="1M",
+            target_horizon_days=3,
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=None,
+            policy_horizon_days=np.asarray([3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0], dtype=np.float64),
+            pattern_exit_mask=np.zeros((4, 1), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+            max_weight_per_stock_in_cohort=0.2,
+        )
+
+        holding = sim.port_at(dates[1]).reset_index().iloc[0]
+        self.assertTrue(np.isclose(float(holding["value"]), 1.0 / 15.0))
+        self.assertTrue(np.isclose(float(holding["cohort_value"]), 1.0 / 3.0))
+        self.assertTrue(np.isclose(float(holding["weight_in_cohort"]), 0.2))
+        self.assertTrue(np.isclose(sim.summary()["max_weight_per_stock_in_cohort"], 0.2))
+
+    def test_simulator_fully_invests_single_selected_stock_by_default(self):
+        dates = pd.date_range("2025-01-01", periods=4, freq="B")
+        prices = np.ones((4, 1), dtype=np.float64)
+        sim = Simulator(
+            dates=dates.to_numpy(),
+            prices=prices,
+            codes=["A"],
+            buy_fee=0.0,
+            sell_fee=0.0,
+        )
+
+        pattern_mask = np.zeros((4, 1), dtype=np.bool_)
+        pattern_mask[1, 0] = True
+
+        sim.run(
+            start_idx=0,
+            end_idx=4,
+            pattern="full_fill",
+            target_horizon="1M",
+            target_horizon_days=3,
+            pattern_mask=pattern_mask,
+            pattern_policy_id_matrix=None,
+            policy_horizon_days=np.asarray([3], dtype=np.int32),
+            policy_stop_loss_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_take_profit_pct=np.asarray([np.nan], dtype=np.float64),
+            policy_cohort_scale=np.asarray([1.0], dtype=np.float64),
+            pattern_exit_mask=np.zeros((4, 1), dtype=np.bool_),
+            pattern_dynamic_exit_index=None,
+            stop_loss_pct=None,
+            take_profit_pct=None,
+            execution_lag_days=0,
+            execution_price_mode="same_close",
+            allow_reentry=True,
+            min_cohort_size=1,
+        )
+
+        holding = sim.port_at(dates[1]).reset_index().iloc[0]
+        self.assertTrue(np.isclose(float(holding["value"]), 1.0 / 3.0))
+        self.assertTrue(np.isclose(float(holding["cohort_value"]), 1.0 / 3.0))
+        self.assertTrue(np.isclose(float(holding["weight_in_cohort"]), 1.0))
+        self.assertTrue(np.isnan(sim.summary()["max_weight_per_stock_in_cohort"]))
 
     def test_simulator_respects_branch_specific_cohort_scale(self):
         dates = pd.date_range("2025-01-01", periods=4, freq="B")

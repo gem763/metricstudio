@@ -2403,6 +2403,7 @@ class Backtest:
         take_profit_pct: float | None = None,
         allow_reentry: bool = True,
         min_cohort_size: int = 1,
+        max_weight_per_stock_in_cohort: float | None = None,
     ) -> Simulator:
         """
         분석된 패턴 통계를 기반으로 포트폴리오 시뮬레이션을 실행하고 마지막 결과로 저장한다.
@@ -2518,6 +2519,7 @@ class Backtest:
             allow_reentry=allow_reentry,
             min_cohort_size=min_cohort_size,
             max_cohort_size=max_cohort_size,
+            max_weight_per_stock_in_cohort=max_weight_per_stock_in_cohort,
         )
         regime_mask = self._combined_regime_mask(pattern_fn)
         if regime_mask is not None and result.data is not None:

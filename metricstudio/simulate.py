@@ -36,7 +36,7 @@ class Simulator:
     take_profit_pct: float | None = field(default=None, init=False)
     execution_lag_days: int | None = field(default=None, init=False)
     execution_price_mode: str | None = field(default=None, init=False)
-    max_weight_per_stock: float | None = field(default=None, init=False)
+    max_weight_per_stock_in_cohort: float | None = field(default=None, init=False)
     allow_reentry: bool | None = field(default=None, init=False)
     min_cohort_size: int | None = field(default=None, init=False)
     max_cohort_size: int | None = field(default=None, init=False)
@@ -96,6 +96,7 @@ class Simulator:
                     "idx": np.asarray(bucket["idx"], dtype=np.int64).copy(),
                     "values": np.asarray(bucket["values"], dtype=np.float64).copy(),
                     "entry_values": np.asarray(bucket["entry_values"], dtype=np.float64).copy(),
+                    "cash_value": float(bucket.get("cash_value", 0.0)),
                     "age": int(bucket["age"]),
                     "entry_idx": int(bucket["entry_idx"]),
                     "signal_entry_idx": int(bucket.get("signal_entry_idx", bucket["entry_idx"])),
@@ -157,6 +158,7 @@ class Simulator:
         total = float(cash)
         for bucket in buckets:
             total += float(np.asarray(bucket["values"], dtype=np.float64).sum())
+            total += float(bucket.get("cash_value", 0.0))
         return total
 
     @staticmethod
@@ -224,7 +226,7 @@ class Simulator:
             stock_idx = np.asarray(bucket["idx"], dtype=np.int64)
             stock_vals = np.asarray(bucket["values"], dtype=np.float64)
             stock_entry_vals = np.asarray(bucket["entry_values"], dtype=np.float64)
-            cohort_value = float(stock_vals.sum())
+            cohort_value = float(stock_vals.sum()) + float(bucket.get("cash_value", 0.0))
             entry_idx = int(bucket["entry_idx"])
             entry_date = pd.Timestamp(self.dates[entry_idx]).date()
             age = int(bucket["age"])
@@ -299,7 +301,9 @@ class Simulator:
             "execution_price_mode": str(self.execution_price_mode)
             if self.execution_price_mode is not None
             else "none",
-            "max_weight_per_stock": float(self.max_weight_per_stock),
+            "max_weight_per_stock_in_cohort": float(self.max_weight_per_stock_in_cohort)
+            if self.max_weight_per_stock_in_cohort is not None
+            else float("nan"),
             "allow_reentry": bool(self.allow_reentry) if self.allow_reentry is not None else True,
             "min_cohort_size": float(self.min_cohort_size)
             if self.min_cohort_size is not None
@@ -383,6 +387,7 @@ class Simulator:
         allow_reentry: bool = True,
         min_cohort_size: int = 1,
         max_cohort_size: int | None = None,
+        max_weight_per_stock_in_cohort: float | None = None,
     ) -> Simulator:
         """
         패턴 신호를 코호트 포트폴리오로 시뮬레이션한다.
@@ -390,7 +395,7 @@ class Simulator:
         - 기본 코호트 크기: 전체자산의 1/horizon
         - 선택된 신규 코호트는 기본적으로 100% 크기로 진입
         - branch별 `policy_cohort_scale`이 있으면 그 비율을 추가 적용
-        - 종목별 비중 상한은 적용하지 않음(동등비중)
+        - `max_weight_per_stock_in_cohort`가 있으면 코호트 내 종목별 비중 상한을 적용하고 남는 금액은 코호트 현금으로 유지
         """
 
         horizon_days = int(target_horizon_days)
@@ -411,6 +416,17 @@ class Simulator:
         max_cohort_size_value = None if max_cohort_size is None else int(max_cohort_size)
         if max_cohort_size_value is not None and max_cohort_size_value <= 0:
             raise ValueError("max_cohort_size는 1 이상의 정수 또는 None이어야 합니다.")
+        max_weight_per_stock_in_cohort_value = (
+            None
+            if max_weight_per_stock_in_cohort is None
+            else float(max_weight_per_stock_in_cohort)
+        )
+        if max_weight_per_stock_in_cohort_value is not None and (
+            (not np.isfinite(max_weight_per_stock_in_cohort_value))
+            or max_weight_per_stock_in_cohort_value <= 0.0
+            or max_weight_per_stock_in_cohort_value > 1.0
+        ):
+            raise ValueError("max_weight_per_stock_in_cohort는 0보다 크고 1 이하여야 합니다.")
         buy_fee_value = float(self.buy_fee)
         sell_fee_value = float(self.sell_fee)
         if pattern_policy_id_matrix is None or pattern_policy_id_matrix.shape != pattern_mask.shape:
@@ -571,6 +587,7 @@ class Simulator:
                 idx = np.asarray(bucket["idx"], dtype=np.int64)
                 vals = np.asarray(bucket["values"], dtype=np.float64)
                 entry_vals = np.asarray(bucket["entry_values"], dtype=np.float64)
+                bucket_cash_value = float(bucket.get("cash_value", 0.0))
                 exit_mask = np.asarray(
                     bucket.get("exit_next_mask", np.zeros(idx.size, dtype=np.bool_)),
                     dtype=np.bool_,
@@ -584,10 +601,10 @@ class Simulator:
                     sell_fee_paid = gross_sell_value * sell_fee_value
                     total_sell_fee_paid += sell_fee_paid
                     net_sell_value = gross_sell_value - sell_fee_paid
-                    cash += net_sell_value
+                    cash += net_sell_value + bucket_cash_value
                     cohort_id = int(bucket["cohort_id"])
                     cohort_exit_net[cohort_id] = float(
-                        cohort_exit_net.get(cohort_id, 0.0) + net_sell_value
+                        cohort_exit_net.get(cohort_id, 0.0) + net_sell_value + bucket_cash_value
                     )
                     entry_net = float(cohort_entry_net.get(cohort_id, np.nan))
                     if np.isfinite(entry_net) and entry_net > 0.0:
@@ -617,6 +634,10 @@ class Simulator:
                         bucket.pop("exit_next_mask", None)
                         next_active.append(bucket)
                     else:
+                        cash += bucket_cash_value
+                        cohort_exit_net[cohort_id] = float(
+                            cohort_exit_net.get(cohort_id, 0.0) + bucket_cash_value
+                        )
                         entry_net = float(cohort_entry_net.get(cohort_id, np.nan))
                         if np.isfinite(entry_net) and entry_net > 0.0:
                             closed_cohort_returns.append(
@@ -692,16 +713,24 @@ class Simulator:
                     if invest_amount <= 0.0:
                         continue
 
-                    net_budget = invest_amount / (1.0 + buy_fee_value)
+                    gross_stock_spend = invest_amount
+                    if max_weight_per_stock_in_cohort_value is not None:
+                        per_stock_weight = min(
+                            1.0 / float(buy_idx.size),
+                            float(max_weight_per_stock_in_cohort_value),
+                        )
+                        gross_stock_spend = invest_amount * per_stock_weight * float(buy_idx.size)
+                    net_budget = gross_stock_spend / (1.0 + buy_fee_value)
                     per_stock_value = net_budget / float(buy_idx.size)
                     if per_stock_value <= 0.0:
                         continue
 
                     buy_values = np.full(buy_idx.size, per_stock_value, dtype=np.float64)
                     invested_net = float(buy_values.sum())
+                    idle_cash_value = float(invest_amount - gross_stock_spend)
                     day_buy_notional += invested_net
                     buy_fee_paid = invested_net * buy_fee_value
-                    gross_spend = invested_net + buy_fee_paid
+                    gross_spend = invest_amount
                     total_buy_fee_paid += buy_fee_paid
                     cash -= gross_spend
                     cohort_id = int(next_cohort_id)
@@ -710,6 +739,7 @@ class Simulator:
                             "idx": buy_idx,
                             "values": buy_values,
                             "entry_values": buy_values.copy(),
+                            "cash_value": idle_cash_value,
                             "age": 0,
                             "entry_idx": t + 1,
                             "signal_entry_idx": signal_idx,
@@ -719,18 +749,20 @@ class Simulator:
                             "take_profit_pct": group_take_profit_value,
                         }
                     )
-                    cohort_entry_net[cohort_id] = invested_net
+                    cohort_entry_net[cohort_id] = invested_net + idle_cash_value
                     cohort_exit_net[cohort_id] = 0.0
                     next_cohort_id += 1
                     actual_selected += int(buy_idx.size)
 
             # 4) 다음 날짜 기준 자산/메타 시계열 기록
             invested_value = 0.0
+            idle_cash_value = 0.0
             total_active = 0
             for bucket in active_buckets:
                 invested_value += float(np.asarray(bucket["values"], dtype=np.float64).sum())
+                idle_cash_value += float(bucket.get("cash_value", 0.0))
                 total_active += int(np.asarray(bucket["idx"], dtype=np.int64).size)
-            next_wealth = cash + invested_value
+            next_wealth = cash + invested_value + idle_cash_value
             wealth[t + 1] = next_wealth
             turnover[t + 1] = (
                 (day_buy_notional + day_sell_notional) / trade_base_wealth
@@ -743,11 +775,13 @@ class Simulator:
             snapshots[t + 1] = self._clone_active_buckets(active_buckets)
 
         final_invested = 0.0
+        final_idle_cash = 0.0
         final_active = 0
         for bucket in active_buckets:
             final_invested += float(np.asarray(bucket["values"], dtype=np.float64).sum())
+            final_idle_cash += float(bucket.get("cash_value", 0.0))
             final_active += int(np.asarray(bucket["idx"], dtype=np.int64).size)
-        final_wealth = cash + final_invested
+        final_wealth = cash + final_invested + final_idle_cash
         wealth[end_idx - 1] = final_wealth
         if not np.isfinite(turnover[end_idx - 1]):
             turnover[end_idx - 1] = 0.0
@@ -847,7 +881,11 @@ class Simulator:
         )
         out.attrs["execution_lag_days"] = float(lag_days)
         out.attrs["execution_price_mode"] = str(execution_price_mode)
-        out.attrs["max_weight_per_stock"] = float("nan")
+        out.attrs["max_weight_per_stock_in_cohort"] = (
+            float(max_weight_per_stock_in_cohort_value)
+            if max_weight_per_stock_in_cohort_value is not None
+            else float("nan")
+        )
         out.attrs["allow_reentry"] = bool(allow_reentry_value)
         out.attrs["min_cohort_size"] = float(min_cohort_size_value)
         out.attrs["max_cohort_size"] = (
@@ -869,7 +907,7 @@ class Simulator:
         self.take_profit_pct = take_profit_value
         self.execution_lag_days = lag_days
         self.execution_price_mode = str(execution_price_mode)
-        self.max_weight_per_stock = float("nan")
+        self.max_weight_per_stock_in_cohort = max_weight_per_stock_in_cohort_value
         self.allow_reentry = bool(allow_reentry_value)
         self.min_cohort_size = int(min_cohort_size_value)
         self.max_cohort_size = (

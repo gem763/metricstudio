@@ -159,6 +159,7 @@ sim = bt.run(
 - `trade_price_mode`: `"당일종가"`, `"익일종가"`, `"익일VWAP"`
 - `stop_loss_pct`, `take_profit_pct`: 기본 손절/익절
 - `allow_reentry`, `min_cohort_size`: 포지션 운용 옵션
+- `max_weight_per_stock_in_cohort`: 코호트 내부 종목별 비중 상한. 예: `0.2`
 
 출력:
 - `Simulator`
@@ -173,6 +174,12 @@ sim = bt.run(
 - 실제 종목 수 제한은 `nmax(...)`가 담당하고, `rank_by(...)`는 `nmax` 초과 후보가 나온 날짜에 어떤 종목을 남길지 정한다.
 - 현재 `rank_by(...)`는 일자별 후보군 안에서 각 metric을 `0~1` 점수로 정규화한 뒤 합산하는 `rank_sum` 방식만 지원한다.
 - 종목 공통 metric은 `("stock", "marketcap.desc")`처럼 줄 수 있다.
+
+날짜 해석:
+- `trade_price_mode="당일종가"`면 신호가 나온 그 날짜 종가에 바로 체결된다.
+- `trade_price_mode="익일종가"` 또는 `"익일VWAP"`면 신호일 `D`의 패턴이 다음 거래일 `D+1`에 체결된다.
+- 따라서 `익일종가` 기준으로 2026-03-20 종가에 패턴이 나왔다면, 실제 진입 코호트는 다음 거래일인 2026-03-23에 생성된다.
+- 이 경우 `bt.simulator.port_at("2026-03-20")`에는 아직 보이지 않고, `bt.simulator.port_at("2026-03-23")`에서 보이게 된다.
 
 ### 2.3 `screen(date, pattern, use_cache=True)`
 
@@ -196,6 +203,47 @@ picked = bt.screen("2026-03-12", strat)
 동작:
 - 같은 `pattern` 객체가 이미 analyze에 쓰였다면, 그때의 `filter`와 캐시를 재사용할 수 있다.
 - analyze되지 않은 새 패턴 객체를 넣어도 동작하지만, 그 경우는 on-the-fly 평가에 가깝다.
+- `screen(date, pattern)`은 "그 날짜 기준 신호"를 보여준다.
+- 즉, `trade_price_mode`와 무관하게 지정 날짜 `date`에 패턴을 만족한 종목 목록을 반환한다.
+
+### 2.4 `simulator` / `simulator.port_at(date)`
+
+목적:
+- 마지막 `run()` 결과에 연결된 `Simulator` 객체와, 지정 날짜 기준 실제 보유 종목 스냅샷을 조회한다.
+
+기본 형태:
+
+```python
+sim = bt.run(
+    pattern="trend_entry",
+    target_horizon="1M",
+    trade_price_mode="익일종가",
+)
+
+holdings = bt.simulator.port_at("2026-03-20")
+```
+
+입력:
+- `date`: 조회할 거래일
+
+출력:
+- MultiIndex(`cohort_id`, `entry_date`, `age`)와
+  `code`, `name`, `value`, `entry_value`, `cohort_value`, `weight_in_cohort`
+  컬럼을 가진 `DataFrame`
+
+동작:
+- `bt.simulator`는 마지막 `bt.run(...)` 결과를 가리킨다.
+- `port_at(date)`는 "그 날짜 종가 기준 실제로 보유 중인 종목"을 반환한다.
+- 따라서 `screen(date, pattern)`과는 의미가 다르다.
+- `screen("2026-03-20", strat)`은 2026-03-20 신호 종목이고,
+  `bt.simulator.port_at("2026-03-20")`은 2026-03-20 장 마감 시점 실제 보유 종목이다.
+- `trade_price_mode="익일종가"` 또는 `"익일VWAP"`라면, 2026-03-20 신호는 2026-03-23에 체결되므로
+  `port_at("2026-03-20")`에는 없고 `port_at("2026-03-23")`에서 보인다.
+
+중요:
+- `port_at(date)`는 미래 진입 예정 코호트를 미리 보여주는 API가 아니다.
+- 데이터 또는 run 구간이 2026-03-20까지만 있으면, 2026-03-23 체결 코호트는 아직 조회할 수 없다.
+- 다음 거래일 진입 예정 후보를 보고 싶다면 `screen(신호일, pattern)`을 사용한다.
 
 ## 3. `Univ`와 `Filter`를 어떻게 구분할까
 
