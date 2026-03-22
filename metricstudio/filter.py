@@ -73,15 +73,29 @@ def _normalize_filter_order(values) -> tuple[str, ...] | None:
     return tuple(out)
 
 
+def _normalize_positive_threshold(value, name: str) -> float | None:
+    """
+    절대 하한 입력을 양의 실수로 정규화한다.
+    """
+
+    if value is None:
+        return None
+    out = float(value)
+    if not np.isfinite(out) or out <= 0.0:
+        raise ValueError(f"{name}는 양수여야 합니다.")
+    return out
+
+
 class Filter:
     """
     날짜별 종목 필터 마스크를 계산하고 조회한다.
     """
 
-    def __init__(self, market_cap=None, liquidity=None, order=None):
+    def __init__(self, market_cap=None, liquidity=None, order=None, market_cap_min=None):
         self.market_cap_buckets = _normalize_bucket_list(market_cap, "market_cap")
         self.liquidity_buckets = _normalize_bucket_list(liquidity, "liquidity")
         self.order = _normalize_filter_order(order)
+        self.market_cap_min = _normalize_positive_threshold(market_cap_min, "market_cap_min")
         self._dates: np.ndarray | None = None
         self._codes: list[str] | None = None
         self._prices: np.ndarray | None = None
@@ -97,7 +111,11 @@ class Filter:
         실제 필터링 조건이 하나라도 지정됐는지 반환한다.
         """
 
-        return self.market_cap_buckets is not None or self.liquidity_buckets is not None
+        return (
+            self.market_cap_buckets is not None
+            or self.liquidity_buckets is not None
+            or self.market_cap_min is not None
+        )
 
     def bind(
         self,
@@ -217,17 +235,30 @@ class Filter:
     def _build_mask_matrix(self) -> np.ndarray:
         _, _, prices, _, _ = self._require_bound()
         mask = np.isfinite(prices) & (prices > 0.0)
+        if self.market_cap_min is not None:
+            marketcap = self._get_marketcap_matrix()
+            abs_marketcap_mask = (
+                np.isfinite(marketcap)
+                & (marketcap > 0.0)
+                & (marketcap >= float(self.market_cap_min))
+            )
+            mask &= abs_marketcap_mask
         if self.order is None:
             if self.market_cap_buckets is not None:
                 marketcap = self._get_marketcap_matrix()
                 marketcap_mask = self._build_decile_mask_matrix(
                     np.where(marketcap > 0.0, marketcap, np.nan),
                     self.market_cap_buckets,
+                    base_mask=mask,
                 )
                 mask &= marketcap_mask
             if self.liquidity_buckets is not None:
                 liquidity = self._get_liquidity_matrix()
-                liquidity_mask = self._build_decile_mask_matrix(liquidity, self.liquidity_buckets)
+                liquidity_mask = self._build_decile_mask_matrix(
+                    liquidity,
+                    self.liquidity_buckets,
+                    base_mask=mask,
+                )
                 mask &= liquidity_mask
             return mask
 

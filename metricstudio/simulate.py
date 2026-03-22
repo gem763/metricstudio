@@ -15,6 +15,43 @@ BUY_FEE = 0.0003
 SELL_FEE = 0.0020
 
 
+def _wealth_stability(wealth_values: np.ndarray) -> float:
+    """
+    로그 자산곡선의 직선성(R^2)을 계산한다.
+
+    empyrical/pyfolio의 stability_of_timeseries와 같은 개념으로,
+    로그 Wealth 곡선이 시간축에 대해 얼마나 선형적인지 측정한다.
+    """
+
+    wealth = np.asarray(wealth_values, dtype=np.float64)
+    wealth = wealth[np.isfinite(wealth) & (wealth > 0.0)]
+    if wealth.size < 3:
+        return float("nan")
+
+    cum_log_returns = np.log(wealth[1:] / wealth[0])
+    if cum_log_returns.size < 2:
+        return float("nan")
+
+    x = np.arange(cum_log_returns.size, dtype=np.float64)
+    x_centered = x - x.mean()
+    y_centered = cum_log_returns - cum_log_returns.mean()
+    ss_x = float(np.dot(x_centered, x_centered))
+    if ss_x <= 0.0:
+        return float("nan")
+
+    ss_y = float(np.dot(y_centered, y_centered))
+    if ss_y <= 0.0:
+        return 1.0
+
+    slope = float(np.dot(x_centered, y_centered) / ss_x)
+    intercept = float(cum_log_returns.mean() - slope * x.mean())
+    fitted = slope * x + intercept
+    residual = cum_log_returns - fitted
+    ss_res = float(np.dot(residual, residual))
+    r_squared = 1.0 - (ss_res / ss_y)
+    return float(np.clip(r_squared, 0.0, 1.0))
+
+
 @dataclass
 class Simulator:
     """
@@ -44,6 +81,7 @@ class Simulator:
     total_return: float | None = field(default=None, init=False)
     cagr: float | None = field(default=None, init=False)
     max_drawdown: float | None = field(default=None, init=False)
+    wealth_stability: float | None = field(default=None, init=False)
     cohort_win_rate: float | None = field(default=None, init=False)
     cohort_payoff_ratio: float | None = field(default=None, init=False)
     active_day_ratio: float | None = field(default=None, init=False)
@@ -318,6 +356,9 @@ class Simulator:
             "cagr": float(self.cagr),
             "max_drawdown": float(self.max_drawdown)
             if self.max_drawdown is not None
+            else float("nan"),
+            "wealth_stability": float(self.wealth_stability)
+            if self.wealth_stability is not None
             else float("nan"),
             "win_rate": float(self.cohort_win_rate)
             if self.cohort_win_rate is not None
@@ -859,9 +900,11 @@ class Simulator:
             running_peak = np.maximum.accumulate(wealth_values[wealth_valid])
             drawdown = wealth_values[wealth_valid] / running_peak - 1.0
             max_drawdown = float(np.min(drawdown))
+        wealth_stability = _wealth_stability(wealth_values)
 
         out.attrs["cagr"] = cagr
         out.attrs["max_drawdown"] = max_drawdown
+        out.attrs["wealth_stability"] = wealth_stability
         out.attrs["total_return"] = total_return
         out.attrs["run_years"] = years
         out.attrs["win_rate"] = win_rate_value
@@ -919,6 +962,7 @@ class Simulator:
         self.total_return = total_return
         self.cagr = cagr
         self.max_drawdown = max_drawdown
+        self.wealth_stability = wealth_stability
         self.cohort_win_rate = win_rate_value
         self.cohort_payoff_ratio = payoff_ratio_value
         self.active_day_ratio = active_day_ratio_value

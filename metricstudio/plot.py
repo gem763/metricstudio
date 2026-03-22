@@ -478,6 +478,8 @@ def plot_simulator(
     ann_vol_text = f"{ann_vol * 100.0:.2f}%" if np.isfinite(ann_vol) else "nan"
     ir = cagr / ann_vol if np.isfinite(cagr) and np.isfinite(ann_vol) and ann_vol > 0.0 else float("nan")
     ir_text = f"{ir:.2f}" if np.isfinite(ir) else "nan"
+    wealth_stability = float(meta.get("wealth_stability", np.nan))
+    wealth_stability_text = f"{wealth_stability:.3f}" if np.isfinite(wealth_stability) else "nan"
     win_rate = float(meta.get("win_rate", meta.get("cohort_win_rate", np.nan)))
     payoff_ratio = float(meta.get("payoff_ratio", meta.get("cohort_payoff_ratio", np.nan)))
     active_day_ratio = float(meta.get("active_day_ratio", np.nan))
@@ -610,11 +612,12 @@ def plot_simulator(
     axes[2].text(
         0.02,
         0.98,
-        "CAGR: {cagr}\nMDD: {mdd}\n연변동성: {vol}\nIR: {ir}\n평균 노출도: {exposure}\n회전율(연환산): {turnover}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
+        "CAGR: {cagr}\nMDD: {mdd}\n연변동성: {vol}\nIR: {ir}\nStability: {stability}\n평균 노출도: {exposure}\n회전율(연환산): {turnover}\n승률(코호트): {win}\n손익비(코호트): {payoff}\n투자일 비중: {active}".format(
             cagr=cagr_text,
             mdd=max_drawdown_text,
             vol=ann_vol_text,
             ir=ir_text,
+            stability=wealth_stability_text,
             exposure=mean_exposure_text,
             turnover=turnover_text,
             win=win_text,

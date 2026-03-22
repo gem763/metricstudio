@@ -18,7 +18,7 @@ from metricstudio.backtest import (
 from metricstudio.univ import Univ
 from metricstudio.patterns import AllStockPattern, BasePattern, Bollinger, Disparity, MFI
 from metricstudio.regime import Regime
-from metricstudio.simulate import Simulator
+from metricstudio.simulate import Simulator, _wealth_stability
 from metricstudio.stats import Stats, StatsCollection
 
 matplotlib.use("Agg")
@@ -578,6 +578,7 @@ class BacktestContextTests(unittest.TestCase):
         sim.total_return = 0.05
         sim.cagr = 0.05
         sim.max_drawdown = -0.02
+        sim.wealth_stability = 0.987
         sim.cohort_win_rate = 0.6
         sim.cohort_payoff_ratio = 1.4
         sim.active_day_ratio = 0.5
@@ -595,6 +596,7 @@ class BacktestContextTests(unittest.TestCase):
         self.assertIn("코호트 평균 종목수", axes[1].texts[0].get_text())
         self.assertGreaterEqual(len(axes[2].patches), 2)
         self.assertEqual([line.get_label() for line in axes[2].lines], ["demo", "KOSPI"])
+        self.assertIn("Stability", axes[2].texts[0].get_text())
         self.assertIn("회전율(연환산)", axes[2].texts[0].get_text())
 
     def test_simulator_plot_keeps_wealth_y_ticks_on_left_when_axes_are_injected(self):
@@ -621,6 +623,7 @@ class BacktestContextTests(unittest.TestCase):
         sim.total_return = 0.05
         sim.cagr = 0.05
         sim.max_drawdown = -0.02
+        sim.wealth_stability = 0.987
         sim.cohort_win_rate = 0.6
         sim.cohort_payoff_ratio = 1.4
         sim.active_day_ratio = 0.5
@@ -677,6 +680,12 @@ class BacktestContextTests(unittest.TestCase):
 
         self.assertTrue(np.isclose(summary["mean_turnover"], 1.0 / 12.0))
         self.assertTrue(np.isclose(summary["annual_turnover"], 20.0))
+        self.assertTrue(np.isclose(summary["wealth_stability"], 1.0))
+
+    def test_wealth_stability_is_one_for_perfect_log_line(self):
+        wealth = np.asarray([1.0, 2.0, 4.0, 8.0], dtype=np.float64)
+
+        self.assertTrue(np.isclose(_wealth_stability(wealth), 1.0))
 
     def test_simulator_respects_branch_specific_horizon_days(self):
         dates = pd.date_range("2025-01-01", periods=5, freq="B")

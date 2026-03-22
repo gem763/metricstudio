@@ -54,6 +54,7 @@ from metricstudio import Filter
 
 flt = Filter(
     market_cap=[5, 6, 7, 8, 9, 10],
+    market_cap_min=100_000_000_000,
     liquidity=[3, 4, 5, 6, 7, 8, 9, 10],
     order=["market_cap", "liquidity"],
 )
@@ -61,6 +62,7 @@ flt = Filter(
 
 주요 입력:
 - `market_cap`: 날짜별 시가총액 데실(1~10) 선택
+- `market_cap_min`: 절대 시가총액 하한. `marketcap` 데이터와 같은 단위 사용
 - `liquidity`: 날짜별 `amount / marketcap` 데실 선택
 - `order`: `market_cap`, `liquidity`를 어떤 순서로 순차 적용할지 지정
 
@@ -70,7 +72,9 @@ flt = Filter(
 - 한 번 `analyze(..., filter=flt)` 하면, 그 analyzed pattern은 이후 `run()`과 `screen()`에서도 같은 필터를 재사용한다.
 
 중요:
-- 현재 `Filter(market_cap=[...])`는 절대 시총 금액 기준이 아니라 "날짜별 데실" 기준이다.
+- `market_cap=[...]`는 절대 시총 금액 기준이 아니라 "날짜별 데실" 기준이다.
+- 절대 시총 하한이 필요하면 `market_cap_min=...`을 사용한다.
+- `market_cap_min`은 데실 필터보다 먼저 적용된다.
 - `Filter`는 benchmark를 바꾸는 수단이 아니다.
 - benchmark까지 더 좁은 우주로 계산하고 싶다면 `Filter`가 아니라 `Univ`를 더 좁혀야 한다.
 

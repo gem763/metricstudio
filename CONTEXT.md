@@ -3180,3 +3180,171 @@ u.Univ(market=["KOSPI", "KOSDAQ"])
 2. 패턴 문서와 API 문서를 분리했고, `stay와 cooldown.md`로 문서명을 정리했다
 3. `Bollinger` 내장 청산과 `stats.py`의 몇몇 dead feature를 제거했다
 4. `Backtest(..., benchmark=AllStockPattern(...), by="day")` 초기화는 결과를 유지한 채 훨씬 빨라졌다
+
+## 23) 2026-03-23 추가 인계: Stability 해석 + 시총 필터 방향 + large-cap breakout 탐색
+
+### 23.1 `Stability` 해석 메모
+이번 턴에서 `Wealth` 차트에 추가된 `Stability`의 의미를 다시 정리했다.
+
+- 현재 `Stability`는 `Simulator.summary()` 기준 `wealth_stability` 키로 들어간다
+- 정의는 로그 `Wealth` 곡선을 시간축에 선형회귀했을 때의 `R^2`다
+- 즉 “drawdown이 작은가”보다 “장기 로그 자산곡선이 얼마나 직선 우상향에 가까운가”를 본다
+- 따라서 `MDD`가 아주 큰데도 `Stability`가 `0.87 ~ 0.90`처럼 높게 나오는 것은 이상한 일이 아니다
+
+실무 해석 메모:
+
+- `0.95+`: 매우 매끈한 추세
+- `0.90 ~ 0.95`: 추세는 꽤 일관적
+- `0.80 ~ 0.90`: 우상향은 맞지만 흔들림이 분명함
+- `< 0.80`: 안정적 우상향으로 보기 어려움
+
+중요:
+
+- `Stability` 단독으로 “안정적으로 돈 번다”를 판정하면 안 된다
+- 반드시 `MDD` 또는 `Ulcer`류 drawdown 지표와 같이 해석해야 한다
+
+### 23.2 절대 시총 하한 필터 추가는 했지만, 장기 백테스트 주력 해법은 아님
+이번 턴에서 `Filter(market_cap_min=...)`도 구현했다.
+
+- 위치: `metricstudio/filter.py`
+- 문서: `API.md`
+- 테스트: `tests/test_filter.py`
+- 동작: 절대 시총 하한을 먼저 적용한 뒤, 필요하면 상대 데실 필터를 추가 적용한다
+
+하지만 사용자 결론은 아래다.
+
+- `2000 ~ 2026` 같이 긴 구간에서는 시장 체급이 많이 변했으므로
+  절대 하한보다 상대 데실 필터가 더 합리적이다
+- 따라서 앞으로 large-cap 전용 탐색의 주력 방식은
+  `Filter(market_cap=[...])` 같은 상대 필터로 보는 것이 맞다
+
+즉 다음 세션에서는:
+
+- 절대 필터 코드는 지우지 말 것
+- 하지만 전략 탐색의 기본축은 상대 데실로 둘 것
+
+### 23.3 size-aware router 아이디어는 숫자는 괜찮았지만 현재 사용자 목적과 다름
+중간에 `small`에는 더 엄격한 신호를 허용하는 size-aware router도 검토했다.
+
+- large/mid는 기존 패턴 유지
+- small은 더 강한 조건만 통과
+
+이 방식은 성과상 나쁘지 않았지만, 사용자 조건이 “기관투자자라 small 자체가 투자 검토 불가한 경우가 많다”였기 때문에 최종 방향으로 채택하지 않았다.
+
+즉 현재 목적은:
+
+- small을 덜 사는 전략이 아니라
+- 아예 상대 시총 상위 구간만으로도 그럴듯한 우상향 `Wealth`를 만드는 전략이다
+
+### 23.4 large-cap 전용 탐색용 연구 스크립트 추가
+재현 가능한 탐색을 위해 아래 스크립트를 추가했다.
+
+- `research/explore_large_cap_breakout.py`
+
+스크립트 역할:
+
+1. `screen_variants()`
+   - 상대 시총 데실별로 `analyze()`만 돌려 1개월 이벤트 품질을 먼저 스크리닝
+2. `validate_candidates()`
+   - shortlist만 `run()`으로 전체 기간 `Wealth` 검증
+
+실행 예시:
+
+- 스크리닝: `conda run --no-capture-output -n metricstudio python research/explore_large_cap_breakout.py`
+- shortlist 검증: `conda run --no-capture-output -n metricstudio python research/explore_large_cap_breakout.py --validate`
+
+주의:
+
+- validation 스크립트에서 `Stability`는 `summary["wealth_stability"]`로 읽어야 한다
+- `summary["stability"]`가 아니다
+
+### 23.5 이번 large-cap 탐색 세팅
+탐색 범위는 과최적화를 피하려고 아주 작게 제한했다.
+
+상대 시총 필터:
+
+- `d78910 = [7, 8, 9, 10]`
+- `d8910 = [8, 9, 10]`
+- `d910 = [9, 10]`
+
+후보 변형:
+
+- `base`
+- `high93` (`52주 고가 proximity`를 `0.93`으로 강화)
+- `amt15` (`거래량 급증`을 `1.5x`로 완화)
+- `bb04` (`bandwidth_max=0.04`로 강화)
+- `rs60`
+- `high93_rs60`
+
+패턴 뼈대는 사용자 기존 전략을 그대로 따랐다.
+
+- `Bollinger breakout_up`, cooldown 3일
+- `Trending(ma200 up)`
+- `High(240, threshold=...)`
+- `MFI(above 50)`
+- `AmountSurge(20, threshold=...)`
+- ranking은 기존처럼 `marketcap`, `amount ratio`, `bandwidth`, `high proximity`, `ma_slope`, `mfi` 순
+
+### 23.6 스크리닝 결론
+상대 데실 large-cap 구간에서의 패턴 탐색 결과, 방향성은 명확했다.
+
+- `amt15`는 count는 늘리지만 quality를 consistently 훼손했다
+- `rs60`, `high93_rs60`도 개선보다 희석 효과가 컸다
+- 남은 후보는 사실상 `bb04`와 `high93`였다
+
+즉 large-cap에서는:
+
+- 신호를 느슨하게 해서 노출도를 복구하는 것보다
+- 브레이크아웃 품질을 더 엄격하게 보는 쪽이 낫다
+
+### 23.7 전체 기간 `Wealth` 검증 결과
+검증 구간은 `2000-01-01 ~ 2026-03-20`, `target_horizon=20`, `trade_price_mode='당일종가'`였다.
+
+핵심 비교값:
+
+- `d78910 + base`: `CAGR 12.25%`, `MDD -15.66%`, `IR 1.59`, `Stability 0.9768`, `노출도 41.33%`
+- `d78910 + bb04`: `CAGR 9.09%`, `MDD -12.25%`, `IR 1.67`, `Stability 0.9787`, `노출도 28.53%`
+- `d8910 + base`: `CAGR 10.34%`, `MDD -14.61%`, `IR 1.48`, `Stability 0.9659`, `노출도 35.54%`
+- `d8910 + high93`: `CAGR 9.57%`, `MDD -14.14%`, `IR 1.48`, `Stability 0.9721`, `노출도 31.22%`
+- `d8910 + bb04`: `CAGR 7.18%`, `MDD -9.08%`, `IR 1.51`, `Stability 0.9651`, `노출도 23.04%`
+- `d910 + base`: `CAGR 7.23%`, `MDD -12.11%`, `IR 1.24`, `Stability 0.9759`, `노출도 27.28%`
+- `d910 + high93`: `CAGR 6.44%`, `MDD -12.87%`, `IR 1.21`, `Stability 0.9761`, `노출도 23.72%`
+- `d910 + bb04`: `CAGR 4.32%`, `MDD -9.25%`, `IR 1.15`, `Stability 0.9796`, `노출도 16.44%`
+
+해석:
+
+- `top 20% (d910)`까지 가면 alpha와 노출도가 너무 많이 죽는다
+- `bb04`는 IR / drawdown 방어는 좋지만 CAGR 희생이 크다
+- `high93`는 `d8910`에서 CAGR 훼손이 상대적으로 작으면서 `Stability`를 개선한다
+
+### 23.8 현재 추천안
+현재 사용자 목적(기관형, small 배제, relative large-cap 중심) 기준의 1차 추천은 아래다.
+
+- 기본 추천: `Filter(market_cap=[8, 9, 10]) + high93`
+- 더 방어적 대안: `Filter(market_cap=[7, 8, 9, 10]) + bb04`
+
+이 추천의 의미:
+
+- `d8910 + high93`
+  - top 30% large-cap만 보면서
+  - 기존 `d8910 + base` 대비 CAGR 훼손을 제한하고
+  - `Stability`와 승률을 조금 더 낫게 만든다
+- `d78910 + bb04`
+  - top 40%까지 허용하는 대신
+  - 더 타이트한 브레이크아웃만 인정해 IR / drawdown 쪽을 개선한다
+
+즉 다음 세션에서 이어갈 우선순위는:
+
+1. `d8910 + high93`를 기본 institutional candidate로 본다
+2. 방어형 대조군으로 `d78910 + bb04`를 같이 본다
+3. `amt15`나 `rs60` 계열은 우선순위를 낮춘다
+
+### 23.9 다음 세션 주의사항
+다음 에이전트가 특히 주의할 점은 아래다.
+
+1. 상대 데실 필터를 large-cap 탐색의 기본축으로 유지할 것
+2. `small`을 부분 허용하는 router로 다시 돌아가지 말 것
+   - 현재 사용자 목적과 다르다
+3. `Stability`를 “drawdown 안정성”으로 오해하지 말 것
+4. large-cap 성능을 올리려고 `amount threshold`를 낮추는 방향은
+   현재까지는 거의 확실히 좋지 않았다
